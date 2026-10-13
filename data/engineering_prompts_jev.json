@@ -1,0 +1,177 @@
+[
+  {
+    "request_id": "27495e54-1dd3-4452-9152-c39de4e0d316",
+    "task_slug": "log_trace_triage_oom_error",
+    "prompt": "Classify this log line into exactly one category from [oom, disk_full, network_timeout, auth_failure, dependency_unavailable, config_error, unknown]. Reply with the category only.\n\nFATAL: In-memory container limit exceeded (OOMKilled) during ClickHouse bulk merge operation.",
+    "department": "engineering",
+    "jev_eligible": true
+  },
+  {
+    "request_id": "020aaf50-e485-4d45-bb5a-c9add6be49c2",
+    "task_slug": "log_trace_triage_stack_trace",
+    "prompt": "Classify this panic into exactly one category from [thread_exhaustion, unwrap_on_none, index_out_of_bounds, deadlock, stack_overflow, other]. Reply with JSON: {\"category\": ..., \"file\": ..., \"line\": ...}.\n\nthread 'tokio-runtime-worker' panicked at src/pool.rs:142:17:\ncalled `Result::unwrap()` on an `Err` value: PoolError(\"no available worker threads\")\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace",
+    "department": "engineering",
+    "jev_eligible": true
+  },
+  {
+    "request_id": "9074dc8f-fd20-465b-97ef-9460b8c2cf64",
+    "task_slug": "log_trace_triage_stack_trace",
+    "prompt": "Classify this exception into exactly one category from [null_reference, type_error, import_error, key_error, timeout, other]. Reply with JSON: {\"category\": ..., \"file\": ..., \"line\": ...}.\n\nTraceback (most recent call last):\n  File \"/app/worker/tasks.py\", line 88, in process_event\n    user_id = payload[\"user\"][\"id\"]\nKeyError: 'user'",
+    "department": "engineering",
+    "jev_eligible": true
+  },
+  {
+    "request_id": "6e5b4a4e-40b4-42ba-8d4f-fd2f54f40475",
+    "task_slug": "log_field_extraction",
+    "prompt": "Extract timestamp, level, service, and message from this log line as JSON with those four keys.\n\n2026-10-12T14:03:22.481Z WARN  billing-worker  retry 3/5 for invoice inv_8841 after upstream 503",
+    "department": "engineering",
+    "jev_eligible": true
+  },
+  {
+    "request_id": "52b2b41e-7d53-4ad8-b520-f2266f24cec8",
+    "task_slug": "log_field_extraction",
+    "prompt": "Extract every distinct HTTP status code from these nginx access log lines and return them as a sorted JSON array of integers.\n\n10.0.4.12 - - [12/Oct/2026:14:03:22 +0000] \"GET /api/v1/orders HTTP/1.1\" 200 5123\n10.0.4.19 - - [12/Oct/2026:14:03:23 +0000] \"POST /api/v1/orders HTTP/1.1\" 502 0\n10.0.4.12 - - [12/Oct/2026:14:03:25 +0000] \"GET /api/v1/orders/881 HTTP/1.1\" 404 112\n10.0.4.31 - - [12/Oct/2026:14:03:26 +0000] \"GET /healthz HTTP/1.1\" 200 2",
+    "department": "engineering",
+    "jev_eligible": true
+  },
+  {
+    "request_id": "002493a5-93fd-4172-9a89-274ad14cc1fe",
+    "task_slug": "api_schema_translation_openapi",
+    "prompt": "Convert this GraphQL type definition into an OpenAPI 3.0 component schema in YAML.\n\ntype Product {\n  id: ID!\n  name: String!\n  priceCents: Int!\n  tags: [String!]!\n  description: String\n}",
+    "department": "engineering",
+    "jev_eligible": true
+  },
+  {
+    "request_id": "147ccac7-1a6e-4e7e-bd3b-02b9e97ffdbe",
+    "task_slug": "api_schema_translation_openapi",
+    "prompt": "Convert this GraphQL enum and input type into OpenAPI 3.0 component schemas in YAML.\n\nenum OrderStatus { PENDING SHIPPED DELIVERED CANCELLED }\n\ninput CreateOrderInput {\n  customerId: ID!\n  status: OrderStatus!\n  note: String\n}",
+    "department": "engineering",
+    "jev_eligible": true
+  },
+  {
+    "request_id": "8717cf39-374e-42dc-a564-25a02ecd558d",
+    "task_slug": "json_to_typescript_interface",
+    "prompt": "Generate a TypeScript interface named Account from this JSON sample. Use optional properties for any field that is null.\n\n{\"id\": \"acc_123\", \"email\": \"a@example.com\", \"createdAt\": \"2026-01-04T10:00:00Z\", \"plan\": \"pro\", \"seats\": 12, \"trialEndsAt\": null}",
+    "department": "engineering",
+    "jev_eligible": true
+  },
+  {
+    "request_id": "197b03d0-3820-4609-a80b-4b086a5322fe",
+    "task_slug": "config_format_conversion",
+    "prompt": "Convert this YAML to JSON. Preserve key order.\n\nserver:\n  host: 0.0.0.0\n  port: 8080\n  tls:\n    enabled: true\n    cert: /etc/certs/tls.crt\nlogging:\n  level: info\n  sinks: [stdout, file]",
+    "department": "engineering",
+    "jev_eligible": true
+  },
+  {
+    "request_id": "98b05cfb-3d8a-40cc-9d98-437578488d5e",
+    "task_slug": "config_format_conversion",
+    "prompt": "Convert these .env lines into a Kubernetes ConfigMap manifest named app-config in namespace staging.\n\nLOG_LEVEL=info\nCACHE_TTL_SECONDS=300\nFEATURE_NEW_CHECKOUT=true\nREGION=us-east-1",
+    "department": "engineering",
+    "jev_eligible": true
+  },
+  {
+    "request_id": "eda24f42-6c31-4f73-9c0a-1f74c37ea107",
+    "task_slug": "sql_dialect_translation",
+    "prompt": "Translate this MySQL DDL to PostgreSQL.\n\nCREATE TABLE sessions (\n  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,\n  user_id BIGINT UNSIGNED NOT NULL,\n  token VARCHAR(64) NOT NULL,\n  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,\n  KEY idx_user (user_id)\n) ENGINE=InnoDB;",
+    "department": "engineering",
+    "jev_eligible": true
+  },
+  {
+    "request_id": "8d3d589f-d880-459c-9009-bc8837c621ec",
+    "task_slug": "commit_classification",
+    "prompt": "Classify this commit into exactly one Conventional Commits type from [feat, fix, docs, refactor, test, chore, perf, ci]. Reply with the type only.\n\nChanged files: .github/workflows/build.yml\nSummary: pin node to 20.11 and cache pnpm store between runs",
+    "department": "engineering",
+    "jev_eligible": true
+  },
+  {
+    "request_id": "4dab3ffc-f6e2-44cf-8072-1c88aa306313",
+    "task_slug": "commit_classification",
+    "prompt": "Classify this commit into exactly one Conventional Commits type from [feat, fix, docs, refactor, test, chore, perf, ci]. Reply with the type only.\n\nChanged files: src/billing/invoice.ts, src/billing/invoice.test.ts\nSummary: round invoice totals half-up instead of truncating, which dropped a cent on some line items",
+    "department": "engineering",
+    "jev_eligible": true
+  },
+  {
+    "request_id": "7d320066-81d2-4270-9541-3cedec3ba2f7",
+    "task_slug": "pr_labeling",
+    "prompt": "Assign every applicable label from [frontend, backend, infra, docs, tests, dependencies] to a PR that changes these paths. Reply as a JSON array.\n\nweb/src/components/Cart.tsx\nweb/src/components/Cart.test.tsx\nCHANGELOG.md\npackage.json\npnpm-lock.yaml",
+    "department": "engineering",
+    "jev_eligible": true
+  },
+  {
+    "request_id": "cb339bb6-22b0-4e15-aa58-4ebba9788cc5",
+    "task_slug": "ticket_triage_routing",
+    "prompt": "Route this ticket to exactly one team from [payments, auth, platform, data, mobile, support-tooling]. Reply with the team only.\n\nTitle: Users on iOS 17 get logged out after backgrounding the app for ~10 minutes\nBody: Refresh token request returns 401 after the app resumes. Only reproduces on the iOS build, Android is fine.",
+    "department": "engineering",
+    "jev_eligible": true
+  },
+  {
+    "request_id": "61b29c45-5f49-4a5d-ac61-fc202eae9163",
+    "task_slug": "ticket_triage_routing",
+    "prompt": "Route this ticket to exactly one team from [payments, auth, platform, data, mobile, support-tooling]. Reply with the team only.\n\nTitle: Nightly revenue rollup missing EU rows since Tuesday\nBody: The dashboard totals for EUR accounts are zero for the last three days. Upstream events appear in the warehouse raw table but not in the rollup output.",
+    "department": "engineering",
+    "jev_eligible": true
+  },
+  {
+    "request_id": "3f4d638f-c18e-4e01-9242-9942e2064967",
+    "task_slug": "http_status_classification",
+    "prompt": "For each HTTP status code, return JSON mapping the code to {\"class\": \"success|redirect|client_error|server_error\", \"retryable\": true|false} for a typical idempotent GET client.\n\nCodes: 200, 301, 400, 404, 429, 500, 503",
+    "department": "engineering",
+    "jev_eligible": true
+  },
+  {
+    "request_id": "7669a14b-a1eb-4506-9cff-20e9b36e2c93",
+    "task_slug": "cron_explanation",
+    "prompt": "Explain this cron expression in one plain English sentence, and give the next three run times assuming it is 2026-10-13 09:15 UTC.\n\n0 */6 * * 1-5",
+    "department": "engineering",
+    "jev_eligible": true
+  },
+  {
+    "request_id": "fa98849d-fbc7-4789-a64e-e881edefbd90",
+    "task_slug": "snippet_translation",
+    "prompt": "Convert this curl command to a Python requests call.\n\ncurl -X POST https://api.example.com/v1/jobs -H 'Authorization: Bearer $TOKEN' -H 'Content-Type: application/json' -d '{\"name\": \"nightly-export\", \"retries\": 3}'",
+    "department": "engineering",
+    "jev_eligible": true
+  },
+  {
+    "request_id": "f8a41992-3ba4-474d-90bb-11984f3b2e82",
+    "task_slug": "key_case_conversion",
+    "prompt": "Convert every key in this JSON from snake_case to camelCase, including nested keys. Leave values unchanged.\n\n{\"user_id\": 42, \"created_at\": \"2026-10-01\", \"billing_address\": {\"street_line_1\": \"1 Main St\", \"postal_code\": \"10001\"}, \"order_items\": [{\"sku_code\": \"A1\", \"unit_price\": 9}]}",
+    "department": "engineering",
+    "jev_eligible": true
+  },
+  {
+    "request_id": "9d837c1e-8b66-412b-95b6-dbd5d6a442f0",
+    "task_slug": "dependency_extraction",
+    "prompt": "Extract the production dependencies from this package.json as a markdown table with columns name and version range.\n\n{\n  \"name\": \"svc\",\n  \"dependencies\": {\"fastify\": \"^4.28.0\", \"zod\": \"^3.23.8\", \"pg\": \"~8.11.3\"},\n  \"devDependencies\": {\"vitest\": \"^2.0.0\", \"typescript\": \"^5.5.0\"}\n}",
+    "department": "engineering",
+    "jev_eligible": true
+  },
+  {
+    "request_id": "7223ee82-ee9a-4dd2-a625-e71d532fb2cc",
+    "task_slug": "changelog_formatting",
+    "prompt": "Group these commit subjects into a markdown changelog with sections Features, Fixes, and Other, keeping the original wording after the prefix.\n\nfeat: add CSV export to reports\nfix: handle empty cart on checkout\nchore: bump eslint to 9\nfix: correct timezone in digest email\nfeat: support SSO login for teams\ndocs: update API quickstart",
+    "department": "engineering",
+    "jev_eligible": true
+  },
+  {
+    "request_id": "d15537ef-009a-4455-bd06-77a91d8be70c",
+    "task_slug": "secret_detection",
+    "prompt": "Does this line contain a hardcoded credential? Reply with JSON: {\"contains_secret\": true|false, \"kind\": \"api_key|password|private_key|none\"}.\n\nconst client = new S3Client({ region: \"us-east-1\", credentials: { accessKeyId: \"AKIAIOSFODNN7EXAMPLE\", secretAccessKey: \"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\" } });",
+    "department": "engineering",
+    "jev_eligible": true
+  },
+  {
+    "request_id": "5892e6ef-bc63-4a82-95a8-3423fd35633e",
+    "task_slug": "timestamp_normalization",
+    "prompt": "Convert these unix epoch timestamps (seconds) to ISO 8601 UTC strings, one per line, in the same order.\n\n1760364000\n1760450400\n1760536800",
+    "department": "engineering",
+    "jev_eligible": true
+  },
+  {
+    "request_id": "40622e34-3869-4d42-85b0-286e8e76d736",
+    "task_slug": "terraform_resource_extraction",
+    "prompt": "List every resource in this Terraform snippet as JSON objects with keys type and name.\n\nresource \"aws_s3_bucket\" \"logs\" { bucket = \"acme-logs\" }\nresource \"aws_s3_bucket_versioning\" \"logs\" { bucket = aws_s3_bucket.logs.id }\nresource \"aws_iam_role\" \"ingest\" { name = \"ingest-role\" }",
+    "department": "engineering",
+    "jev_eligible": true
+  }
+]
