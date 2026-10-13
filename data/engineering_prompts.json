@@ -1,0 +1,93 @@
+[
+  {
+    "request_id": "f90dde91-1b9d-48e4-bc5b-877fac6099bd",
+    "task_slug": "code_generation_api_endpoint",
+    "prompt": "Write a Fastify endpoint in TypeScript that handles user signups with Zod validation.",
+    "department": "engineering",
+    "jev_eligible": false
+  },
+  {
+    "request_id": "9a6a21ae-cf29-4938-b2ad-f5e2b6caf14f",
+    "task_slug": "code_generation_api_endpoint",
+    "prompt": "Generate a RESTful CRUD controller in Go using Gin for managing inventory items.",
+    "department": "engineering",
+    "jev_eligible": false
+  },
+  {
+    "request_id": "d0d09a6c-da11-4f56-b939-2f98b20ce2a9",
+    "task_slug": "code_generation_microservice_boilerplate",
+    "prompt": "Scaffold a Go microservice using Chi and pgx with structured logging.",
+    "department": "engineering",
+    "jev_eligible": false
+  },
+  {
+    "request_id": "c21b2057-d7a0-443e-adcc-058fe05aa130",
+    "task_slug": "code_generation_sql_migration",
+    "prompt": "Write a PostgreSQL migration adding an encrypted jsonb metadata column to users with an index.",
+    "department": "engineering",
+    "jev_eligible": false
+  },
+  {
+    "request_id": "14627990-c6d3-4e81-a761-ab8b472874fa",
+    "task_slug": "code_refactoring_legacy_monolith",
+    "prompt": "Refactor this 400-line monolithic Express route handler into separate domain services.",
+    "department": "engineering",
+    "jev_eligible": false
+  },
+  {
+    "request_id": "b527f223-2c76-4ef8-bfa4-c3370853af23",
+    "task_slug": "code_refactoring_async_await",
+    "prompt": "Convert these nested callback functions in Node.js to clean async/await syntax.",
+    "department": "engineering",
+    "jev_eligible": false
+  },
+  {
+    "request_id": "236dcbef-ac88-4f19-85ce-f58a6c8991f0",
+    "task_slug": "code_refactoring_memory_leak",
+    "prompt": "Identify and fix the memory leak caused by uncleaned event listeners in this React useEffect hook.",
+    "department": "engineering",
+    "jev_eligible": false
+  },
+  {
+    "request_id": "6996a0e8-159b-4b65-af2e-d744c492d550",
+    "task_slug": "code_explanation_security_audit",
+    "prompt": "Review this authentication middleware for JWT timing attacks or insecure signature verifications.",
+    "department": "engineering",
+    "jev_eligible": false
+  },
+  {
+    "request_id": "66744c13-8b60-4498-805c-3d91e73a9029",
+    "task_slug": "log_trace_triage_stack_trace",
+    "prompt": "Trace this panic log from a Rust tokio worker pool crashing on thread exhaustion: thread 'tokio-runtime-worker' panicked at src/pool.rs:142.",
+    "department": "engineering",
+    "jev_eligible": false
+  },
+  {
+    "request_id": "13304085-a6e8-44b6-830b-879f708fba5c",
+    "task_slug": "log_trace_triage_oom_error",
+    "prompt": "FATAL: In-memory container limit exceeded (OOMKilled) during ClickHouse bulk merge operation.",
+    "department": "engineering",
+    "jev_eligible": false
+  },
+  {
+    "request_id": "a76ed3f1-9445-4281-a361-fc049e13b8a7",
+    "task_slug": "unit_test_generation_mock_assertions",
+    "prompt": "Generate Vitest unit tests with mocks for this Stripe webhook payment processor function.",
+    "department": "engineering",
+    "jev_eligible": false
+  },
+  {
+    "request_id": "8c97f263-ebdf-4204-bf56-8270d8b1831d",
+    "task_slug": "api_schema_translation_openapi",
+    "prompt": "Convert this internal GraphQL schema definition into an OpenAPI 3.0 YAML spec.",
+    "department": "engineering",
+    "jev_eligible": true
+  },
+  {
+    "request_id": "a396168f-2a37-4cbc-b5a1-4eac2491904e",
+    "task_slug": "terraform_opentofu_drift_audit",
+    "prompt": "Review this OpenTofu plan output for unexpected security group recreation rules in AWS.",
+    "department": "engineering",
+    "jev_eligible": false
+  }
+]
