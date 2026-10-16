@@ -340,6 +340,7 @@ impl TagQueue {
 #[derive(Debug, Clone)]
 pub struct TagConfig {
     pub base_path: PathBuf,
+    pub clickhouse_url: Option<String>,
     pub queue_capacity: usize,
     pub concurrency: usize,
     pub call_timeout: Duration,
@@ -351,6 +352,7 @@ impl Default for TagConfig {
     fn default() -> Self {
         Self {
             base_path: PathBuf::from("logs/task_tags.jsonl"),
+            clickhouse_url: None,
             queue_capacity: 1024,
             concurrency: 4,
             call_timeout: Duration::from_secs(5),
@@ -426,9 +428,14 @@ pub fn spawn<T: Tagger>(
     };
 
     let writer_path = cfg.base_path.clone();
+    let clickhouse_url = cfg.clickhouse_url.clone();
     let writer = tokio::spawn(async move {
         let mut current_date = String::new();
         let mut file: Option<tokio::fs::File> = None;
+        let clickhouse_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .map_err(std::io::Error::other)?;
 
         async fn get_file(base: &PathBuf, date_str: &str) -> std::io::Result<tokio::fs::File> {
             let path = if let Some(parent) = base.parent() {
@@ -448,7 +455,7 @@ pub fn spawn<T: Tagger>(
                     let date_str = record.timestamp.format("%Y-%m-%d").to_string();
                     if date_str != current_date || file.is_none() {
                         if let Some(mut f) = file.take() {
-                            let _ = f.flush().await;
+                            f.flush().await?;
                         }
                         current_date = date_str;
                         file = Some(get_file(&writer_path, &current_date).await?);
@@ -457,6 +464,15 @@ pub fn spawn<T: Tagger>(
                         let mut line = serde_json::to_string(&record)?;
                         line.push('\n');
                         f.write_all(line.as_bytes()).await?;
+                        if let Some(url) = &clickhouse_url {
+                            if let Err(error) = insert_clickhouse_tag(&clickhouse_client, url, line.trim_end()).await {
+                                warn!(
+                                    request_id = %record.request_id,
+                                    error = %error,
+                                    "failed to insert task tag into ClickHouse; retained in local JSONL spool"
+                                );
+                            }
+                        }
                     }
                 }
                 _ = flush.tick() => {
@@ -502,6 +518,35 @@ pub fn spawn<T: Tagger>(
     (queue, handle)
 }
 
+async fn insert_clickhouse_tag(
+    client: &reqwest::Client,
+    base_url: &str,
+    line: &str,
+) -> Result<(), String> {
+    let query = "INSERT INTO llm_observability.task_tags_raw (line) FORMAT JSONEachRow";
+    let url = format!("{}/", base_url.trim_end_matches('/'));
+    let body = serde_json::json!({ "line": line });
+    let mut last_error = None;
+    for attempt in 0..3 {
+        match client.post(&url).query(&[("query", query)]).json(&body).send().await {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(response) => {
+                let status = response.status();
+                let detail = match response.text().await {
+                    Ok(detail) => detail,
+                    Err(error) => format!("failed to read response body: {error}"),
+                };
+                last_error = Some(format!("ClickHouse returned {status}: {detail}"));
+            }
+            Err(error) => last_error = Some(format!("ClickHouse request failed: {error}")),
+        }
+        if attempt < 2 {
+            tokio::time::sleep(Duration::from_millis(100 * (1 << attempt))).await;
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "ClickHouse insert failed without an error".into()))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -509,6 +554,7 @@ pub fn spawn<T: Tagger>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     struct Fixed {
         delay: Duration,
@@ -592,6 +638,60 @@ mod tests {
 
     fn by_id<'a>(records: &'a [TagRecord], id: &str) -> &'a TagRecord {
         records.iter().find(|r| r.request_id == id).unwrap()
+    }
+
+    #[tokio::test]
+    async fn clickhouse_sink_inserts_raw_json_each_row() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            let mut content_length = None;
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                request.extend_from_slice(&buffer[..read]);
+                if content_length.is_none() {
+                    if let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        content_length = headers.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        });
+                    }
+                }
+                if let Some(content_length) = content_length {
+                    let header_end = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                    if request.len() >= header_end + content_length {
+                        break;
+                    }
+                }
+            }
+            let _ = request_tx.send(String::from_utf8_lossy(&request).into_owned());
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        insert_clickhouse_tag(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            r#"{"request_id":"req-1","result":{"status":"untagged"}}"#,
+        )
+        .await
+        .unwrap();
+
+        let request = request_rx.await.unwrap();
+        assert!(
+            request.contains("query=INSERT+INTO+llm_observability.task_tags_raw"),
+            "{request}"
+        );
+        assert!(request.contains(r#""line":"{\"request_id\":\"req-1\",\"result\":{\"status\":\"untagged\"}}""#));
     }
 
     #[test]
