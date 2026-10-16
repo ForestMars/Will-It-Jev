@@ -7,8 +7,10 @@ use axum::{
     routing::post,
     Json, Router,
 };
+
+use crate::tagging::{TagInput, TagQueue};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::json;
 use tokio::sync::mpsc;
 use tracing::warn;
 
@@ -30,6 +32,7 @@ pub struct AppState {
     dispatcher: Arc<DownstreamDispatcher>,
     hashes: Arc<Hashes>,
     capture_tx: mpsc::Sender<RouteRecord>,
+    tag_queue: TagQueue,
     budget: Duration,
 }
 
@@ -45,6 +48,7 @@ pub fn app(
     dispatcher: DownstreamDispatcher,
     hashes: Hashes,
     capture_tx: mpsc::Sender<RouteRecord>,
+    tag_queue: TagQueue,
     budget: Duration,
 ) -> Router {
     let state = AppState {
@@ -54,6 +58,7 @@ pub fn app(
         dispatcher: Arc::new(dispatcher),
         hashes: Arc::new(hashes),
         capture_tx,
+        tag_queue,
         budget,
     };
     Router::new()
@@ -90,6 +95,9 @@ async fn completion(
         .await
     {
         Ok(result) => {
+            let payload = result.payload.clone();
+            let response_text = payload.to_string();
+            let request_id = record.request_id.clone();
             record.final_routing.backend = if result.tier == 4 { "jev" } else { "llm" }.into();
             record.final_routing.tier = result.tier;
             record.final_routing.latency_us += result.request_latency.as_micros();
@@ -107,9 +115,16 @@ async fn completion(
                     Some(result.request_latency.as_secs_f64() * 1000.0);
             }
             capture(&state.capture_tx, record).await;
-            (StatusCode::OK, Json(result.payload)).into_response()
+            state.tag_queue.enqueue(TagInput {
+                request_id,
+                prompt: request.prompt.clone(),
+                response: Some(response_text),
+            });
+            (StatusCode::OK, Json(payload)).into_response()
         }
         Err(error) => {
+            let detail = error.error.to_string();
+            let request_id = record.request_id.clone();
             record.final_routing.backend = "llm".into();
             record.final_routing.tier = error.tier;
             record.final_routing.latency_us += error.request_latency.as_micros();
@@ -123,8 +138,12 @@ async fn completion(
                 record.request_latency_failover_ms =
                     Some(error.request_latency.as_secs_f64() * 1000.0);
             }
-            let detail = error.error.to_string();
             capture(&state.capture_tx, record).await;
+            state.tag_queue.enqueue(TagInput {
+                request_id,
+                prompt: request.prompt.clone(),
+                response: Some(format!("{{\"error\":\"generative_provider_unavailable\",\"detail\":{detail:?}}}")),
+            });
             (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({ "error": "generative_provider_unavailable", "detail": detail })),
@@ -145,14 +164,35 @@ mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
     use serde_json::Value;
+    use tokio::io::AsyncWriteExt;
     use tower::ServiceExt;
+
+    async fn stub_backend(body: &str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = body.to_string();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut bytes = [0u8; 4096];
+                let _ = stream.readable().await;
+                let _ = stream.try_read(&mut bytes);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}/")
+    }
 
     #[tokio::test]
     async fn completion_reaches_selected_backend() {
         let tier1 = Tier1Engine::new(
             crate::router::tier1_runner::Tier1Automaton::from_toml_file("config/tier1.toml")
                 .unwrap(),
-        );
+        )
+        .unwrap();
         let tier2 = Tier2Runner::new("models/tier2.bin", 0.95).unwrap();
         let tier3 = Tier3Runner::new(
             "http://127.0.0.1:1".into(),
@@ -161,8 +201,8 @@ mod tests {
             Duration::from_millis(20),
         )
         .unwrap();
-        let jev = super::super::dispatch::tests_endpoint("jev");
-        let frontier = super::super::dispatch::tests_endpoint("frontier");
+        let jev = stub_backend(r#"{"completion":"jev"}"#).await;
+        let frontier = stub_backend(r#"{"completion":"frontier"}"#).await;
         let dispatcher = DownstreamDispatcher::new(
             jev,
             frontier,
@@ -172,6 +212,12 @@ mod tests {
             Duration::from_secs(30),
         )
         .unwrap();
+        let (_tag_tx, _tag_rx) = tokio::sync::mpsc::channel::<crate::telemetry::RouteRecord>(2);
+        let tag_queue = crate::tagging::spawn(
+            std::sync::Arc::new(NoopTagger),
+            crate::tagging::TagConfig::default(),
+        )
+        .0;
         let (tx, _rx) = mpsc::channel(2);
         let application = app(
             tier1,
@@ -183,6 +229,7 @@ mod tests {
                 tier2_bin: String::new(),
             },
             tx,
+            tag_queue,
             Duration::from_millis(30),
         );
 
@@ -201,5 +248,34 @@ mod tests {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let payload: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(payload.get("completion").is_some());
+    }
+
+    struct NoopTagger;
+
+    impl crate::tagging::Tagger for NoopTagger {
+        fn model(&self) -> &str { "noop-tagger" }
+        fn version(&self) -> &str { "test" }
+        fn taxonomy_version(&self) -> &str { "test-v1" }
+        fn tag(
+            &self,
+            _input: &crate::tagging::TagInput,
+        ) -> impl std::future::Future<Output = Result<crate::tagging::TaggerOutput, crate::tagging::TagError>> + Send {
+            async {
+                Ok(crate::tagging::TaggerOutput {
+                    verdict: crate::tagging::TaggerVerdict::Tagged {
+                        primary: crate::tagging::CategoryScore {
+                            category_id: "engineering".to_string(),
+                            score: 1.0,
+                        },
+                        alternatives: vec![],
+                    },
+                    usage: Some(crate::tagging::TokenUsage {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        estimated: true,
+                    }),
+                })
+            }
+        }
     }
 }
