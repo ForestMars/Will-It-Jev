@@ -9,14 +9,20 @@ use super::tier4_runner::DownstreamError;
 pub struct Tier5Runner {
     client: Client,
     endpoint: String,
+    model: String,
     timeout: Duration,
 }
 
 impl Tier5Runner {
-    pub fn new(endpoint: String, timeout: Duration) -> Result<Self, reqwest::Error> {
+    pub fn new(
+        endpoint: String,
+        model: String,
+        timeout: Duration,
+    ) -> Result<Self, reqwest::Error> {
         Ok(Self {
             client: Client::builder().build()?,
             endpoint,
+            model,
             timeout,
         })
     }
@@ -27,7 +33,11 @@ impl Tier5Runner {
             let response = self
                 .client
                 .post(&self.endpoint)
-                .json(&json!({ "prompt": prompt }))
+                .json(&json!({
+                    "model": self.model,
+                    "prompt": prompt,
+                    "stream": false,
+                }))
                 .send()
                 .await
                 .map_err(|error| DownstreamError::Transport(error.to_string()))?;
