@@ -37,6 +37,7 @@ impl DownstreamDispatcher {
     pub fn new(
         tier4_endpoint: String,
         tier5_endpoint: String,
+        tier5_model: String,
         downstream_timeout: Duration,
         breaker_threshold: usize,
         breaker_window: Duration,
@@ -50,7 +51,7 @@ impl DownstreamDispatcher {
                 breaker_window,
                 breaker_open_duration,
             )?,
-            tier5: Tier5Runner::new(tier5_endpoint, downstream_timeout)?,
+            tier5: Tier5Runner::new(tier5_endpoint, tier5_model, downstream_timeout)?,
         })
     }
 
@@ -59,10 +60,25 @@ impl DownstreamDispatcher {
         request_id: &str,
         backend: Backend,
         prompt: &str,
+        state: Option<&Value>,
+        questions: Option<&serde_json::Map<String, Value>>,
     ) -> Result<DispatchOutcome, DispatchFailure> {
         if backend == Backend::Jev {
             let primary_started = Instant::now();
-            match self.tier4.invoke(prompt).await {
+            let tier4_result = match (state, questions) {
+                (Some(state), Some(questions)) => self.tier4.invoke(state, questions).await,
+                _ => {
+                    return self
+                        .invoke_tier5(
+                            request_id,
+                            prompt,
+                            Some("typed_decision_request_required".into()),
+                            Duration::ZERO,
+                        )
+                        .await
+                }
+            };
+            match tier4_result {
                 Ok((payload, elapsed)) => {
                     downstream_metric(request_id, "tier4", "success", false, elapsed);
                     return Ok(DispatchOutcome {
@@ -143,6 +159,7 @@ impl DownstreamDispatcher {
 fn classify_error(error: &DownstreamError) -> (&'static str, &'static str) {
     match error {
         DownstreamError::Timeout => ("timeout", "timeout"),
+        DownstreamError::NotEligible => ("not_eligible", "jev_not_eligible"),
         DownstreamError::CircuitOpen => ("connection_error", "circuit_open"),
         DownstreamError::Transport(_) => ("connection_error", "transport_error"),
         DownstreamError::HttpStatus(status, _) => {
@@ -184,9 +201,10 @@ mod tests {
         net::TcpListener,
     };
 
-    async fn stub(status: &str, body: &'static str, delay: Duration) -> String {
+    async fn stub(status: &'static str, body: &str, delay: Duration) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let body = body.to_string();
         tokio::spawn(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
                 let mut request = [0u8; 4096];
@@ -206,12 +224,26 @@ mod tests {
         DownstreamDispatcher::new(
             jev,
             gen,
+            "gemma3:latest".into(),
             timeout,
             2,
             Duration::from_secs(10),
             Duration::from_secs(30),
         )
         .unwrap()
+    }
+
+    fn decision_request() -> (Value, serde_json::Map<String, Value>) {
+        (
+            Value::String("Can Jev answer this?".into()),
+            serde_json::from_value(serde_json::json!({
+                "answer": {
+                    "type": "choice",
+                    "criteria": {"yes": "yes", "no": "no"}
+                }
+            }))
+            .unwrap(),
+        )
     }
 
     #[tokio::test]
@@ -221,8 +253,18 @@ mod tests {
         drop(listener);
         let frontier = stub("200 OK", r#"{"completion":"frontier"}"#, Duration::ZERO).await;
         let router = dispatcher(format!("http://{address}/"), frontier, Duration::from_millis(300));
+        let (state, questions) = decision_request();
 
-        let result = router.execute("test-connection", Backend::Jev, "prompt").await.unwrap();
+        let result = router
+            .execute(
+                "test-connection",
+                Backend::Jev,
+                "prompt",
+                Some(&state),
+                Some(&questions),
+            )
+            .await
+            .unwrap();
         assert_eq!(result.tier, 5);
         assert!(result.is_failover);
         assert_eq!(result.failure_reason.as_deref(), Some("transport_error"));
@@ -234,11 +276,50 @@ mod tests {
         let jev = stub("200 OK", r#"{"completion":"late"}"#, Duration::from_millis(200)).await;
         let frontier = stub("200 OK", r#"{"completion":"frontier"}"#, Duration::ZERO).await;
         let router = dispatcher(jev, frontier, Duration::from_millis(50));
+        let (state, questions) = decision_request();
 
-        let result = router.execute("test-timeout", Backend::Jev, "prompt").await.unwrap();
+        let result = router
+            .execute(
+                "test-timeout",
+                Backend::Jev,
+                "prompt",
+                Some(&state),
+                Some(&questions),
+            )
+            .await
+            .unwrap();
         assert_eq!(result.tier, 5);
         assert!(result.is_failover);
         assert_eq!(result.failure_reason.as_deref(), Some("timeout"));
+        assert_eq!(result.payload["completion"], Value::String("frontier".into()));
+    }
+
+    #[tokio::test]
+    async fn laya_ineligible_decision_falls_through_to_tier5() {
+        let jev = stub(
+            "200 OK",
+            r#"{"answers":{"__router_jev_eligible":{"choice":"no","confidence":1.0}}}"#,
+            Duration::ZERO,
+        )
+        .await;
+        let frontier = stub("200 OK", r#"{"completion":"frontier"}"#, Duration::ZERO).await;
+        let router = dispatcher(jev, frontier, Duration::from_millis(300));
+        let (state, questions) = decision_request();
+
+        let result = router
+            .execute(
+                "test-not-eligible",
+                Backend::Jev,
+                "prompt",
+                Some(&state),
+                Some(&questions),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.tier, 5);
+        assert!(result.is_failover);
+        assert_eq!(result.failure_reason.as_deref(), Some("jev_not_eligible"));
         assert_eq!(result.payload["completion"], Value::String("frontier".into()));
     }
 }
