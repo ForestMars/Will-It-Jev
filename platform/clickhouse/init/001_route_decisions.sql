@@ -8,18 +8,16 @@
 -- present was created by this run, so running the down migration restores the prior system
 -- state exactly (database absent).
 --
--- The router already emits one RouteRecord per request as a JSON line
--- (logs/routing_capture.jsonl). This schema ingests those lines unchanged:
+-- The router emits one RouteRecord per request as a JSON line
+-- (logs/routing_capture.jsonl) and inserts it into route_records_raw:
 --
 --   route_records_raw   landing table, one row per JSON line, never altered
 --   route_decisions     typed, queryable projection, populated by a materialized view
 --
--- Ingest with no router change:
+-- If ClickHouse was unavailable, replay the local spool with:
 --   clickhouse-client --input_format_allow_errors_num=10 \
 --       --query "INSERT INTO llm_observability.route_records_raw FORMAT JSONAsString" \
 --       < logs/routing_capture.jsonl
--- The router appends to this file, so the last line can be mid-write. Without the flag,
--- one truncated line rejects the whole file; with it, up to 10 unparseable lines are skipped.
 -- Replaying a file is safe: route_decisions is a ReplacingMergeTree keyed on
 -- (timestamp, request_id), so replayed rows collapse on merge. Read with FINAL for exact
 -- counts before a merge has run. route_records_raw keeps every replayed line.
