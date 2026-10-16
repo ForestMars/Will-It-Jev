@@ -1,10 +1,12 @@
 // src/main.rs
 
 mod router;
+mod tagging;
 mod telemetry;
 
-use std::time::Duration;
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
+use crate::tagging::{OvenV1Tagger, TagConfig};
 use router::cascade;
 use router::tier1_runner::{Tier1Automaton, Tier1Engine};
 use router::tier2_runner::{Tier2Runner, DEFAULT_CONFIDENCE_THRESHOLD};
@@ -84,6 +86,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Cascade Router initialized successfully");
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<telemetry::RouteRecord>(128);
+
+    let tagger = Arc::new(OvenV1Tagger::new(
+        "http://localhost:11434",
+        "qwen3:1.7b",
+    ));
+    let (tag_queue, tag_handle) = tagging::spawn(
+        tagger,
+        TagConfig {
+            base_path: PathBuf::from("logs/task_tags.jsonl"),
+            queue_capacity: 1024,
+            concurrency: 4,
+            call_timeout: Duration::from_secs(5),
+            max_age: Duration::from_secs(60),
+            sample_prob: 1.0,
+        },
+    );
+    let _tag_queue = tag_queue;
+
     let capture_task = tokio::spawn(async move {
         tokio::fs::create_dir_all("logs").await?;
 
@@ -166,5 +186,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     capture_task
         .await?
         .map_err(|error| std::io::Error::other(error.to_string()))?;
+    drop(_tag_queue);
+    tag_handle
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))??;
     Ok(())
 }
