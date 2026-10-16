@@ -609,6 +609,41 @@ mod tests {
         assert_eq!(untagged, r#"{"status":"untagged","reason":"timeout"}"#);
     }
 
+    #[test]
+    fn tag_record_json_matches_clickhouse_projection_shape() {
+        let tagged = TagRecord {
+            request_id: "req-1".into(),
+            timestamp: Utc::now(),
+            taxonomy_version: "v1.0".into(),
+            tagger_model: "oven-domain-tagger-v1".into(),
+            tagger_version: "1.0.0".into(),
+            latency_ms: 12.5,
+            queue_wait_ms: 1.2,
+            result: TagResult::Tagged {
+                primary: CategoryScore {
+                    category_id: "engineering".into(),
+                    score: 0.91,
+                },
+                alternatives: vec![CategoryScore {
+                    category_id: "help_desk".into(),
+                    score: 0.09,
+                }],
+            },
+            tagger_usage: Some(TokenUsage {
+                input_tokens: 128,
+                output_tokens: 32,
+                estimated: false,
+            }),
+        };
+
+        let value = serde_json::to_value(&tagged).unwrap();
+        assert_eq!(value["result"]["status"], "tagged");
+        assert_eq!(value["result"]["primary"]["category_id"], "engineering");
+        assert!((value["result"]["primary"]["score"].as_f64().unwrap() - 0.91).abs() < 1e-6);
+        assert_eq!(value["tagger_usage"]["input_tokens"], 128);
+        assert_eq!(value["tagger_usage"]["output_tokens"], 32);
+    }
+
     #[tokio::test]
     async fn pipeline_writes_one_record_per_job() {
         let path = temp_path("basic");
