@@ -348,6 +348,12 @@ pub struct TagConfig {
     pub sample_prob: f32,
 }
 
+#[derive(Clone, Copy)]
+pub enum ClickHouseRawTable {
+    RouteRecords,
+    TaskTags,
+}
+
 impl Default for TagConfig {
     fn default() -> Self {
         Self {
@@ -465,7 +471,14 @@ pub fn spawn<T: Tagger>(
                         line.push('\n');
                         f.write_all(line.as_bytes()).await?;
                         if let Some(url) = &clickhouse_url {
-                            if let Err(error) = insert_clickhouse_tag(&clickhouse_client, url, line.trim_end()).await {
+                            if let Err(error) = insert_clickhouse_raw_line(
+                                &clickhouse_client,
+                                url,
+                                ClickHouseRawTable::TaskTags,
+                                line.trim_end(),
+                            )
+                            .await
+                            {
                                 warn!(
                                     request_id = %record.request_id,
                                     error = %error,
@@ -518,17 +531,28 @@ pub fn spawn<T: Tagger>(
     (queue, handle)
 }
 
-async fn insert_clickhouse_tag(
+pub async fn insert_clickhouse_raw_line(
     client: &reqwest::Client,
     base_url: &str,
+    table: ClickHouseRawTable,
     line: &str,
 ) -> Result<(), String> {
-    let query = "INSERT INTO llm_observability.task_tags_raw (line) FORMAT JSONEachRow";
+    let table = match table {
+        ClickHouseRawTable::RouteRecords => "route_records_raw",
+        ClickHouseRawTable::TaskTags => "task_tags_raw",
+    };
+    let query = format!("INSERT INTO llm_observability.{table} (line) FORMAT JSONEachRow");
     let url = format!("{}/", base_url.trim_end_matches('/'));
     let body = serde_json::json!({ "line": line });
     let mut last_error = None;
     for attempt in 0..3 {
-        match client.post(&url).query(&[("query", query)]).json(&body).send().await {
+        match client
+            .post(&url)
+            .query(&[("query", &query)])
+            .json(&body)
+            .send()
+            .await
+        {
             Ok(response) if response.status().is_success() => return Ok(()),
             Ok(response) => {
                 let status = response.status();
@@ -678,9 +702,10 @@ mod tests {
                 .unwrap();
         });
 
-        insert_clickhouse_tag(
+        insert_clickhouse_raw_line(
             &reqwest::Client::new(),
             &format!("http://{address}"),
+            ClickHouseRawTable::TaskTags,
             r#"{"request_id":"req-1","result":{"status":"untagged"}}"#,
         )
         .await
@@ -691,7 +716,67 @@ mod tests {
             request.contains("query=INSERT+INTO+llm_observability.task_tags_raw"),
             "{request}"
         );
-        assert!(request.contains(r#""line":"{\"request_id\":\"req-1\",\"result\":{\"status\":\"untagged\"}}""#));
+        assert!(request.contains(
+            r#""line":"{\"request_id\":\"req-1\",\"result\":{\"status\":\"untagged\"}}""#
+        ));
+    }
+
+    #[tokio::test]
+    async fn clickhouse_sink_inserts_route_records_into_route_table() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            let mut content_length = None;
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                request.extend_from_slice(&buffer[..read]);
+                if content_length.is_none() {
+                    if let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        content_length = headers.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        });
+                    }
+                }
+                if let Some(content_length) = content_length {
+                    let header_end = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                    if request.len() >= header_end + content_length {
+                        break;
+                    }
+                }
+            }
+            let _ = request_tx.send(String::from_utf8_lossy(&request).into_owned());
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let route_line = r#"{"request_id":"route-1","final_backend":"llm"}"#;
+        insert_clickhouse_raw_line(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            ClickHouseRawTable::RouteRecords,
+            route_line,
+        )
+        .await
+        .unwrap();
+
+        let request = request_rx.await.unwrap();
+        assert!(
+            request.contains("query=INSERT+INTO+llm_observability.route_records_raw"),
+            "{request}"
+        );
+        assert!(
+            request.contains(r#""line":"{\"request_id\":\"route-1\",\"final_backend\":\"llm\"}""#)
+        );
     }
 
     #[test]
