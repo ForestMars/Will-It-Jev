@@ -213,11 +213,26 @@ mod tests {
         )
         .unwrap();
         let (_tag_tx, _tag_rx) = tokio::sync::mpsc::channel::<crate::telemetry::RouteRecord>(2);
-        let tag_queue = crate::tagging::spawn(
-            std::sync::Arc::new(NoopTagger),
-            crate::tagging::TagConfig::default(),
-        )
-        .0;
+        let (tag_input_tx, mut tag_input_rx) = mpsc::channel(1);
+        let release_tagger = Arc::new(tokio::sync::Notify::new());
+        let tag_dir = std::env::temp_dir().join(format!(
+            "router-service-tags-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (tag_queue, tag_handle) = crate::tagging::spawn(
+            std::sync::Arc::new(NoopTagger {
+                input_tx: tag_input_tx,
+                release: Arc::clone(&release_tagger),
+            }),
+            crate::tagging::TagConfig {
+                base_path: tag_dir.join("task_tags.jsonl"),
+                ..crate::tagging::TagConfig::default()
+            },
+        );
         let (tx, _rx) = mpsc::channel(2);
         let application = app(
             tier1,
@@ -233,24 +248,44 @@ mod tests {
             Duration::from_millis(30),
         );
 
-        let response = application
-            .oneshot(
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            application.oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/v1/completions")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"prompt":"What is 2+2?"}"#))
                     .unwrap(),
-            )
-            .await
-            .unwrap();
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let payload: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(payload.get("completion").is_some());
+
+        let tag_input = tokio::time::timeout(Duration::from_secs(1), tag_input_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tag_input.prompt, "What is 2+2?");
+        assert!(!tag_input.request_id.is_empty());
+        assert_eq!(
+            serde_json::from_str::<Value>(tag_input.response.as_deref().unwrap()).unwrap(),
+            payload
+        );
+        release_tagger.notify_one();
+        tag_handle.await.unwrap().unwrap();
+        std::fs::remove_dir_all(tag_dir).unwrap();
     }
 
-    struct NoopTagger;
+    struct NoopTagger {
+        input_tx: mpsc::Sender<crate::tagging::TagInput>,
+        release: Arc<tokio::sync::Notify>,
+    }
 
     impl crate::tagging::Tagger for NoopTagger {
         fn model(&self) -> &str { "noop-tagger" }
@@ -258,9 +293,14 @@ mod tests {
         fn taxonomy_version(&self) -> &str { "test-v1" }
         fn tag(
             &self,
-            _input: &crate::tagging::TagInput,
+            input: &crate::tagging::TagInput,
         ) -> impl std::future::Future<Output = Result<crate::tagging::TaggerOutput, crate::tagging::TagError>> + Send {
-            async {
+            let input_tx = self.input_tx.clone();
+            let input = input.clone();
+            let release = Arc::clone(&self.release);
+            async move {
+                input_tx.send(input).await.unwrap();
+                release.notified().await;
                 Ok(crate::tagging::TaggerOutput {
                     verdict: crate::tagging::TaggerVerdict::Tagged {
                         primary: crate::tagging::CategoryScore {
