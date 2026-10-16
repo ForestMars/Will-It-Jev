@@ -184,9 +184,10 @@ mod tests {
         net::TcpListener,
     };
 
-    async fn stub(status: &str, body: &'static str, delay: Duration) -> String {
+    async fn stub(status: &'static str, body: &str, delay: Duration) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let body = body.to_string();
         tokio::spawn(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
                 let mut request = [0u8; 4096];
