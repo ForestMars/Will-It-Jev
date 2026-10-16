@@ -365,9 +365,46 @@ Tracking **resolved-at-tier distribution over time** is the most important signa
 
 ### Request Capture
 
-Each completed route is sent through a Tokio channel to a background writer, which appends one JSON object per line to `logs/routing_capture.jsonl`. The log directory is created at startup. The record includes a UUID v4 request ID, the request-start UTC timestamp, the raw prompt, SHA-256 hashes of the Tier 1 TOML and Tier 2 model files, the outcomes from tiers that ran, and the final backend, tier, and latency in microseconds. Tier 2 records its raw probability vector; Tier 3 records its score. The sampling probability currently defaults to `1.0`.
+Each completed route is sent through a bounded, non-blocking Tokio channel to a background writer, which appends one JSON object per line to `logs/routing_capture.jsonl`. If that queue is full, the record is dropped with a warning rather than delaying the response. The log directory is created at startup. The record includes a UUID v4 request ID, the request-start UTC timestamp, the raw prompt, SHA-256 hashes of the Tier 1 TOML and Tier 2 model files, the outcomes from tiers that ran, and the final backend, tier, and latency in microseconds. Tier 2 records its raw probability vector; Tier 3 records its score. The sampling probability currently defaults to `1.0`.
 
 The raw prompt is stored verbatim and may contain sensitive data. Restrict access to the capture file and define appropriate retention and cleanup; the writer appends indefinitely and does not rotate the file.
+
+### Running the Gateway
+
+`cargo run --release` starts the HTTP gateway on `127.0.0.1:8080` by default. It exposes
+`GET /healthz`, `POST /v1/completions`, and `POST /v1/decisions`. Prompt-only requests are sent
+to the configured generative model. Structured requests may include `state` and `questions`; when the cascade
+selects Jev, Ollaya/Laya is asked to assess Jev eligibility and answer those typed questions in
+one decision request. If Jev is not eligible or the Laya call fails, the request falls through to
+the Gemma/Ollama generator.
+
+```bash
+docker run -d --name ollaya -p 11435:11435 ghcr.io/ollaya-dev/ollaya
+ollaya run laya
+ollama pull gemma3:latest
+ollama pull qwen3:1.7b
+cargo run --release
+```
+
+Ollaya publishes multi-architecture images (including `linux/amd64` and `linux/arm64`); Docker
+selects the host architecture. Run ClickHouse with the migrations in `platform/clickhouse/init`
+applied to enable typed task-tag ingestion. The tag pipeline also retains daily JSONL spool files
+under `logs/`; ClickHouse insert failures are logged and do not block gateway responses. Spool lines
+remain available for manual replay if ClickHouse is unavailable.
+
+The principal runtime overrides are `ROUTER_BIND`, `TIER4_ENDPOINT` (default
+`http://127.0.0.1:11435/api/decide`), `OLLAMA_GENERATE_URL` (default
+`http://127.0.0.1:11434/api/generate`), `GEMMA_MODEL` (default `gemma3:latest`),
+`TAGGER_OLLAMA_URL` (default `http://127.0.0.1:11434`), `TAGGER_MODEL` (default
+`qwen3:1.7b`), and `CLICKHOUSE_URL` (default `http://127.0.0.1:8123`).
+
+Example structured request:
+
+```bash
+curl -s http://127.0.0.1:8080/v1/decisions \
+  -H 'content-type: application/json' \
+  -d '{"state":"Is 2 + 2 equal to 4?","questions":{"answer":{"type":"choice","instructions":"Does the statement hold?","criteria":{"yes":"It is true.","no":"It is false."}}}}'
+```
 
 ### Adjusting the Log Level
 
