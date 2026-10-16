@@ -6,16 +6,13 @@ mod telemetry;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use crate::tagging::{OvenV1Tagger, TagConfig};
+use crate::tagging::{ClickHouseRawTable, OvenV1Tagger, TagConfig};
 use router::dispatch::DownstreamDispatcher;
 use router::service;
 use router::tier1_runner::{Tier1Automaton, Tier1Engine};
 use router::tier2_runner::{Tier2Runner, DEFAULT_CONFIDENCE_THRESHOLD};
 use router::tier3_runner::Tier3Runner;
 
-use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::trace::{SdkTracerProvider, Tracer};
 use sha2::{Digest, Sha256};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
@@ -23,7 +20,6 @@ use tokio::io::AsyncWriteExt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
-use url::Url;
 
 fn sha256_file(path: &str) -> Result<String, std::io::Error> {
     let contents = std::fs::read(path)?;
@@ -64,50 +60,19 @@ async fn shutdown_signal() {
     }
 }
 
-// Helper function to set up OpenTelemetry Tracer for Tempo
-fn init_opentelemetry_tracer() -> Tracer {
-    let exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_tonic()
-        .with_endpoint("http://localhost:4317") // Tempo / OTel Collector OTLP endpoint
-        .build()
-        .expect("Failed to build OTLP exporter");
-
-    let provider = SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
-        .build();
-
-    provider.tracer("cascade-router")
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let otel_tracer = init_opentelemetry_tracer();
-
-    // 1. Layer for TRACES (Spans) -> Goes to Grafana Tempo
-    // Captures start times, end times, parent-child request spans, and durations
-    let otel_trace_layer = tracing_opentelemetry::layer().with_tracer(otel_tracer);
-
-    // 2. Layer for LOGS (Events) -> Goes to Grafana Loki
-    // Captures individual log events (tracing::info!), formats as JSON, or ships via OTLP
-    let (loki_layer, loki_task) = tracing_loki::builder()
-        .label("service", "cascade-router")?
-        .build_url(Url::parse("http://localhost:3100")?)?;
-
     let filter = match std::env::var("RUST_LOG") {
         Ok(filter) => EnvFilter::try_new(filter)?,
         Err(std::env::VarError::NotPresent) => EnvFilter::new("info"),
         Err(error) => return Err(error.into()),
     };
 
-    // 3. Register BOTH layers together in the Subscriber Pipeline
     tracing_subscriber::registry()
         .with(filter)
         .with(tracing_subscriber::fmt::layer().with_target(false).compact())
-        .with(otel_trace_layer) // Handles spans -> Tempo
-        .with(loki_layer) // Handles events -> Loki
         .init();
 
-    tokio::spawn(loki_task);
     tracing::info!("Cascade Router initialized successfully");
 
     let tier1_path = env_or("TIER1_CONFIG", "config/tier1.toml");
@@ -140,8 +105,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Duration::from_secs(30),
     )?;
 
-    let (capture_tx, mut capture_rx) =
-        tokio::sync::mpsc::channel::<telemetry::RouteRecord>(1024);
+    let clickhouse_url = env_or("CLICKHOUSE_URL", "http://127.0.0.1:8123");
+    let route_clickhouse_url = clickhouse_url.clone();
+    let (capture_tx, mut capture_rx) = tokio::sync::mpsc::channel::<telemetry::RouteRecord>(1024);
     let capture_task = tokio::spawn(async move {
         tokio::fs::create_dir_all("logs").await?;
         let mut file = OpenOptions::new()
@@ -149,6 +115,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .append(true)
             .open("logs/routing_capture.jsonl")
             .await?;
+        let clickhouse_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .map_err(std::io::Error::other)?;
         let mut flush_interval = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
@@ -156,6 +126,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let Some(record) = recv else { break };
                     let json = serde_json::to_string(&record)?;
                     file.write_all(format!("{json}\n").as_bytes()).await?;
+                    if let Err(error) = tagging::insert_clickhouse_raw_line(
+                        &clickhouse_client,
+                        &route_clickhouse_url,
+                        ClickHouseRawTable::RouteRecords,
+                        &json,
+                    ).await {
+                        tracing::warn!(
+                            request_id = %record.request_id,
+                            error = %error,
+                            "failed to insert route record into ClickHouse; retained in local JSONL spool"
+                        );
+                    }
                 }
                 _ = flush_interval.tick() => file.flush().await?,
             }
@@ -172,7 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tagger,
         TagConfig {
             base_path: PathBuf::from("logs/task_tags.jsonl"),
-            clickhouse_url: Some(env_or("CLICKHOUSE_URL", "http://127.0.0.1:8123")),
+            clickhouse_url: Some(clickhouse_url),
             queue_capacity: 1024,
             concurrency: 4,
             call_timeout: Duration::from_secs(5),
