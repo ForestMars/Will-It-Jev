@@ -339,7 +339,7 @@ When validating the SLA:
 
 ## Observability
 
-Telemetry is driven by `tracing`, initialized in `src/main.rs`. Every classification request generates a structured span containing feature variables, execution path outcomes, and timing metadata, exported to OpenTelemetry/Tempo for distributed tracing and Loki for log aggregation.
+Runtime observability records are written to ClickHouse. `tracing` provides local console diagnostics; the gateway does not export logs or traces to Loki, Tempo, or another remote telemetry service.
 
 ### Span Attributes and Evaluation Tracking
 The Tier1Engine::classify method instruments spans with individual feature metrics and routing decisions:
@@ -349,11 +349,6 @@ The Tier1Engine::classify method instruments spans with individual feature metri
 - Decision State: confidence, routing_reason
 
 Tracking resolved-at-tier distribution over time is the primary health signal. A shift of traffic toward Tiers 4 and 5 indicates threshold, model, or prompt-distribution drift, causing tail latency and operational cost to rise.
-
-### Exporter Configuration
-Distributed tracing and log streaming are configured via default local endpoints or environment variables:
-- OTLP Traces (Tempo): Sent via opentelemetry-otlp using `SdkTracerProvider`. Defaults to http://localhost:4317.
-- Loki Events: Streamed via `tracing-loki` under the service label cascade-router. Defaults to http://localhost:3100.
 
 ### Adjusting Log Verbosity
 Verbosity is controlled via RUST_LOG. The default level is info.
@@ -365,7 +360,7 @@ Tracking **resolved-at-tier distribution over time** is the most important signa
 
 ### Request Capture
 
-Each completed route is sent through a bounded, non-blocking Tokio channel to a background writer, which appends one JSON object per line to `logs/routing_capture.jsonl`. If that queue is full, the record is dropped with a warning rather than delaying the response. The log directory is created at startup. The record includes a UUID v4 request ID, the request-start UTC timestamp, the raw prompt, SHA-256 hashes of the Tier 1 TOML and Tier 2 model files, the outcomes from tiers that ran, and the final backend, tier, and latency in microseconds. Tier 2 records its raw probability vector; Tier 3 records its score. The sampling probability currently defaults to `1.0`.
+Each completed route is sent through a bounded, non-blocking Tokio channel to a background writer, which appends one JSON object per line to `logs/routing_capture.jsonl` and inserts it into ClickHouse's `route_records_raw` table. If that queue is full, the record is dropped with a warning rather than delaying the response. ClickHouse insert failures are logged and the local spool is retained for replay. The log directory is created at startup. The record includes a UUID v4 request ID, the request-start UTC timestamp, the raw prompt, SHA-256 hashes of the Tier 1 TOML and Tier 2 model files, the outcomes from tiers that ran, and the final backend, tier, and latency in microseconds. Tier 2 records its raw probability vector; Tier 3 records its score. The sampling probability currently defaults to `1.0`.
 
 The raw prompt is stored verbatim and may contain sensitive data. Restrict access to the capture file and define appropriate retention and cleanup; the writer appends indefinitely and does not rotate the file.
 
@@ -388,9 +383,9 @@ cargo run --release
 
 Ollaya publishes multi-architecture images (including `linux/amd64` and `linux/arm64`); Docker
 selects the host architecture. Run ClickHouse with the migrations in `platform/clickhouse/init`
-applied to enable typed task-tag ingestion. The tag pipeline also retains daily JSONL spool files
-under `logs/`; ClickHouse insert failures are logged and do not block gateway responses. Spool lines
-remain available for manual replay if ClickHouse is unavailable.
+applied to enable typed route-decision and task-tag ingestion. The route and tag pipelines retain
+JSONL spool files under `logs/`; ClickHouse insert failures are logged and do not block gateway
+responses. Spool lines remain available for manual replay if ClickHouse is unavailable.
 
 The principal runtime overrides are `ROUTER_BIND`, `TIER4_ENDPOINT` (default
 `http://127.0.0.1:11435/api/decide`), `OLLAMA_GENERATE_URL` (default
