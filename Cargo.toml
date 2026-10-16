@@ -26,6 +26,7 @@ opentelemetry = "0.33.0"
 
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-loki = "0.2"
+tower = { version = "0.5", features = ["util"] }
 url = "2.5"
 
 # OpenTelemetry crates with required features
