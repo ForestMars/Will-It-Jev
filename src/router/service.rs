@@ -4,13 +4,13 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::IntoResponse,
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 
 use crate::tagging::{TagInput, TagQueue};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 use tracing::warn;
 
@@ -38,7 +38,9 @@ pub struct AppState {
 
 #[derive(Deserialize)]
 pub struct CompletionRequest {
-    prompt: String,
+    prompt: Option<String>,
+    state: Option<Value>,
+    questions: Option<Map<String, Value>>,
 }
 
 pub fn app(
@@ -62,7 +64,9 @@ pub fn app(
         budget,
     };
     Router::new()
+        .route("/healthz", get(|| async { StatusCode::OK }))
         .route("/v1/completions", post(completion))
+        .route("/v1/decisions", post(completion))
         .with_state(state)
 }
 
@@ -70,9 +74,48 @@ async fn completion(
     State(state): State<AppState>,
     Json(request): Json<CompletionRequest>,
 ) -> impl IntoResponse {
+    if request.state.is_some() != request.questions.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid_request",
+                "detail": "state and questions must be provided together"
+            })),
+        )
+            .into_response();
+    }
+    let route_input = match (&request.prompt, &request.state, &request.questions) {
+        (Some(prompt), _, _) => Some(prompt.clone()),
+        (None, Some(state), Some(questions)) => {
+            Some(format!("{state}\n{}", Value::Object(questions.clone())))
+        }
+        _ => None,
+    };
+    let Some(route_input) = route_input else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid_request",
+                "detail": "provide prompt, or both state and questions"
+            })),
+        )
+            .into_response();
+    };
+    let fallback_prompt = match (&request.state, &request.questions) {
+        (Some(state), Some(questions)) => format!(
+            "Answer the user's typed decision request. Use the supplied state and questions and \
+             return one JSON object keyed by question id. For choice questions, return the chosen \
+             label; for score questions, return the score; for noul questions, return the noul \
+             probability.\nState:\n{}\nQuestions:\n{}",
+            state,
+            Value::Object(questions.clone())
+        ),
+        _ => route_input.clone(),
+    };
+
     let (_, mut record) = cascade::route(
         telemetry::next_req_id(),
-        &request.prompt,
+        &route_input,
         &state.tier1,
         &state.tier2,
         &state.tier3,
@@ -90,7 +133,9 @@ async fn completion(
             } else {
                 Backend::Llm
             },
-            &request.prompt,
+            &fallback_prompt,
+            request.state.as_ref(),
+            request.questions.as_ref(),
         )
         .await
     {
@@ -102,7 +147,7 @@ async fn completion(
             record.final_routing.tier = result.tier;
             record.final_routing.latency_us += result.request_latency.as_micros();
             record.downstream_invocation_latency_ms =
-                result.request_latency.as_secs_f64() * 1000.0;
+                result.invocation_latency.as_secs_f64() * 1000.0;
             record.downstream_outcome = Some(result.outcome.into());
             record.downstream_tier = Some(format!("tier{}", result.tier));
             record.is_failover = result.is_failover;
@@ -114,10 +159,10 @@ async fn completion(
                 record.request_latency_primary_ms =
                     Some(result.request_latency.as_secs_f64() * 1000.0);
             }
-            capture(&state.capture_tx, record).await;
+            capture(&state.capture_tx, record);
             state.tag_queue.enqueue(TagInput {
                 request_id,
-                prompt: request.prompt.clone(),
+                prompt: route_input.clone(),
                 response: Some(response_text),
             });
             (StatusCode::OK, Json(payload)).into_response()
@@ -129,7 +174,7 @@ async fn completion(
             record.final_routing.tier = error.tier;
             record.final_routing.latency_us += error.request_latency.as_micros();
             record.downstream_invocation_latency_ms =
-                error.request_latency.as_secs_f64() * 1000.0;
+                error.invocation_latency.as_secs_f64() * 1000.0;
             record.downstream_outcome = Some(error.outcome.into());
             record.downstream_tier = Some(format!("tier{}", error.tier));
             record.is_failover = error.is_failover;
@@ -138,10 +183,10 @@ async fn completion(
                 record.request_latency_failover_ms =
                     Some(error.request_latency.as_secs_f64() * 1000.0);
             }
-            capture(&state.capture_tx, record).await;
+            capture(&state.capture_tx, record);
             state.tag_queue.enqueue(TagInput {
                 request_id,
-                prompt: request.prompt.clone(),
+                prompt: route_input.clone(),
                 response: Some(format!("{{\"error\":\"generative_provider_unavailable\",\"detail\":{detail:?}}}")),
             });
             (
@@ -153,9 +198,15 @@ async fn completion(
     }
 }
 
-async fn capture(sender: &mpsc::Sender<RouteRecord>, record: RouteRecord) {
-    if let Err(error) = sender.send(record).await {
-        warn!(error = %error, "routing capture writer is unavailable");
+fn capture(sender: &mpsc::Sender<RouteRecord>, record: RouteRecord) {
+    match sender.try_send(record) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(record)) => {
+            warn!(request_id = %record.request_id, "routing capture queue is full; dropping record");
+        }
+        Err(mpsc::error::TrySendError::Closed(record)) => {
+            warn!(request_id = %record.request_id, "routing capture writer is unavailable; dropping record");
+        }
     }
 }
 
@@ -201,11 +252,15 @@ mod tests {
             Duration::from_millis(20),
         )
         .unwrap();
-        let jev = stub_backend(r#"{"completion":"jev"}"#).await;
-        let frontier = stub_backend(r#"{"completion":"frontier"}"#).await;
+        let jev = stub_backend(
+            r#"{"model":"laya:en","answers":{"__router_jev_eligible":{"choice":"yes","confidence":1.0,"probabilities":{"yes":1.0,"no":0.0}},"answer":{"choice":"yes","confidence":1.0,"probabilities":{"yes":1.0,"no":0.0}}}}"#,
+        )
+        .await;
+        let frontier = stub_backend(r#"{"response":"frontier","model":"gemma3:latest"}"#).await;
         let dispatcher = DownstreamDispatcher::new(
             jev,
             frontier,
+            "gemma3:latest".into(),
             Duration::from_millis(100),
             2,
             Duration::from_secs(5),
@@ -255,7 +310,9 @@ mod tests {
                     .method("POST")
                     .uri("/v1/completions")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"prompt":"What is 2+2?"}"#))
+                    .body(Body::from(
+                        r#"{"prompt":"What is 2+2?","state":"What is 2+2?","questions":{"answer":{"type":"choice","instructions":"Is 2+2 equal to 4?","criteria":{"yes":"The expression equals four.","no":"The expression does not equal four."}}}}"#,
+                    ))
                     .unwrap(),
             ),
         )
@@ -265,13 +322,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let payload: Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(payload.get("completion").is_some());
+        assert_eq!(payload["answers"]["answer"]["choice"], "yes");
+        assert!(payload["answers"].get("__router_jev_eligible").is_none());
 
         let tag_input = tokio::time::timeout(Duration::from_secs(1), tag_input_rx.recv())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(tag_input.prompt, "What is 2+2?");
+        assert!(tag_input.prompt.contains("What is 2+2?"));
         assert!(!tag_input.request_id.is_empty());
         assert_eq!(
             serde_json::from_str::<Value>(tag_input.response.as_deref().unwrap()).unwrap(),
