@@ -8,8 +8,8 @@ use super::tier4_runner::{DownstreamError, Tier4Runner};
 use super::tier5_runner::Tier5Runner;
 
 pub struct DownstreamDispatcher {
-    tier4: Tier4Runner,
-    tier5: Tier5Runner,
+    tier4: Option<Tier4Runner>,
+    tier5: Option<Tier5Runner>,
 }
 
 pub struct DispatchOutcome {
@@ -43,15 +43,48 @@ impl DownstreamDispatcher {
         breaker_window: Duration,
         breaker_open_duration: Duration,
     ) -> Result<Self, reqwest::Error> {
+        Self::new_with_enabled(
+            tier4_endpoint,
+            tier5_endpoint,
+            tier5_model,
+            downstream_timeout,
+            breaker_threshold,
+            breaker_window,
+            breaker_open_duration,
+            true,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_enabled(
+        tier4_endpoint: String,
+        tier5_endpoint: String,
+        tier5_model: String,
+        downstream_timeout: Duration,
+        breaker_threshold: usize,
+        breaker_window: Duration,
+        breaker_open_duration: Duration,
+        tier4_enabled: bool,
+        tier5_enabled: bool,
+    ) -> Result<Self, reqwest::Error> {
         Ok(Self {
-            tier4: Tier4Runner::new(
-                tier4_endpoint,
-                downstream_timeout,
-                breaker_threshold,
-                breaker_window,
-                breaker_open_duration,
-            )?,
-            tier5: Tier5Runner::new(tier5_endpoint, tier5_model, downstream_timeout)?,
+            tier4: if tier4_enabled {
+                Some(Tier4Runner::new(
+                    tier4_endpoint,
+                    downstream_timeout,
+                    breaker_threshold,
+                    breaker_window,
+                    breaker_open_duration,
+                )?)
+            } else {
+                None
+            },
+            tier5: if tier5_enabled {
+                Some(Tier5Runner::new(tier5_endpoint, tier5_model, downstream_timeout)?)
+            } else {
+                None
+            },
         })
     }
 
@@ -65,8 +98,21 @@ impl DownstreamDispatcher {
     ) -> Result<DispatchOutcome, DispatchFailure> {
         if backend == Backend::Jev {
             let primary_started = Instant::now();
+            let Some(tier4) = self.tier4.as_ref() else {
+                return match self.tier5.as_ref() {
+                    Some(_) => self
+                        .invoke_tier5(
+                            request_id,
+                            prompt,
+                            Some("tier4_disabled".into()),
+                            Duration::ZERO,
+                        )
+                        .await,
+                    None => Err(disabled_failure(4, "tier4_and_tier5_disabled")),
+                };
+            };
             let tier4_result = match (state, questions) {
-                (Some(state), Some(questions)) => self.tier4.invoke(state, questions).await,
+                (Some(state), Some(questions)) => tier4.invoke(state, questions).await,
                 _ => {
                     return self
                         .invoke_tier5(
@@ -100,14 +146,21 @@ impl DownstreamDispatcher {
                         error = %error,
                         "Jev downstream failed; falling through to Tier 5"
                     );
-                    return self
-                        .invoke_tier5(request_id, prompt, Some(reason.to_string()), primary_started.elapsed())
-                        .await;
+                    return match self.tier5.as_ref() {
+                        Some(_) => self
+                            .invoke_tier5(request_id, prompt, Some(reason.to_string()), primary_started.elapsed())
+                            .await,
+                        None => Err(disabled_failure(5, "tier5_disabled_after_tier4_failure")),
+                    };
                 }
             }
         }
 
-        self.invoke_tier5(request_id, prompt, None, Duration::ZERO).await
+        if self.tier5.is_some() {
+            self.invoke_tier5(request_id, prompt, None, Duration::ZERO).await
+        } else {
+            Err(disabled_failure(5, "tier5_disabled"))
+        }
     }
 
     async fn invoke_tier5(
@@ -119,7 +172,10 @@ impl DownstreamDispatcher {
     ) -> Result<DispatchOutcome, DispatchFailure> {
         let is_failover = failure_reason.is_some();
         let started = Instant::now();
-        match self.tier5.invoke(prompt).await {
+        let Some(tier5) = self.tier5.as_ref() else {
+            return Err(disabled_failure(5, "tier5_disabled"));
+        };
+        match tier5.invoke(prompt).await {
             Ok((payload, elapsed)) => {
                 downstream_metric(request_id, "tier5", "success", is_failover, elapsed);
                 Ok(DispatchOutcome {
@@ -156,6 +212,18 @@ impl DownstreamDispatcher {
     }
 }
 
+fn disabled_failure(tier: u8, reason: &'static str) -> DispatchFailure {
+    DispatchFailure {
+        error: DownstreamError::Disabled,
+        tier,
+        outcome: "disabled",
+        is_failover: false,
+        invocation_latency: Duration::ZERO,
+        request_latency: Duration::ZERO,
+        failure_reason: reason.to_string(),
+    }
+}
+
 fn classify_error(error: &DownstreamError) -> (&'static str, &'static str) {
     match error {
         DownstreamError::Timeout => ("timeout", "timeout"),
@@ -170,6 +238,7 @@ fn classify_error(error: &DownstreamError) -> (&'static str, &'static str) {
             }
         }
         DownstreamError::InvalidResponse(_) => ("connection_error", "invalid_response"),
+        DownstreamError::Disabled => ("disabled", "disabled"),
     }
 }
 
@@ -244,6 +313,34 @@ mod tests {
             }))
             .unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn disabled_downstream_tiers_are_not_invoked() {
+        let router = DownstreamDispatcher::new_with_enabled(
+            "not a url".into(),
+            "not a url".into(),
+            "unused".into(),
+            Duration::from_millis(100),
+            2,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+            false,
+            false,
+        )
+        .unwrap();
+
+        let result = router
+            .execute("test-disabled", Backend::Llm, "prompt", None, None)
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("disabled tier unexpectedly returned a response"),
+        };
+
+        assert_eq!(error.tier, 5);
+        assert_eq!(error.outcome, "disabled");
+        assert_eq!(error.failure_reason, "tier5_disabled");
     }
 
     #[tokio::test]

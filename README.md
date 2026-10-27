@@ -160,54 +160,26 @@ src/
 
 ## Configuration
 
-The router reads `config/router.toml`. Any key can be overridden by an environment variable with the `ROUTER__` prefix and double-underscore nesting, for example `ROUTER__TIER2__CONFIDENCE_THRESHOLD=0.9`.
+At startup, the router reads `config/router.toml`. Set `enabled = true` for each tier that should be constructed and used; omitted tiers default to disabled. Override the config file path with `ROUTER_CONFIG`.
 
 ```toml
-[router]
-workers = 16
-max_payload_bytes = 1048576
-
 [router.tier1]
 enabled = true
-regex_patterns_path = "config/rules.regex"
 
 [router.tier2]
 enabled = true
-model_path = "models/router_fastpath.ftz"
-confidence_threshold = 0.85
 
 [router.tier3]
 enabled = true
-engine = "modernbert"            # modernbert | harrier | oryn
-model_path = "models/tier3_quantized.onnx"
-tokenizer_path = "models/tokenizer.json"
-centroids_path = "models/centroids.bin"
-confidence_threshold = 0.80
 
 [router.tier4]
 enabled = true
-timeout_ms = 50
 
 [router.tier5]
 enabled = true
-endpoint_url = "https://api.frontier.internal/v1/classify"
 ```
 
-The values above are illustrative defaults. Thresholds must be calibrated on your own validation data before production use.
-
-### Key parameters
-
-| Key | Description |
-| :--- | :--- |
-| `router.workers` | Number of worker threads in the routing pool |
-| `router.max_payload_bytes` | Payloads above this size are rejected at tier 1 |
-| `tier1.regex_patterns_path` | File containing the compiled-at-startup regex rule set |
-| `tier2.confidence_threshold` | Minimum margin-scaled score `S` to resolve at tier 2 |
-| `tier3.engine` | Which in-process evaluator to load |
-| `tier3.centroids_path` | Pre-computed route centroids for cosine scoring |
-| `tier3.confidence_threshold` | Minimum similarity-derived confidence to resolve at tier 3 |
-| `tier4.timeout_ms` | Hard deadline for the heavy fallback model |
-| `tier5.endpoint_url` | Frontier model endpoint |
+Tier 1 rules and model/backend locations continue to use their existing environment variables and `config/tier1.toml`; the master file controls whether each tier is constructed. At least one tier must be enabled. If a request reaches a disabled downstream tier, the router returns an explicit downstream error rather than invoking it.
 
 ---
 

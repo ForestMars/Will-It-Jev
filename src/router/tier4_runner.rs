@@ -6,6 +6,7 @@ use tokio::time::timeout;
 
 #[derive(Debug)]
 pub enum DownstreamError {
+    Disabled,
     CircuitOpen,
     Timeout,
     NotEligible,
@@ -17,6 +18,7 @@ pub enum DownstreamError {
 impl std::fmt::Display for DownstreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Disabled => write!(f, "downstream tier is disabled by configuration"),
             Self::CircuitOpen => write!(f, "circuit breaker is open"),
             Self::Timeout => write!(f, "downstream request timed out"),
             Self::NotEligible => write!(f, "Laya determined Jev is not eligible"),

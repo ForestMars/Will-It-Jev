@@ -1,0 +1,14 @@
+[router.tier1]
+enabled = true
+
+[router.tier2]
+enabled = true
+
+[router.tier3]
+enabled = true
+
+[router.tier4]
+enabled = true
+
+[router.tier5]
+enabled = true

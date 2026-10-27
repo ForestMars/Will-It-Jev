@@ -1,5 +1,6 @@
 // src/main.rs
 
+mod config;
 mod router;
 mod tagging;
 mod telemetry;
@@ -62,9 +63,14 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let verbose = std::env::args()
+        .skip(1)
+        .any(|argument| argument == "-v" || argument == "--verbose");
     let filter = match std::env::var("RUST_LOG") {
         Ok(filter) => EnvFilter::try_new(filter)?,
-        Err(std::env::VarError::NotPresent) => EnvFilter::new("info"),
+        Err(std::env::VarError::NotPresent) => {
+            EnvFilter::new(if verbose { "debug" } else { "info" })
+        }
         Err(error) => return Err(error.into()),
     };
 
@@ -75,27 +81,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Cascade Router initialized successfully");
 
+    let config_path = env_or("ROUTER_CONFIG", "config/router.toml");
+    let config = config::load_from_path(&config_path)?;
+    tracing::info!(config_path, "loaded router configuration");
+    tracing::info!(
+        tier1_enabled = config.router.tier1.enabled,
+        tier2_enabled = config.router.tier2.enabled,
+        tier3_enabled = config.router.tier3.enabled,
+        tier4_enabled = config.router.tier4.enabled,
+        tier5_enabled = config.router.tier5.enabled,
+        "configured tier status"
+    );
+    tracing::debug!(verbose, "startup verbosity configured");
+
     let tier1_path = env_or("TIER1_CONFIG", "config/tier1.toml");
-    let tier1 = Tier1Engine::new(Tier1Automaton::from_toml_file(&tier1_path)?)?;
-    let model_path = std::env::var("FASTTEXT_MODEL").unwrap_or_else(|_| default_fasttext_model_path());
-    if model_path == "models/tier2.bin" && !std::path::Path::new("models/tier2_small.bin").exists() {
-        tracing::warn!(model_path, "using legacy fastText tier-2 model; prefer models/tier2_small.bin when available");
-    }
-    let tier2 = Tier2Runner::new(&model_path, DEFAULT_CONFIDENCE_THRESHOLD)?;
-    let hashes = telemetry::Hashes {
-        tier1_toml: sha256_file(&tier1_path)?,
-        tier2_bin: sha256_file(&model_path)?,
+    let tier1 = if config.router.tier1.enabled {
+        Some(Tier1Engine::new(Tier1Automaton::from_toml_file(&tier1_path)?)?)
+    } else {
+        tracing::info!("tier 1 disabled by configuration");
+        None
     };
-    let tier3 = Tier3Runner::new(
-        env_or("TIER3_ENDPOINT", "http://[::1]:50051"),
-        0.95,
-        0.70,
-        Duration::from_millis(500),
-    )?;
+    let model_path = if config.router.tier2.enabled {
+        Some(std::env::var("FASTTEXT_MODEL").unwrap_or_else(|_| default_fasttext_model_path()))
+    } else {
+        tracing::info!("tier 2 disabled by configuration");
+        None
+    };
+    if let Some(model_path) = model_path.as_deref() {
+        if model_path == "models/tier2.bin" && !std::path::Path::new("models/tier2_small.bin").exists() {
+            tracing::warn!(model_path, "using legacy fastText tier-2 model; prefer models/tier2_small.bin when available");
+        }
+    }
+    let tier2 = model_path
+        .as_deref()
+        .map(|path| Tier2Runner::new(path, DEFAULT_CONFIDENCE_THRESHOLD))
+        .transpose()?;
+    let hashes = telemetry::Hashes {
+        tier1_toml: if tier1.is_some() { sha256_file(&tier1_path)? } else { "disabled".into() },
+        tier2_bin: match model_path.as_deref() {
+            Some(path) => sha256_file(path)?,
+            None => "disabled".into(),
+        },
+    };
+    let tier3 = if config.router.tier3.enabled {
+        Some(Tier3Runner::new(
+            env_or("TIER3_ENDPOINT", "http://[::1]:50051"),
+            0.95,
+            0.70,
+            Duration::from_millis(500),
+        )?)
+    } else {
+        tracing::info!("tier 3 disabled by configuration");
+        None
+    };
 
     let downstream_timeout =
         Duration::from_millis(env_or("DOWNSTREAM_TIMEOUT_MS", "120000").parse()?);
-    let dispatcher = DownstreamDispatcher::new(
+    let dispatcher = DownstreamDispatcher::new_with_enabled(
         env_or("TIER4_ENDPOINT", "http://127.0.0.1:11435/api/decide"),
         env_or("OLLAMA_GENERATE_URL", "http://127.0.0.1:11434/api/generate"),
         env_or("GEMMA_MODEL", "gemma3:latest"),
@@ -103,6 +145,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         3,
         Duration::from_secs(30),
         Duration::from_secs(30),
+        config.router.tier4.enabled,
+        config.router.tier5.enabled,
     )?;
 
     let clickhouse_url = env_or("CLICKHOUSE_URL", "http://127.0.0.1:8123");

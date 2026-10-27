@@ -26,9 +26,9 @@ use super::{
 
 #[derive(Clone)]
 pub struct AppState {
-    tier1: Arc<Tier1Engine>,
-    tier2: Arc<Tier2Runner>,
-    tier3: Arc<Tier3Runner>,
+    tier1: Option<Arc<Tier1Engine>>,
+    tier2: Option<Arc<Tier2Runner>>,
+    tier3: Option<Arc<Tier3Runner>>,
     dispatcher: Arc<DownstreamDispatcher>,
     hashes: Arc<Hashes>,
     capture_tx: mpsc::Sender<RouteRecord>,
@@ -44,9 +44,9 @@ pub struct CompletionRequest {
 }
 
 pub fn app(
-    tier1: Tier1Engine,
-    tier2: Tier2Runner,
-    tier3: Tier3Runner,
+    tier1: Option<Tier1Engine>,
+    tier2: Option<Tier2Runner>,
+    tier3: Option<Tier3Runner>,
     dispatcher: DownstreamDispatcher,
     hashes: Hashes,
     capture_tx: mpsc::Sender<RouteRecord>,
@@ -54,9 +54,9 @@ pub fn app(
     budget: Duration,
 ) -> Router {
     let state = AppState {
-        tier1: Arc::new(tier1),
-        tier2: Arc::new(tier2),
-        tier3: Arc::new(tier3),
+        tier1: tier1.map(Arc::new),
+        tier2: tier2.map(Arc::new),
+        tier3: tier3.map(Arc::new),
         dispatcher: Arc::new(dispatcher),
         hashes: Arc::new(hashes),
         capture_tx,
@@ -116,9 +116,9 @@ async fn completion(
     let (_, mut record) = cascade::route(
         telemetry::next_req_id(),
         &route_input,
-        &state.tier1,
-        &state.tier2,
-        &state.tier3,
+        state.tier1.as_deref(),
+        state.tier2.as_deref(),
+        state.tier3.as_deref(),
         state.budget,
         &state.hashes,
     )
@@ -290,9 +290,9 @@ mod tests {
         );
         let (tx, _rx) = mpsc::channel(2);
         let application = app(
-            tier1,
-            tier2,
-            tier3,
+            Some(tier1),
+            Some(tier2),
+            Some(tier3),
             dispatcher,
             Hashes {
                 tier1_toml: String::new(),
