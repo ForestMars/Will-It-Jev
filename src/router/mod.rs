@@ -2,6 +2,7 @@
 
 pub mod cascade;
 pub mod dispatch;
+pub mod modernbert_runner;
 pub mod service;
 pub mod tier1_runner;
 pub mod tier2_runner;

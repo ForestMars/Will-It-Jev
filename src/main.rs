@@ -9,6 +9,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use crate::tagging::{ClickHouseRawTable, OvenV1Tagger, TagConfig};
 use router::dispatch::DownstreamDispatcher;
+use router::modernbert_runner::ModernBertRunner;
 use router::service;
 use router::tier1_runner::{Tier1Automaton, Tier1Engine};
 use router::tier2_runner::{Tier2Runner, DEFAULT_CONFIDENCE_THRESHOLD};
@@ -90,6 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tier3_enabled = config.router.tier3.enabled,
         tier4_enabled = config.router.tier4.enabled,
         tier5_enabled = config.router.tier5.enabled,
+        tier6_enabled = config.router.tier6.enabled,
         "configured tier status"
     );
     tracing::debug!(verbose, "startup verbosity configured");
@@ -124,29 +126,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     };
     let tier3 = if config.router.tier3.enabled {
+        Some(ModernBertRunner::new())
+    } else {
+        tracing::info!("tier 3 disabled by configuration");
+        None
+    };
+    let tier4 = if config.router.tier4.enabled {
         Some(Tier3Runner::new(
-            env_or("TIER3_ENDPOINT", "http://[::1]:50051"),
+            env_or(
+                "TIER4_HARRIER_ENDPOINT",
+                &env_or("TIER3_ENDPOINT", "http://[::1]:50051"),
+            ),
             0.95,
             0.70,
             Duration::from_millis(500),
         )?)
     } else {
-        tracing::info!("tier 3 disabled by configuration");
+        tracing::info!("tier 4 disabled by configuration");
         None
     };
 
     let downstream_timeout =
         Duration::from_millis(env_or("DOWNSTREAM_TIMEOUT_MS", "120000").parse()?);
     let dispatcher = DownstreamDispatcher::new_with_enabled(
-        env_or("TIER4_ENDPOINT", "http://127.0.0.1:11435/api/decide"),
+        env_or(
+            "TIER5_ENDPOINT",
+            &env_or("TIER4_ENDPOINT", "http://127.0.0.1:11435/api/decide"),
+        ),
         env_or("OLLAMA_GENERATE_URL", "http://127.0.0.1:11434/api/generate"),
         env_or("GEMMA_MODEL", "gemma3:latest"),
         downstream_timeout,
         3,
         Duration::from_secs(30),
         Duration::from_secs(30),
-        config.router.tier4.enabled,
         config.router.tier5.enabled,
+        config.router.tier6.enabled,
     )?;
 
     let clickhouse_url = env_or("CLICKHOUSE_URL", "http://127.0.0.1:8123");
@@ -211,6 +225,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tier1,
         tier2,
         tier3,
+        tier4,
         dispatcher,
         hashes,
         capture_tx.clone(),

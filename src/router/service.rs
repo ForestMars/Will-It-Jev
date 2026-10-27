@@ -22,13 +22,15 @@ use super::{
     tier1_runner::Tier1Engine,
     tier2_runner::Tier2Runner,
     tier3_runner::Tier3Runner,
+    modernbert_runner::ModernBertRunner,
 };
 
 #[derive(Clone)]
 pub struct AppState {
     tier1: Option<Arc<Tier1Engine>>,
     tier2: Option<Arc<Tier2Runner>>,
-    tier3: Option<Arc<Tier3Runner>>,
+    tier3: Option<Arc<ModernBertRunner>>,
+    tier4: Option<Arc<Tier3Runner>>,
     dispatcher: Arc<DownstreamDispatcher>,
     hashes: Arc<Hashes>,
     capture_tx: mpsc::Sender<RouteRecord>,
@@ -46,7 +48,8 @@ pub struct CompletionRequest {
 pub fn app(
     tier1: Option<Tier1Engine>,
     tier2: Option<Tier2Runner>,
-    tier3: Option<Tier3Runner>,
+    tier3: Option<ModernBertRunner>,
+    tier4: Option<Tier3Runner>,
     dispatcher: DownstreamDispatcher,
     hashes: Hashes,
     capture_tx: mpsc::Sender<RouteRecord>,
@@ -57,6 +60,7 @@ pub fn app(
         tier1: tier1.map(Arc::new),
         tier2: tier2.map(Arc::new),
         tier3: tier3.map(Arc::new),
+        tier4: tier4.map(Arc::new),
         dispatcher: Arc::new(dispatcher),
         hashes: Arc::new(hashes),
         capture_tx,
@@ -119,6 +123,7 @@ async fn completion(
         state.tier1.as_deref(),
         state.tier2.as_deref(),
         state.tier3.as_deref(),
+        state.tier4.as_deref(),
         state.budget,
         &state.hashes,
     )
@@ -143,7 +148,7 @@ async fn completion(
             let payload = result.payload.clone();
             let response_text = payload.to_string();
             let request_id = record.request_id.clone();
-            record.final_routing.backend = if result.tier == 4 { "jev" } else { "llm" }.into();
+            record.final_routing.backend = if result.tier == 5 { "jev" } else { "llm" }.into();
             record.final_routing.tier = result.tier;
             record.final_routing.latency_us += result.request_latency.as_micros();
             record.downstream_invocation_latency_ms =
@@ -292,6 +297,7 @@ mod tests {
         let application = app(
             Some(tier1),
             Some(tier2),
+            None,
             Some(tier3),
             dispatcher,
             Hashes {
