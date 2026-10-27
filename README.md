@@ -86,7 +86,7 @@ Disabled tiers are skipped without cost. Tiers are always evaluated in numeric o
 ### Tier 3: ModernBERT ONNX Runtime
 
 - **Placement:** ModernBERT evaluates requests after FastText and before Harrier.
-- **Runtime:** The intended backend is ONNX Runtime, not GGUF. The initial Rust runner is a stub that passes requests through with `not_implemented` until ONNX tokenization and inference are integrated.
+- **Runtime:** ModernBERT runs through ONNX Runtime, not GGUF. The router calls a dedicated gRPC sidecar, which tokenizes the prompt and scores the two-class ONNX output.
 
 ### Tier 4: Harrier Sidecar
 
@@ -112,7 +112,7 @@ Latency figures are per-tier p99 budgets. Coverage figures are **design targets*
 | :--- | :--- | :--- | :--- |
 | 1 | `regex::RegexSet` and hash maps | < 0.1 ms | 25% to 35% |
 | 2 | FastText subword (`libfasttext`) | 0.2 ms to 0.4 ms | 40% to 50% |
-| 3 | ModernBERT via ONNX Runtime (stub currently passes through) | TBD | TBD |
+| 3 | ModernBERT via ONNX Runtime sidecar | TBD | TBD |
 | 4 | Harrier sidecar over gRPC | 1.5 ms to 8.0 ms | 15% to 25% |
 | 5 | Jev self-evaluation | 20 ms to 50 ms | 3% to 5% |
 | 6 | Frontier LLM | Variable | < 1% |
@@ -189,6 +189,15 @@ enabled = true
 
 Tier 1 rules and model/backend locations continue to use their existing environment variables and `config/tier1.toml`; the master file controls whether each tier is constructed. At least one tier must be enabled. If a request reaches a disabled downstream tier, the router returns an explicit downstream error rather than invoking it.
 
+When Tier 3 is enabled, run the ModernBERT sidecar separately. It loads `models/modernbert-base/model_int8.onnx` and `models/modernbert-base/tokenizer.json` at startup and listens on port `50052` by default:
+
+```bash
+pip install -r sidecars/modernbert/requirements.txt
+python sidecars/modernbert/server.py
+```
+
+Set `MODERNBERT_ENDPOINT` on the router to change its gRPC address. The model must be a two-class ONNX sequence classifier; set `MODERNBERT_JEV_LABEL_INDEX` to `0` or `1` if Jev is not class index `1`.
+
 ---
 
 ## Building
@@ -226,13 +235,13 @@ Binaries built with `target-cpu=native` are not portable across CPU generations.
 
 ## Model Artifacts
 
-ModernBERT ONNX artifacts are present, but the current Tier 3 stub does not load them yet.
+ModernBERT requires a valid ONNX sequence-classification model and matching tokenizer at the paths below. The checked-in files may be placeholders; the sidecar fails at startup if either file is empty.
 
 | Artifact | Used by | Produced by |
 | :--- | :--- | :--- |
 | `router_fastpath.ftz` | Tier 2 | `scripts/train_fasttext.py` |
-| `models/modernbert-base/model_int8.onnx` | Planned Tier 3 inference | ONNX export and Int8 quantization pipeline |
-| `models/modernbert-base/tokenizer.json` | Planned Tier 3 inference | Tokenizer matching the ModernBERT ONNX model |
+| `models/modernbert-base/model_int8.onnx` | Tier 3 | ONNX export and Int8 quantization pipeline |
+| `models/modernbert-base/tokenizer.json` | Tier 3 | Tokenizer matching the ModernBERT ONNX model |
 
 ### Training the Tier 2 model
 
@@ -366,7 +375,8 @@ applied to enable typed route-decision and task-tag ingestion. The route and tag
 JSONL spool files under `logs/`; ClickHouse insert failures are logged and do not block gateway
 responses. Spool lines remain available for manual replay if ClickHouse is unavailable.
 
-The principal runtime overrides are `ROUTER_BIND`, `TIER4_HARRIER_ENDPOINT` (falls back to
+The principal runtime overrides are `ROUTER_BIND`, `MODERNBERT_ENDPOINT` (default
+`http://[::1]:50052`), `TIER4_HARRIER_ENDPOINT` (falls back to
 `TIER3_ENDPOINT` for compatibility), `TIER5_ENDPOINT` (falls back to `TIER4_ENDPOINT`, default
 `http://127.0.0.1:11435/api/decide`), `OLLAMA_GENERATE_URL` (default
 `http://127.0.0.1:11434/api/generate`), `GEMMA_MODEL` (default `gemma3:latest`),

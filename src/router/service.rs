@@ -22,14 +22,13 @@ use super::{
     tier1_runner::Tier1Engine,
     tier2_runner::Tier2Runner,
     tier3_runner::Tier3Runner as HarrierRunner,
-    modernbert_runner::ModernBertRunner,
 };
 
 #[derive(Clone)]
 pub struct AppState {
     tier1: Option<Arc<Tier1Engine>>,
     tier2: Option<Arc<Tier2Runner>>,
-    tier3: Option<Arc<ModernBertRunner>>,
+    tier3: Option<Arc<HarrierRunner>>,
     tier4: Option<Arc<HarrierRunner>>,
     dispatcher: Arc<DownstreamDispatcher>,
     hashes: Arc<Hashes>,
@@ -48,7 +47,7 @@ pub struct CompletionRequest {
 pub fn app(
     tier1: Option<Tier1Engine>,
     tier2: Option<Tier2Runner>,
-    tier3: Option<ModernBertRunner>,
+    tier3: Option<HarrierRunner>,
     tier4: Option<HarrierRunner>,
     dispatcher: DownstreamDispatcher,
     hashes: Hashes,

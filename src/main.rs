@@ -9,7 +9,6 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use crate::tagging::{ClickHouseRawTable, OvenV1Tagger, TagConfig};
 use router::dispatch::DownstreamDispatcher;
-use router::modernbert_runner::ModernBertRunner;
 use router::service;
 use router::tier1_runner::{Tier1Automaton, Tier1Engine};
 use router::tier2_runner::{Tier2Runner, DEFAULT_CONFIDENCE_THRESHOLD};
@@ -126,7 +125,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     };
     let modernbert = if config.router.tier3.enabled {
-        Some(ModernBertRunner::new())
+        Some(Tier3Runner::new(
+            env_or("MODERNBERT_ENDPOINT", "http://[::1]:50052"),
+            0.95,
+            0.70,
+            Duration::from_millis(500),
+        )?)
     } else {
         tracing::info!("tier 3 disabled by configuration");
         None

@@ -1,0 +1,14 @@
+[project]
+name = "modernbert-onnx-sidecar"
+version = "0.1.0"
+description = "ModernBERT ONNX Runtime Tier 3 scoring sidecar"
+requires-python = ">=3.12"
+dependencies = [
+	"grpcio>=1.60",
+	"numpy>=1.26",
+	"onnxruntime>=1.17",
+	"tokenizers>=0.15",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]

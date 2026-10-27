@@ -20,7 +20,6 @@ use crate::telemetry::{
 use super::tier1_runner::{Tier1Engine, AMBIGUITY_UPPER_BOUND};
 use super::tier2_runner::{Tier2Outcome, Tier2Route, Tier2Runner};
 use super::tier3_runner::{Tier3Outcome, Tier3Route, Tier3Runner};
-use super::modernbert_runner::ModernBertRunner;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
@@ -121,7 +120,7 @@ pub async fn route(
     prompt: &str,
     t1: Option<&Tier1Engine>,
     t2: Option<&Tier2Runner>,
-    t3: Option<&ModernBertRunner>,
+    t3: Option<&Tier3Runner>,
     t4: Option<&Tier3Runner>,
     budget: Duration,
     hashes: &Hashes,
@@ -429,8 +428,14 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn modernbert_stub_passes_through_to_terminal_tier() {
-        let modernbert = ModernBertRunner::new();
+    async fn modernbert_rpc_failure_passes_through_to_terminal_tier() {
+        let modernbert = Tier3Runner::new(
+            "http://127.0.0.1:1".into(),
+            0.95,
+            0.70,
+            Duration::from_millis(20),
+        )
+        .unwrap();
         let hashes = Hashes {
             tier1_toml: "disabled".into(),
             tier2_bin: "disabled".into(),
@@ -448,7 +453,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(record.tier3_outcome.as_ref().unwrap().reason, "not_implemented");
+        assert_eq!(record.tier3_outcome.as_ref().unwrap().reason, "rpc_error");
         assert_eq!(record.cascade_decision_tier, 6);
         assert!(record.tier4_outcome.is_none());
     }
