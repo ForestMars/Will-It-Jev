@@ -13,7 +13,7 @@ use router::modernbert_runner::ModernBertRunner;
 use router::service;
 use router::tier1_runner::{Tier1Automaton, Tier1Engine};
 use router::tier2_runner::{Tier2Runner, DEFAULT_CONFIDENCE_THRESHOLD};
-use router::tier3_runner::Tier3Runner;
+use router::tier3_runner::Tier3Runner as HarrierRunner;
 
 use sha2::{Digest, Sha256};
 use tokio::fs::OpenOptions;
@@ -125,14 +125,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => "disabled".into(),
         },
     };
-    let tier3 = if config.router.tier3.enabled {
+    let modernbert = if config.router.tier3.enabled {
         Some(ModernBertRunner::new())
     } else {
         tracing::info!("tier 3 disabled by configuration");
         None
     };
-    let tier4 = if config.router.tier4.enabled {
-        Some(Tier3Runner::new(
+    let harrier = if config.router.tier4.enabled {
+        Some(HarrierRunner::new(
             env_or(
                 "TIER4_HARRIER_ENDPOINT",
                 &env_or("TIER3_ENDPOINT", "http://[::1]:50051"),
@@ -224,8 +224,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = service::app(
         tier1,
         tier2,
-        tier3,
-        tier4,
+        modernbert,
+        harrier,
         dispatcher,
         hashes,
         capture_tx.clone(),

@@ -23,7 +23,7 @@
 -- counts before a merge has run. route_records_raw keeps every replayed line.
 --
 -- Tier numbering note: cascade tiers 1-4 are classification tiers. dispatch.rs
--- reuses 4 and 5 for the downstream endpoints (jev, frontier). service.rs overwrites
+-- uses 5 and 6 for the downstream endpoints (jev, frontier). service.rs overwrites
 -- final_routing.tier with the downstream value after dispatch, so the tier that
 -- DECIDED the route is derived below as decided_by_tier from the per-tier outcomes.
 --
@@ -72,9 +72,13 @@ CREATE TABLE llm_observability.route_decisions
     tier2_raw_probabilities         Array(Float32),
     tier2_reason                    LowCardinality(Nullable(String)),
 
-    -- tier 3: harrier sidecar (null when tier 1 or 2 resolved)
+    -- tier 3: ModernBERT ONNX Runtime (null when tier 1 or 2 resolved)
     tier3_score                     Nullable(Float32),
     tier3_reason                    LowCardinality(Nullable(String)),
+
+    -- tier 4: Harrier sidecar
+    tier4_score                     Nullable(Float32),
+    tier4_reason                    LowCardinality(Nullable(String)),
 
     -- the decision
     decided_by_tier                 UInt8,
@@ -120,12 +124,30 @@ SELECT
 
     JSONExtract(line, 'tier3_outcome', 'score', 'Nullable(Float32)')                     AS tier3_score,
     JSONExtract(line, 'tier3_outcome', 'reason', 'Nullable(String)')                     AS tier3_reason,
+    JSONExtract(line, 'tier4_outcome', 'score', 'Nullable(Float32)')                     AS tier4_score,
+    JSONExtract(line, 'tier4_outcome', 'reason', 'Nullable(String)')                     AS tier4_reason,
 
-    multiIf(
-        JSONExtract(line, 'tier3_outcome', 'reason', 'Nullable(String)') = 'resolved', 3,
-        JSONExtract(line, 'tier3_outcome', 'reason', 'Nullable(String)') IS NOT NULL, 4,
-        JSONExtract(line, 'tier2_outcome', 'reason', 'Nullable(String)') = 'resolved', 2,
-        1
+    if(
+        JSONHas(line, 'cascade_decision_tier'),
+        toUInt8(JSONExtractUInt(line, 'cascade_decision_tier')),
+        if(
+        JSONHas(line, 'tier4_outcome'),
+        multiIf(
+            JSONExtract(line, 'tier4_outcome', 'reason', 'Nullable(String)') = 'resolved', 4,
+            JSONExtract(line, 'tier4_outcome', 'reason', 'Nullable(String)') IS NOT NULL, 6,
+            JSONExtract(line, 'tier3_outcome', 'reason', 'Nullable(String)') = 'resolved', 3,
+            JSONExtract(line, 'tier3_outcome', 'reason', 'Nullable(String)') IS NOT NULL, 6,
+            JSONExtract(line, 'tier2_outcome', 'reason', 'Nullable(String)') = 'resolved', 2,
+            JSONExtract(line, 'tier2_outcome', 'reason', 'Nullable(String)') IS NOT NULL, 6,
+            1
+        ),
+        multiIf(
+            JSONExtract(line, 'tier3_outcome', 'reason', 'Nullable(String)') = 'resolved', 3,
+            JSONExtract(line, 'tier3_outcome', 'reason', 'Nullable(String)') IS NOT NULL, 4,
+            JSONExtract(line, 'tier2_outcome', 'reason', 'Nullable(String)') = 'resolved', 2,
+            1
+        )
+        )
     )                                                                                    AS decided_by_tier,
     if(JSONExtractBool(line, 'is_failover'), 'jev', JSONExtractString(line, 'final_routing', 'backend'))
                                                                                          AS decided_backend,

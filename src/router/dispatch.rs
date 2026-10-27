@@ -4,12 +4,12 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use super::cascade::Backend;
-use super::tier4_runner::{DownstreamError, Tier4Runner};
-use super::tier5_runner::Tier5Runner;
+use super::tier4_runner::{DownstreamError, Tier4Runner as JevRunner};
+use super::tier5_runner::Tier5Runner as LlmRunner;
 
 pub struct DownstreamDispatcher {
-    tier4: Option<Tier4Runner>,
-    tier5: Option<Tier5Runner>,
+    jev: Option<JevRunner>,
+    llm: Option<LlmRunner>,
 }
 
 pub struct DispatchOutcome {
@@ -36,18 +36,18 @@ pub struct DispatchFailure {
 impl DownstreamDispatcher {
     #[cfg(test)]
     pub fn new(
-        tier4_endpoint: String,
-        tier5_endpoint: String,
-        tier5_model: String,
+        jev_endpoint: String,
+        llm_endpoint: String,
+        llm_model: String,
         downstream_timeout: Duration,
         breaker_threshold: usize,
         breaker_window: Duration,
         breaker_open_duration: Duration,
     ) -> Result<Self, reqwest::Error> {
         Self::new_with_enabled(
-            tier4_endpoint,
-            tier5_endpoint,
-            tier5_model,
+            jev_endpoint,
+            llm_endpoint,
+            llm_model,
             downstream_timeout,
             breaker_threshold,
             breaker_window,
@@ -59,20 +59,20 @@ impl DownstreamDispatcher {
 
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_enabled(
-        tier4_endpoint: String,
-        tier5_endpoint: String,
-        tier5_model: String,
+        jev_endpoint: String,
+        llm_endpoint: String,
+        llm_model: String,
         downstream_timeout: Duration,
         breaker_threshold: usize,
         breaker_window: Duration,
         breaker_open_duration: Duration,
-        tier4_enabled: bool,
-        tier5_enabled: bool,
+        jev_enabled: bool,
+        llm_enabled: bool,
     ) -> Result<Self, reqwest::Error> {
         Ok(Self {
-            tier4: if tier4_enabled {
-                Some(Tier4Runner::new(
-                    tier4_endpoint,
+            jev: if jev_enabled {
+                Some(JevRunner::new(
+                    jev_endpoint,
                     downstream_timeout,
                     breaker_threshold,
                     breaker_window,
@@ -81,10 +81,10 @@ impl DownstreamDispatcher {
             } else {
                 None
             },
-            tier5: if tier5_enabled {
-                Some(Tier5Runner::new(
-                    tier5_endpoint,
-                    tier5_model,
+            llm: if llm_enabled {
+                Some(LlmRunner::new(
+                    llm_endpoint,
+                    llm_model,
                     downstream_timeout,
                 )?)
             } else {
@@ -103,25 +103,25 @@ impl DownstreamDispatcher {
     ) -> Result<DispatchOutcome, DispatchFailure> {
         if backend == Backend::Jev {
             let primary_started = Instant::now();
-            let Some(tier4) = self.tier4.as_ref() else {
-                return match self.tier5.as_ref() {
+            let Some(jev) = self.jev.as_ref() else {
+                return match self.llm.as_ref() {
                     Some(_) => {
-                        self.invoke_tier5(
+                        self.invoke_llm(
                             request_id,
                             prompt,
-                            Some("tier4_disabled".into()),
+                            Some("tier5_jev_disabled".into()),
                             Duration::ZERO,
                         )
                         .await
                     }
-                    None => Err(disabled_failure(4, "tier4_and_tier5_disabled")),
+                    None => Err(disabled_failure(5, "jev_and_llm_disabled")),
                 };
             };
-            let tier4_result = match (state, questions) {
-                (Some(state), Some(questions)) => tier4.invoke(state, questions).await,
+            let jev_result = match (state, questions) {
+                (Some(state), Some(questions)) => jev.invoke(state, questions).await,
                 _ => {
                     return self
-                        .invoke_tier5(
+                        .invoke_llm(
                             request_id,
                             prompt,
                             Some("typed_decision_request_required".into()),
@@ -130,12 +130,12 @@ impl DownstreamDispatcher {
                         .await
                 }
             };
-            match tier4_result {
+            match jev_result {
                 Ok((payload, elapsed)) => {
-                    downstream_metric(request_id, "tier4", "success", false, elapsed);
+                    downstream_metric(request_id, "tier5", "success", false, elapsed);
                     return Ok(DispatchOutcome {
                         payload,
-                        tier: 4,
+                        tier: 5,
                         outcome: "success",
                         is_failover: false,
                         invocation_latency: elapsed,
@@ -147,7 +147,7 @@ impl DownstreamDispatcher {
                     let (outcome, reason) = classify_error(&error);
                     downstream_metric(
                         request_id,
-                        "tier4",
+                        "tier5",
                         outcome,
                         false,
                         primary_started.elapsed(),
@@ -156,11 +156,11 @@ impl DownstreamDispatcher {
                         request_id,
                         reason_code = reason,
                         error = %error,
-                        "Jev downstream failed; falling through to Tier 5"
+                        "Jev Tier 5 failed; falling through to LLM Tier 6"
                     );
-                    return match self.tier5.as_ref() {
+                    return match self.llm.as_ref() {
                         Some(_) => {
-                            self.invoke_tier5(
+                            self.invoke_llm(
                                 request_id,
                                 prompt,
                                 Some(reason.to_string()),
@@ -168,21 +168,21 @@ impl DownstreamDispatcher {
                             )
                             .await
                         }
-                        None => Err(disabled_failure(5, "tier5_disabled_after_tier4_failure")),
+                        None => Err(disabled_failure(6, "llm_disabled_after_jev_failure")),
                     };
                 }
             }
         }
 
-        if self.tier5.is_some() {
-            self.invoke_tier5(request_id, prompt, None, Duration::ZERO)
+        if self.llm.is_some() {
+            self.invoke_llm(request_id, prompt, None, Duration::ZERO)
                 .await
         } else {
-            Err(disabled_failure(5, "tier5_disabled"))
+            Err(disabled_failure(6, "llm_disabled"))
         }
     }
 
-    async fn invoke_tier5(
+    async fn invoke_llm(
         &self,
         request_id: &str,
         prompt: &str,
@@ -191,15 +191,15 @@ impl DownstreamDispatcher {
     ) -> Result<DispatchOutcome, DispatchFailure> {
         let is_failover = failure_reason.is_some();
         let started = Instant::now();
-        let Some(tier5) = self.tier5.as_ref() else {
-            return Err(disabled_failure(5, "tier5_disabled"));
+        let Some(llm) = self.llm.as_ref() else {
+            return Err(disabled_failure(6, "llm_disabled"));
         };
-        match tier5.invoke(prompt).await {
+        match llm.invoke(prompt).await {
             Ok((payload, elapsed)) => {
-                downstream_metric(request_id, "tier5", "success", is_failover, elapsed);
+                downstream_metric(request_id, "tier6", "success", is_failover, elapsed);
                 Ok(DispatchOutcome {
                     payload,
-                    tier: 5,
+                    tier: 6,
                     outcome: "success",
                     is_failover,
                     invocation_latency: elapsed,
@@ -209,16 +209,16 @@ impl DownstreamDispatcher {
             }
             Err(error) => {
                 let (outcome, reason) = classify_error(&error);
-                downstream_metric(request_id, "tier5", outcome, is_failover, started.elapsed());
+                downstream_metric(request_id, "tier6", outcome, is_failover, started.elapsed());
                 warn!(
                     request_id,
                     reason_code = reason,
                     error = %error,
-                    "Tier 5 generative downstream failed"
+                    "Tier 6 generative downstream failed"
                 );
                 Err(DispatchFailure {
                     error,
-                    tier: 5,
+                    tier: 6,
                     outcome,
                     is_failover,
                     invocation_latency: started.elapsed(),
@@ -356,13 +356,13 @@ mod tests {
             Ok(_) => panic!("disabled tier unexpectedly returned a response"),
         };
 
-        assert_eq!(error.tier, 5);
+        assert_eq!(error.tier, 6);
         assert_eq!(error.outcome, "disabled");
-        assert_eq!(error.failure_reason, "tier5_disabled");
+        assert_eq!(error.failure_reason, "llm_disabled");
     }
 
     #[tokio::test]
-    async fn connection_refused_falls_through_to_tier5() {
+    async fn connection_refused_falls_through_to_tier6() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
@@ -384,7 +384,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(result.tier, 5);
+        assert_eq!(result.tier, 6);
         assert!(result.is_failover);
         assert_eq!(result.failure_reason.as_deref(), Some("transport_error"));
         assert_eq!(
@@ -415,7 +415,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(result.tier, 5);
+        assert_eq!(result.tier, 6);
         assert!(result.is_failover);
         assert_eq!(result.failure_reason.as_deref(), Some("timeout"));
         assert_eq!(
@@ -425,7 +425,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn laya_ineligible_decision_falls_through_to_tier5() {
+    async fn laya_ineligible_decision_falls_through_to_tier6() {
         let jev = stub(
             "200 OK",
             r#"{"answers":{"__router_jev_eligible":{"choice":"no","confidence":1.0}}}"#,
@@ -447,7 +447,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.tier, 5);
+        assert_eq!(result.tier, 6);
         assert!(result.is_failover);
         assert_eq!(result.failure_reason.as_deref(), Some("jev_not_eligible"));
         assert_eq!(

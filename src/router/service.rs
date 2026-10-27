@@ -21,7 +21,7 @@ use super::{
     dispatch::DownstreamDispatcher,
     tier1_runner::Tier1Engine,
     tier2_runner::Tier2Runner,
-    tier3_runner::Tier3Runner,
+    tier3_runner::Tier3Runner as HarrierRunner,
     modernbert_runner::ModernBertRunner,
 };
 
@@ -30,7 +30,7 @@ pub struct AppState {
     tier1: Option<Arc<Tier1Engine>>,
     tier2: Option<Arc<Tier2Runner>>,
     tier3: Option<Arc<ModernBertRunner>>,
-    tier4: Option<Arc<Tier3Runner>>,
+    tier4: Option<Arc<HarrierRunner>>,
     dispatcher: Arc<DownstreamDispatcher>,
     hashes: Arc<Hashes>,
     capture_tx: mpsc::Sender<RouteRecord>,
@@ -49,7 +49,7 @@ pub fn app(
     tier1: Option<Tier1Engine>,
     tier2: Option<Tier2Runner>,
     tier3: Option<ModernBertRunner>,
-    tier4: Option<Tier3Runner>,
+    tier4: Option<HarrierRunner>,
     dispatcher: DownstreamDispatcher,
     hashes: Hashes,
     capture_tx: mpsc::Sender<RouteRecord>,

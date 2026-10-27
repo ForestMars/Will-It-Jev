@@ -97,6 +97,7 @@ fn finish_route(
         tier2_outcome,
         tier3_outcome,
         tier4_outcome,
+        cascade_decision_tier: decision.decided_by_tier,
         final_routing: FinalRouting {
             backend: decision.backend.to_string(),
             tier: decision.decided_by_tier,
@@ -421,4 +422,34 @@ pub async fn route(
         tier3_record,
         tier4_record,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn modernbert_stub_passes_through_to_terminal_tier() {
+        let modernbert = ModernBertRunner::new();
+        let hashes = Hashes {
+            tier1_toml: "disabled".into(),
+            tier2_bin: "disabled".into(),
+        };
+
+        let (_, record) = route(
+            1,
+            "ambiguous request",
+            None,
+            None,
+            Some(&modernbert),
+            None,
+            Duration::from_secs(1),
+            &hashes,
+        )
+        .await;
+
+        assert_eq!(record.tier3_outcome.as_ref().unwrap().reason, "not_implemented");
+        assert_eq!(record.cascade_decision_tier, 6);
+        assert!(record.tier4_outcome.is_none());
+    }
 }
