@@ -1,0 +1,13 @@
+name: "jev-router"
+language: "rust"
+adopted: true
+
+services:
+  clickhouse: true
+  grafana: false
+  langfuse: false
+  loki: false
+  postgres: false
+  rabbitmq: false
+  redis: false
+  tempo: false
