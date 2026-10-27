@@ -1,0 +1,28 @@
+services:
+    clickhouse:
+        environment:
+            CLICKHOUSE_DB: default
+            CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+            CLICKHOUSE_PASSWORD: app
+            CLICKHOUSE_USER: app
+        healthcheck:
+            interval: 5s
+            retries: 20
+            test:
+                - CMD
+                - clickhouse-client
+                - --user
+                - app
+                - --password
+                - app
+                - --query
+                - SELECT 1
+            timeout: 3s
+        image: clickhouse/clickhouse-server:25.3
+        ports:
+            - 8123:8123
+            - 9000:9000
+        volumes:
+            - clickhouse_data:/var/lib/clickhouse
+volumes:
+    clickhouse_data: {}
