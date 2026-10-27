@@ -34,6 +34,7 @@ pub struct DispatchFailure {
 }
 
 impl DownstreamDispatcher {
+    #[cfg(test)]
     pub fn new(
         tier4_endpoint: String,
         tier5_endpoint: String,
@@ -81,7 +82,11 @@ impl DownstreamDispatcher {
                 None
             },
             tier5: if tier5_enabled {
-                Some(Tier5Runner::new(tier5_endpoint, tier5_model, downstream_timeout)?)
+                Some(Tier5Runner::new(
+                    tier5_endpoint,
+                    tier5_model,
+                    downstream_timeout,
+                )?)
             } else {
                 None
             },
@@ -100,14 +105,15 @@ impl DownstreamDispatcher {
             let primary_started = Instant::now();
             let Some(tier4) = self.tier4.as_ref() else {
                 return match self.tier5.as_ref() {
-                    Some(_) => self
-                        .invoke_tier5(
+                    Some(_) => {
+                        self.invoke_tier5(
                             request_id,
                             prompt,
                             Some("tier4_disabled".into()),
                             Duration::ZERO,
                         )
-                        .await,
+                        .await
+                    }
                     None => Err(disabled_failure(4, "tier4_and_tier5_disabled")),
                 };
             };
@@ -139,7 +145,13 @@ impl DownstreamDispatcher {
                 }
                 Err(error) => {
                     let (outcome, reason) = classify_error(&error);
-                    downstream_metric(request_id, "tier4", outcome, false, primary_started.elapsed());
+                    downstream_metric(
+                        request_id,
+                        "tier4",
+                        outcome,
+                        false,
+                        primary_started.elapsed(),
+                    );
                     warn!(
                         request_id,
                         reason_code = reason,
@@ -147,9 +159,15 @@ impl DownstreamDispatcher {
                         "Jev downstream failed; falling through to Tier 5"
                     );
                     return match self.tier5.as_ref() {
-                        Some(_) => self
-                            .invoke_tier5(request_id, prompt, Some(reason.to_string()), primary_started.elapsed())
-                            .await,
+                        Some(_) => {
+                            self.invoke_tier5(
+                                request_id,
+                                prompt,
+                                Some(reason.to_string()),
+                                primary_started.elapsed(),
+                            )
+                            .await
+                        }
                         None => Err(disabled_failure(5, "tier5_disabled_after_tier4_failure")),
                     };
                 }
@@ -157,7 +175,8 @@ impl DownstreamDispatcher {
         }
 
         if self.tier5.is_some() {
-            self.invoke_tier5(request_id, prompt, None, Duration::ZERO).await
+            self.invoke_tier5(request_id, prompt, None, Duration::ZERO)
+                .await
         } else {
             Err(disabled_failure(5, "tier5_disabled"))
         }
@@ -204,8 +223,7 @@ impl DownstreamDispatcher {
                     is_failover,
                     invocation_latency: started.elapsed(),
                     request_latency: elapsed_before + started.elapsed(),
-                    failure_reason: failure_reason
-                        .unwrap_or_else(|| reason.to_string()),
+                    failure_reason: failure_reason.unwrap_or_else(|| reason.to_string()),
                 })
             }
         }
@@ -349,7 +367,11 @@ mod tests {
         let address = listener.local_addr().unwrap();
         drop(listener);
         let frontier = stub("200 OK", r#"{"completion":"frontier"}"#, Duration::ZERO).await;
-        let router = dispatcher(format!("http://{address}/"), frontier, Duration::from_millis(300));
+        let router = dispatcher(
+            format!("http://{address}/"),
+            frontier,
+            Duration::from_millis(300),
+        );
         let (state, questions) = decision_request();
 
         let result = router
@@ -365,12 +387,20 @@ mod tests {
         assert_eq!(result.tier, 5);
         assert!(result.is_failover);
         assert_eq!(result.failure_reason.as_deref(), Some("transport_error"));
-        assert_eq!(result.payload["completion"], Value::String("frontier".into()));
+        assert_eq!(
+            result.payload["completion"],
+            Value::String("frontier".into())
+        );
     }
 
     #[tokio::test]
     async fn downstream_timeout_falls_through_and_excludes_primary_latency() {
-        let jev = stub("200 OK", r#"{"completion":"late"}"#, Duration::from_millis(200)).await;
+        let jev = stub(
+            "200 OK",
+            r#"{"completion":"late"}"#,
+            Duration::from_millis(200),
+        )
+        .await;
         let frontier = stub("200 OK", r#"{"completion":"frontier"}"#, Duration::ZERO).await;
         let router = dispatcher(jev, frontier, Duration::from_millis(50));
         let (state, questions) = decision_request();
@@ -388,7 +418,10 @@ mod tests {
         assert_eq!(result.tier, 5);
         assert!(result.is_failover);
         assert_eq!(result.failure_reason.as_deref(), Some("timeout"));
-        assert_eq!(result.payload["completion"], Value::String("frontier".into()));
+        assert_eq!(
+            result.payload["completion"],
+            Value::String("frontier".into())
+        );
     }
 
     #[tokio::test]
@@ -417,6 +450,9 @@ mod tests {
         assert_eq!(result.tier, 5);
         assert!(result.is_failover);
         assert_eq!(result.failure_reason.as_deref(), Some("jev_not_eligible"));
-        assert_eq!(result.payload["completion"], Value::String("frontier".into()));
+        assert_eq!(
+            result.payload["completion"],
+            Value::String("frontier".into())
+        );
     }
 }
