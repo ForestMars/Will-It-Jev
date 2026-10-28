@@ -38,7 +38,7 @@ FROM system.databases
 WHERE name = 'llm_observability'
 FORMAT Null;
 
-CREATE DATABASE llm_observability;
+CREATE DATABASE IF NOT EXISTS llm_observability;
 
 CREATE TABLE llm_observability.route_records_raw
 (
