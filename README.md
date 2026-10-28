@@ -88,7 +88,13 @@ Disabled tiers are skipped without cost. Tiers are always evaluated in numeric o
 - **Placement:** ModernBERT evaluates requests after FastText and before Harrier.
 - **Runtime:** ModernBERT runs through ONNX Runtime, not GGUF. The router calls a dedicated gRPC sidecar, which tokenizes the prompt and scores the two-class ONNX output.
 
-### Tier 4: Harrier Sidecar
+### Tier 4: Micro-Transformer / Embedding Evaluators
+
+- **Engines:** Harrier or Oryn. Exactly one in-process engine is selected through configuration. A remote gRPC evaluator can be used instead.
+In-process path: Int8-quantized ONNX models executed by ONNX Runtime (ort), with the HuggingFace tokenizers Rust library for tokenization.
+- **Scoring:** the prompt embedding is compared by cosine similarity (SIMD-accelerated with simsimd) against pre-computed route centroids.
+SIMD targets: AVX-512 on x86-64, NEON on ARM.
+Remote path: the gRPC client in src/tier2/remote/ allows the same evaluator contract to be served out of process.
 
 - **Semantic Classification:** Harrier is the gRPC-backed classifier after ModernBERT. A confident result resolves the route; weak or failed evaluations pass through to Tier 5.
 - **Independent Stage:** ModernBERT and Harrier are separate sequential tiers, not swappable backends.
