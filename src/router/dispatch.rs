@@ -5,7 +5,7 @@ use tracing::{info, warn};
 
 use super::cascade::Backend;
 use super::tier4_runner::{DownstreamError, Tier4Runner as JevRunner};
-use super::tier5_runner::Tier5Runner as LlmRunner;
+use super::tier6_runner::Tier6Runner as LlmRunner;
 
 pub struct DownstreamDispatcher {
     jev: Option<JevRunner>,
