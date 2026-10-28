@@ -265,7 +265,8 @@ pub async fn route(
     let tier3_record = if let Some(t3) = t3 {
         info!("[request_id={request_id}] TRY tier=3 (modernbert/onnx) prompt={prompt:?}");
         let t = Instant::now();
-        let tier3_result = t3.evaluate(prompt);
+        let left = budget.saturating_sub(start.elapsed());
+        let tier3_result = t3.evaluate(prompt, left).await;
         let tier3_record = match &tier3_result {
             Tier3Outcome::Resolved { confidence, .. } => Some(Tier3Record {
                 score: *confidence,
