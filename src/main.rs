@@ -12,7 +12,7 @@ use router::dispatch::DownstreamDispatcher;
 use router::service;
 use router::tier1_runner::{Tier1Automaton, Tier1Engine};
 use router::tier2_runner::{Tier2Runner, DEFAULT_CONFIDENCE_THRESHOLD};
-use router::tier3_runner::Tier3Runner as HarrierRunner;
+use router::tier3_runner::Tier3Runner;
 
 use sha2::{Digest, Sha256};
 use tokio::fs::OpenOptions;
@@ -125,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     };
     let modernbert = if config.router.tier3.enabled {
-        Some(HarrierRunner::new(
+        Some(Tier3Runner::new(
             env_or("MODERNBERT_ENDPOINT", "http://[::1]:50052"),
             0.95,
             0.70,
@@ -136,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let harrier = if config.router.tier4.enabled {
-        Some(HarrierRunner::new(
+        Some(Tier3Runner::new(
             env_or(
                 "TIER4_HARRIER_ENDPOINT",
                 &env_or("TIER3_ENDPOINT", "http://[::1]:50051"),
