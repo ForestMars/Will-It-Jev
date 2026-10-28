@@ -139,11 +139,11 @@ src/
   router/
     cascade.rs        Pipeline dispatcher and lifecycle orchestration
     tier1.rs          Static hash, length bound, and regex evaluator
-    tier2.rs          FastText subword classifier runner
-    modernbert_runner.rs  Tier 3 ModernBERT ONNX stub
-    tier3_runner.rs       Tier 4 Harrier gRPC client
-    tier4_runner.rs       Tier 5 Jev downstream client
-    tier5_runner.rs       Tier 6 generative model client
+    tier2.rs          Learned Decision Tier (FastText subword classifier)
+    tier3_runner.rs   (ModernBERT ONNX runtime stub)
+    tier4.rs          Micro-Transformer / Embedding Evaluators (gRPC client using GGUF) 
+    tier4_runner.rs   Jev Self-evaluation
+    tier6_runner.rs   Generative LLM Fallback
   tier3/
     calibration.rs    Margin calculation and probability calibration
     trait.rs          Core evaluator trait and contract definitions
