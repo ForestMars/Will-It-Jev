@@ -14,6 +14,7 @@ use router::tier1_runner::{Tier1Automaton, Tier1Engine};
 use router::tier2_runner::{Tier2Runner, DEFAULT_CONFIDENCE_THRESHOLD};
 use router::tier3_runner::Tier3Runner;
 
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use sha2::{Digest, Sha256};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
@@ -39,6 +40,83 @@ fn default_fasttext_model_path() -> String {
 
 fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
+}
+
+/// Reads KEY=VALUE pairs from a dotenv-style file such as the `.auth` file devo writes.
+/// A missing or unreadable file yields no entries.
+fn read_env_file(path: &str) -> std::collections::HashMap<String, String> {
+    let mut entries = std::collections::HashMap::new();
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return entries;
+    };
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|inner| inner.strip_suffix('"'))
+            .or_else(|| {
+                value
+                    .strip_prefix('\'')
+                    .and_then(|inner| inner.strip_suffix('\''))
+            })
+            .unwrap_or(value);
+        entries.insert(key.trim().to_string(), value.to_string());
+    }
+    entries
+}
+
+/// ClickHouse credentials: the process environment wins, and `.auth` fills in any
+/// name the environment leaves unset.
+fn clickhouse_credentials() -> (Option<String>, Option<String>) {
+    let file = read_env_file(".auth");
+    let pick = |name: &str| std::env::var(name).ok().or_else(|| file.get(name).cloned());
+    (pick("CLICKHOUSE_USER"), pick("CLICKHOUSE_PASSWORD"))
+}
+
+/// Headers the ClickHouse HTTP interface accepts for authentication. Empty when no
+/// credentials are configured.
+fn clickhouse_auth_headers(
+    user: Option<&str>,
+    password: Option<&str>,
+) -> Result<HeaderMap, Box<dyn std::error::Error>> {
+    let mut headers = HeaderMap::new();
+    if user.is_some() || password.is_some() {
+        headers.insert(
+            HeaderName::from_static("x-clickhouse-user"),
+            HeaderValue::from_str(user.unwrap_or("default"))?,
+        );
+    }
+    if let Some(password) = password {
+        let mut value = HeaderValue::from_str(password)?;
+        value.set_sensitive(true);
+        headers.insert(HeaderName::from_static("x-clickhouse-key"), value);
+    }
+    Ok(headers)
+}
+
+/// Returns `base` with the credentials embedded as URL userinfo, which reqwest
+/// sends as HTTP Basic auth. Unchanged when no credentials are configured.
+fn clickhouse_url_with_auth(
+    base: &str,
+    user: Option<&str>,
+    password: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut url = reqwest::Url::parse(base)?;
+    if user.is_some() || password.is_some() {
+        url.set_username(user.unwrap_or("default"))
+            .map_err(|_| "ClickHouse URL cannot carry credentials")?;
+        url.set_password(password)
+            .map_err(|_| "ClickHouse URL cannot carry credentials")?;
+    }
+    Ok(url.as_str().trim_end_matches('/').to_string())
 }
 
 async fn shutdown_signal() {
@@ -169,6 +247,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let clickhouse_url = env_or("CLICKHOUSE_URL", "http://127.0.0.1:8123");
     let route_clickhouse_url = clickhouse_url.clone();
+    let (clickhouse_user, clickhouse_password) = clickhouse_credentials();
+    let clickhouse_headers =
+        clickhouse_auth_headers(clickhouse_user.as_deref(), clickhouse_password.as_deref())?;
+    let tag_clickhouse_url = clickhouse_url_with_auth(
+        &clickhouse_url,
+        clickhouse_user.as_deref(),
+        clickhouse_password.as_deref(),
+    )?;
+    tracing::info!(
+        clickhouse_user = clickhouse_user.as_deref().unwrap_or("none"),
+        clickhouse_password_set = clickhouse_password.is_some(),
+        "resolved ClickHouse credentials"
+    );
     let (capture_tx, mut capture_rx) = tokio::sync::mpsc::channel::<telemetry::RouteRecord>(1024);
     let capture_task = tokio::spawn(async move {
         tokio::fs::create_dir_all("logs").await?;
@@ -178,6 +269,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .open("logs/routing_capture.jsonl")
             .await?;
         let clickhouse_client = reqwest::Client::builder()
+            .default_headers(clickhouse_headers)
             .timeout(Duration::from_secs(2))
             .build()
             .map_err(std::io::Error::other)?;
@@ -216,7 +308,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tagger,
         TagConfig {
             base_path: PathBuf::from("logs/task_tags.jsonl"),
-            clickhouse_url: Some(clickhouse_url),
+            clickhouse_url: Some(tag_clickhouse_url),
             queue_capacity: 1024,
             concurrency: 4,
             call_timeout: Duration::from_secs(5),
