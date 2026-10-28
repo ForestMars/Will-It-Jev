@@ -125,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     };
     let modernbert = if config.router.tier3.enabled {
-        Some(Tier3Runner::new(
+        Some(HarrierRunner::new(
             env_or("MODERNBERT_ENDPOINT", "http://[::1]:50052"),
             0.95,
             0.70,
