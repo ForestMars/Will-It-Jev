@@ -12,3 +12,6 @@ enabled = true
 
 [router.tier5]
 enabled = true
+
+[router.tier6]
+enabled = true

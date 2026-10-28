@@ -24,6 +24,10 @@ pub struct RouteRecord {
     pub tier1_outcome: Tier1Outcome,
     pub tier2_outcome: Option<Tier2Outcome>,
     pub tier3_outcome: Option<Tier3Outcome>,
+    #[serde(default)]
+    pub tier4_outcome: Option<Tier3Outcome>,
+    #[serde(default)]
+    pub cascade_decision_tier: u8,
     pub final_routing: FinalRouting,
     #[serde(default)]
     pub router_classification_latency_us: u128,

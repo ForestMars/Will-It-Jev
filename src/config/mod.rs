@@ -17,6 +17,7 @@ fn parse(contents: &str) -> Result<AppConfig, Box<dyn Error>> {
 		config.router.tier3.enabled,
 		config.router.tier4.enabled,
 		config.router.tier5.enabled,
+		config.router.tier6.enabled,
 	]
 	.into_iter()
 	.any(|enabled| enabled)
@@ -42,6 +43,7 @@ mod tests {
 		assert!(!config.router.tier3.enabled);
 		assert!(!config.router.tier4.enabled);
 		assert!(!config.router.tier5.enabled);
+		assert!(!config.router.tier6.enabled);
 	}
 
 	#[test]

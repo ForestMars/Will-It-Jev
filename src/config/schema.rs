@@ -18,6 +18,8 @@ pub struct RouterConfig {
 	pub tier4: TierConfig,
 	#[serde(default)]
 	pub tier5: TierConfig,
+	#[serde(default)]
+	pub tier6: TierConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]

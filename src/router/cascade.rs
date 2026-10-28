@@ -84,6 +84,7 @@ fn finish_route(
     tier1_outcome: Tier1Record,
     tier2_outcome: Option<Tier2Record>,
     tier3_outcome: Option<Tier3Record>,
+    tier4_outcome: Option<Tier3Record>,
 ) -> (Decision, RouteRecord) {
     let latency_us = start.elapsed().as_micros();
     let record = RouteRecord {
@@ -94,6 +95,8 @@ fn finish_route(
         tier1_outcome,
         tier2_outcome,
         tier3_outcome,
+        tier4_outcome,
+        cascade_decision_tier: decision.decided_by_tier,
         final_routing: FinalRouting {
             backend: decision.backend.to_string(),
             tier: decision.decided_by_tier,
@@ -118,6 +121,7 @@ pub async fn route(
     t1: Option<&Tier1Engine>,
     t2: Option<&Tier2Runner>,
     t3: Option<&Tier3Runner>,
+    t4: Option<&Tier3Runner>,
     budget: Duration,
     hashes: &Hashes,
 ) -> (Decision, RouteRecord) {
@@ -158,6 +162,7 @@ pub async fn route(
                 &timestamp,
                 hashes,
                 record,
+                None,
                 None,
                 None,
             );
@@ -223,6 +228,7 @@ pub async fn route(
                         reason: "resolved".to_string(),
                     }),
                     None,
+                    None,
                 );
             }
 
@@ -255,12 +261,11 @@ pub async fn route(
         None
     };
 
-    // ---- Tier 3: Harrier sidecar over gRPC ----
+    // ---- Tier 3: ModernBERT ONNX Runtime ----
     let tier3_record = if let Some(t3) = t3 {
-        let left = budget.saturating_sub(start.elapsed());
-        info!("[request_id={request_id}] TRY       tier=3 (harrier)  budget_left={left:?}");
+        info!("[request_id={request_id}] TRY tier=3 (modernbert/onnx) prompt={prompt:?}");
         let t = Instant::now();
-        let tier3_result = t3.evaluate(prompt, left).await;
+        let tier3_result = t3.evaluate(prompt);
         let tier3_record = match &tier3_result {
             Tier3Outcome::Resolved { confidence, .. } => Some(Tier3Record {
                 score: *confidence,
@@ -300,6 +305,7 @@ pub async fn route(
                     tier1_record,
                     tier2_record,
                     tier3_record,
+                    None,
                 );
             }
             Tier3Outcome::PassThrough {
@@ -323,11 +329,80 @@ pub async fn route(
         None
     };
 
+    // ---- Tier 4: Harrier sidecar over gRPC ----
+    let tier4_record = if let Some(t4) = t4 {
+        let left = budget.saturating_sub(start.elapsed());
+        info!("[request_id={request_id}] TRY budget_left={left:?} tier=4 (harrier)");
+        let t = Instant::now();
+        let tier4_result = t4.evaluate(prompt, left).await;
+        let tier4_record = match &tier4_result {
+            Tier3Outcome::Resolved { confidence, .. } => Some(Tier3Record {
+                score: *confidence,
+                reason: "resolved".to_string(),
+            }),
+            Tier3Outcome::PassThrough { score, reason, .. } => Some(Tier3Record {
+                score: *score,
+                reason: reason.to_string(),
+            }),
+        };
+        match tier4_result {
+            Tier3Outcome::Resolved {
+                route,
+                confidence,
+                model_id,
+            } => {
+                let backend = match route {
+                    Tier3Route::Jev => Backend::Jev,
+                    Tier3Route::Llm => Backend::Llm,
+                };
+                let decision = resolved(
+                    &request_id,
+                    4,
+                    &model_id,
+                    backend,
+                    Some(confidence),
+                    t.elapsed(),
+                    start.elapsed(),
+                );
+                return finish_route(
+                    &request_id,
+                    decision,
+                    prompt,
+                    start,
+                    &timestamp,
+                    hashes,
+                    tier1_record,
+                    tier2_record,
+                    tier3_record,
+                    tier4_record,
+                );
+            }
+            Tier3Outcome::PassThrough {
+                top_guess,
+                score,
+                reason,
+            } => {
+                escalate(
+                    &request_id,
+                    4,
+                    5,
+                    reason,
+                    format!("top_guess={top_guess:?} score={score:.3}"),
+                    t.elapsed(),
+                );
+                tier4_record
+            }
+        }
+    } else {
+        info!("[request_id={request_id}] SKIP tier=4 (disabled)");
+        None
+    };
+
     // The local cascade falls through to the configured generative backend.
     info!("[request_id={request_id}] ESCALATE to downstream backend");
     let decision = resolved(
         &request_id,
-        5,
+        6,
         "llm-fallback",
         Backend::Llm,
         None,
@@ -344,5 +419,42 @@ pub async fn route(
         tier1_record,
         tier2_record,
         tier3_record,
+        tier4_record,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn modernbert_rpc_failure_passes_through_to_terminal_tier() {
+        let modernbert = Tier3Runner::new(
+            "http://127.0.0.1:1".into(),
+            0.95,
+            0.70,
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        let hashes = Hashes {
+            tier1_toml: "disabled".into(),
+            tier2_bin: "disabled".into(),
+        };
+
+        let (_, record) = route(
+            1,
+            "ambiguous request",
+            None,
+            None,
+            Some(&modernbert),
+            None,
+            Duration::from_secs(1),
+            &hashes,
+        )
+        .await;
+
+        assert_eq!(record.tier3_outcome.as_ref().unwrap().reason, "rpc_error");
+        assert_eq!(record.cascade_decision_tier, 6);
+        assert!(record.tier4_outcome.is_none());
+    }
 }

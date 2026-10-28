@@ -6,7 +6,7 @@
 
 An in-process, high-throughput request routing engine written in Rust. It classifies incoming prompts and routes them to discriminative (Jev) or generative (LLM) execution pathways with a **p99 decision latency under 5 ms** for the overwhelming majority of traffic.
 
-The engine is a **five-tier deterministic fallback cascade**. Each tier either resolves the request with sufficient confidence or passes it to the next, more expensive tier. Cheap tiers absorb most traffic, so the expensive tiers only see the ambiguous remainder.
+The engine is a **six-tier deterministic fallback cascade**. Each tier either resolves the request with sufficient confidence or passes it to the next, more expensive tier. Cheap tiers absorb most traffic, so the expensive tiers only see the ambiguous remainder.
 
 <table width="100%"><tr><td>
  <h3>Most LLM requests do not need a generative model.</h3>
@@ -40,11 +40,11 @@ The engine is a **five-tier deterministic fallback cascade**. Each tier either r
 
 ## Design Goals
 
-- **Bounded latency.** Every tier has an explicit p99 budget. Total decision latency for tiers 1 to 3 stays within the 5 ms SLA.
+- **Bounded latency.** Every tier has an explicit p99 budget. The 5 ms target is for requests resolved by the early cascade stages.
 - **Early exit.** A request leaves the cascade at the first tier whose confidence meets its configured threshold.
 - **No GC pauses, minimal allocation.** The hot path is native Rust with C++ bindings, a replaced global allocator, and zero-copy ingress for the cheapest tiers.
 - **Deterministic behavior.** Given the same input, model artifacts, and configuration, the router returns the same decision.
-- **Pluggable evaluators.** Tier 2 and tier 3 engines sit behind a common trait, so models can be swapped through configuration without touching the dispatcher.
+- **Independent semantic stages.** ModernBERT and Harrier run as sequential tiers with separate enable flags; ModernBERT currently abstains until ONNX inference is integrated.
 
 ---
 
@@ -57,7 +57,7 @@ Each tier returns one of two outcomes:
 - **Resolved:** the tier produced a routing decision whose confidence meets its threshold. The cascade terminates and the decision is returned.
 - **PassThrough:** the tier could not decide with enough confidence (or is disabled). The payload moves to the next tier.
 
-Tier 5 is the terminal tier. It always produces a decision, so the cascade is total: every request receives a routing outcome.
+Tier 6 is the terminal generative tier. Provider availability determines whether a response can be returned.
 
 Disabled tiers are skipped without cost. Tiers are always evaluated in numeric order, and a tier is never re-entered once passed.
 
@@ -83,21 +83,24 @@ Disabled tiers are skipped without cost. Tiers are always evaluated in numeric o
 - **Robust** to typos, inflections, and fuzzy keyword variation, because subword features generalize across spellings.
 - **Artifact:** quantized binary `router_fastpath.ftz`.
 
-### Tier 3: Micro-Transformer / Embedding Evaluators
+### Tier 3: ModernBERT ONNX Runtime
 
-- **Exemplars at Runtime:** Tier 3 does not use a separately trained routing model. It loads the current labeled exemplar set at runtime and evaluates the incoming request directly against those examples, keeping the routing knowledge explicit and updateable without retraining.
-- **Pluggable Semantic Engines:** Harrier is the default evaluator, with ModernBERT as an upcoming alternative and Oryn available as an optional engine. The exemplar set remains constant while the semantic engine can change independently.
-- **Example-Driven Resolution:** Rather than learning a permanent decision boundary from the exemplars, Tier 3 uses them directly to determine whether the request is sufficiently supported by the observed Jev or LLM examples. Weak, conflicting, or out-of-distribution evidence passes through to Tier 4.
+- **Placement:** ModernBERT evaluates requests after FastText and before Harrier.
+- **Runtime:** ModernBERT runs through ONNX Runtime, not GGUF. The router calls a dedicated gRPC sidecar, which tokenizes the prompt and scores the two-class ONNX output.
 
-### Tier 4: Jev Self-Evaluation
+### Tier 4: Harrier Sidecar
 
-- **Capability-Level Judgment:** Tier 4 uses Jev itself to determine whether Jev can handle the incoming request. The system therefore moves from predicting the route to asking the destination capability whether the request belongs within its executable domain.
-- **Final Discriminative Gate:** Tier 4 provides the last opportunity to resolve a request without invoking a generative model. A positive Jev determination terminates the cascade; uncertainty or a negative determination escalates to Tier 5.
+- **Semantic Classification:** Harrier is the gRPC-backed classifier after ModernBERT. A confident result resolves the route; weak or failed evaluations pass through to Tier 5.
+- **Independent Stage:** ModernBERT and Harrier are separate sequential tiers, not swappable backends.
+
+### Tier 5: Jev Self-Evaluation
+
+- **Capability-Level Judgment:** Jev determines whether it can handle the incoming request. A positive result handles the request; an ineligible or failed evaluation escalates to Tier 6.
 - **Recursive Architecture:** The cascade progressively asks increasingly capable systems whether generation is actually necessary, culminating in the unusual case where Jev evaluates whether Jev can solve the problem.
 
-### Tier 5: Generative LLM Fallback
-- **Open-Ended Generation:** Tier 5 is the terminal generative pathway for requests that survive every discriminative tier or inherently require open-ended language generation, synthesis, or reasoning.
-- **Guaranteed Termination:** Tier 5 always produces the final routing outcome, making the cascade total even when every cheaper evaluator abstains or fails, or are not unavailable.
+### Tier 6: Generative LLM Fallback
+- **Open-Ended Generation:** Tier 6 handles requests that survive every discriminative tier or inherently require open-ended language generation, synthesis, or reasoning.
+- **Terminal Stage:** The router dispatches unresolved requests here; provider availability determines whether a response can be returned.
 - **Expensive by Design:** The generative model is deliberately reserved for the residual traffic that earlier tiers cannot confidently establish as JEV-capable, minimizing unnecessary token consumption while preserving full LLM capability for genuinely generative requests.
 ---
 
@@ -109,11 +112,12 @@ Latency figures are per-tier p99 budgets. Coverage figures are **design targets*
 | :--- | :--- | :--- | :--- |
 | 1 | `regex::RegexSet` and hash maps | < 0.1 ms | 25% to 35% |
 | 2 | FastText subword (`libfasttext`) | 0.2 ms to 0.4 ms | 40% to 50% |
-| 3 | ModernBERT / Harrier / Oryn via ONNX Runtime | 1.5 ms to 8.0 ms | 15% to 25% |
-| 4 | Secondary heavy model | 20 ms to 50 ms | 3% to 5% |
-| 5 | Frontier LLM | Variable | < 1% |
+| 3 | ModernBERT via ONNX Runtime sidecar | TBD | TBD |
+| 4 | Harrier sidecar over gRPC | 1.5 ms to 8.0 ms | 15% to 25% |
+| 5 | Jev self-evaluation | 20 ms to 50 ms | 3% to 5% |
+| 6 | Frontier LLM | Variable | < 1% |
 
-Note that the 5 ms SLA holds for traffic that exits at tiers 1 to 3 within their lower budget range. The upper end of tier 3 (8 ms), tier 4, and tier 5 intentionally exceed it, which is why keeping their coverage small matters.
+Note that the 5 ms SLA holds for traffic that exits at tiers 1 to 4 within their lower budget range. The upper end of tier 4 (8 ms), tier 5, and tier 6 intentionally exceed it, which is why keeping their coverage small matters.
 
 ---
 
@@ -130,9 +134,10 @@ src/
     cascade.rs        Pipeline dispatcher and lifecycle orchestration
     tier1.rs          Static hash, length bound, and regex evaluator
     tier2.rs          FastText subword classifier runner
-    tier3.rs          In-process micro-transformer runner
-    tier4.rs          Heavy fallback model runner
-    tier5.rs          Frontier LLM escalation runner
+    modernbert_runner.rs  Tier 3 ModernBERT ONNX stub
+    tier3_runner.rs       Tier 4 Harrier gRPC client
+    tier4_runner.rs       Tier 5 Jev downstream client
+    tier5_runner.rs       Tier 6 generative model client
   tier3/
     calibration.rs    Margin calculation and probability calibration
     trait.rs          Core evaluator trait and contract definitions
@@ -153,7 +158,7 @@ src/
 - **Global allocator:** the system allocator is replaced with `mimalloc` via `#[global_allocator]` to avoid heap lock contention across worker threads.
 - **Threading:** a fixed worker pool sized by `router.workers`. Pinning workers to physical cores is recommended for stable tail latency.
 - **Zero-copy ingress:** tiers 1 and 2 receive the payload as `&str`, so no copy or allocation is made during pre-filtering.
-- **Quantization:** tier 3 models run Int8 to fit the latency budget on CPU.
+- **Quantization:** the ModernBERT model artifact is Int8 ONNX; the current Tier 3 stub does not load it yet.
 - **Static linking:** `libfasttext` is linked statically to avoid dynamic loading overhead and deployment drift.
 
 ---
@@ -177,9 +182,21 @@ enabled = true
 
 [router.tier5]
 enabled = true
+
+[router.tier6]
+enabled = true
 ```
 
 Tier 1 rules and model/backend locations continue to use their existing environment variables and `config/tier1.toml`; the master file controls whether each tier is constructed. At least one tier must be enabled. If a request reaches a disabled downstream tier, the router returns an explicit downstream error rather than invoking it.
+
+When Tier 3 is enabled, run the ModernBERT sidecar separately. It loads `models/modernbert-base/model_int8.onnx` and `models/modernbert-base/tokenizer.json` at startup and listens on port `50052` by default:
+
+```bash
+pip install -r sidecars/modernbert/requirements.txt
+python sidecars/modernbert/server.py
+```
+
+Set `MODERNBERT_ENDPOINT` on the router to change its gRPC address. The model must be a two-class ONNX sequence classifier; set `MODERNBERT_JEV_LABEL_INDEX` to `0` or `1` if Jev is not class index `1`.
 
 ---
 
@@ -218,14 +235,13 @@ Binaries built with `target-cpu=native` are not portable across CPU generations.
 
 ## Model Artifacts
 
-The router expects these artifacts at the paths configured above. They are not checked into the repository.
+ModernBERT requires a valid ONNX sequence-classification model and matching tokenizer at the paths below. The checked-in files may be placeholders; the sidecar fails at startup if either file is empty.
 
 | Artifact | Used by | Produced by |
 | :--- | :--- | :--- |
 | `router_fastpath.ftz` | Tier 2 | `scripts/train_fasttext.py` |
-| `tier3_quantized.onnx` | Tier 3 | Your ONNX export and Int8 quantization pipeline |
-| `tokenizer.json` | Tier 3 | The tokenizer matching the chosen Tier 3 model |
-| `centroids.bin` | Tier 3 | Route centroid computation over labeled embeddings |
+| `models/modernbert-base/model_int8.onnx` | Tier 3 | ONNX export and Int8 quantization pipeline |
+| `models/modernbert-base/tokenizer.json` | Tier 3 | Tokenizer matching the ModernBERT ONNX model |
 
 ### Training the Tier 2 model
 
@@ -320,7 +336,7 @@ The Tier1Engine::classify method instruments spans with individual feature metri
 - Fast-Path Markers: is_binary_question
 - Decision State: confidence, routing_reason
 
-Tracking resolved-at-tier distribution over time is the primary health signal. A shift of traffic toward Tiers 4 and 5 indicates threshold, model, or prompt-distribution drift, causing tail latency and operational cost to rise.
+Tracking resolved-at-tier distribution over time is the primary health signal. A shift of traffic toward Tiers 4 through 6 indicates threshold, model, or prompt-distribution drift, causing tail latency and operational cost to rise.
 
 ### Adjusting Log Verbosity
 Verbosity is controlled via RUST_LOG. The default level is info.
@@ -328,11 +344,11 @@ Verbosity is controlled via RUST_LOG. The default level is info.
 Recommended production configuration:
 ```RUST_LOG=info,cascade_router=debug```
 
-Tracking **resolved-at-tier distribution over time** is the most important signal. A shift of traffic toward tiers 4 and 5 means thresholds, models, or the input distribution have drifted, and both cost and tail latency will rise.
+Tracking **resolved-at-tier distribution over time** is the most important signal. A shift of traffic toward tiers 4 through 6 means thresholds, models, or the input distribution have drifted, and both cost and tail latency will rise.
 
 ### Request Capture
 
-Each completed route is sent through a bounded, non-blocking Tokio channel to a background writer, which appends one JSON object per line to `logs/routing_capture.jsonl` and inserts it into ClickHouse's `route_records_raw` table. If that queue is full, the record is dropped with a warning rather than delaying the response. ClickHouse insert failures are logged and the local spool is retained for replay. The log directory is created at startup. The record includes a UUID v4 request ID, the request-start UTC timestamp, the raw prompt, SHA-256 hashes of the Tier 1 TOML and Tier 2 model files, the outcomes from tiers that ran, and the final backend, tier, and latency in microseconds. Tier 2 records its raw probability vector; Tier 3 records its score. The sampling probability currently defaults to `1.0`.
+Each completed route is sent through a bounded, non-blocking Tokio channel to a background writer, which appends one JSON object per line to `logs/routing_capture.jsonl` and inserts it into ClickHouse's `route_records_raw` table. If that queue is full, the record is dropped with a warning rather than delaying the response. ClickHouse insert failures are logged and the local spool is retained for replay. The log directory is created at startup. The record includes a UUID v4 request ID, the request-start UTC timestamp, the raw prompt, SHA-256 hashes of the Tier 1 TOML and Tier 2 model files, outcomes from tiers that ran, the cascade decision tier, and the final backend, downstream tier, and latency. Tier 2 records its raw probability vector; tiers 3 and 4 record their scores. The sampling probability currently defaults to `1.0`.
 
 The raw prompt is stored verbatim and may contain sensitive data. Restrict access to the capture file and define appropriate retention and cleanup; the writer appends indefinitely and does not rotate the file.
 
@@ -359,7 +375,9 @@ applied to enable typed route-decision and task-tag ingestion. The route and tag
 JSONL spool files under `logs/`; ClickHouse insert failures are logged and do not block gateway
 responses. Spool lines remain available for manual replay if ClickHouse is unavailable.
 
-The principal runtime overrides are `ROUTER_BIND`, `TIER4_ENDPOINT` (default
+The principal runtime overrides are `ROUTER_BIND`, `MODERNBERT_ENDPOINT` (default
+`http://[::1]:50052`), `TIER4_HARRIER_ENDPOINT` (falls back to
+`TIER3_ENDPOINT` for compatibility), `TIER5_ENDPOINT` (falls back to `TIER4_ENDPOINT`, default
 `http://127.0.0.1:11435/api/decide`), `OLLAMA_GENERATE_URL` (default
 `http://127.0.0.1:11434/api/generate`), `GEMMA_MODEL` (default `gemma3:latest`),
 `TAGGER_OLLAMA_URL` (default `http://127.0.0.1:11434`), `TAGGER_MODEL` (default
@@ -416,15 +434,16 @@ Engines must not allocate on the per-request hot path where avoidable, and must 
 
 - **Tier pass-through:** low confidence is not an error. It is the normal escalation path.
 - **Model load failure at startup:** the router should fail fast rather than silently run with a tier missing. Disabling a tier must be an explicit configuration choice.
-- **Tier 4 timeout:** when `timeout_ms` elapses, the request escalates to tier 5 rather than blocking.
-- **Tier 5 unavailable:** the terminal tier is an external dependency. Define and test your degraded-mode policy (default route, error, or retry) before production.
+- **Tier 4 timeout:** Harrier timeouts and RPC failures pass through to Jev Tier 5.
+- **Tier 5 failure:** Jev ineligibility or failure falls through to the generative Tier 6 endpoint when enabled.
+- **Tier 6 unavailable:** the terminal tier is an external dependency; provider failures return an explicit gateway error.
 - **Oversize or malformed payloads:** rejected at tier 1 based on `max_payload_bytes`.
 
 ---
 
 ## Known Constraints
 
-- The 5 ms p99 SLA applies to traffic resolved within tiers 1 to 3 at the lower end of tier 3's range. Tiers 4 and 5 exceed it by design.
+- The 5 ms p99 SLA applies to traffic resolved within tiers 1 to 4 at the lower end of tier 4's range. Tiers 5 and 6 exceed it by design.
 - Coverage percentages are targets, not guarantees.
 - AVX-512 and NEON acceleration depend on the host CPU. Throughput and latency on other hardware will differ.
 - Thresholds are coupled to specific model artifacts. Swapping or retraining a model requires recalibration.
