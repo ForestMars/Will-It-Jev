@@ -40,8 +40,17 @@ pub struct AppState {
 #[derive(Deserialize)]
 pub struct CompletionRequest {
     prompt: Option<String>,
+    messages: Option<Vec<ChatMessage>>,
+    model: Option<String>,
+    stream: Option<bool>,
     state: Option<Value>,
     questions: Option<Map<String, Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatMessage {
+    role: String,
+    content: String,
 }
 
 pub fn app(
@@ -69,6 +78,7 @@ pub fn app(
     Router::new()
         .route("/healthz", get(|| async { StatusCode::OK }))
         .route("/v1/completions", post(completion))
+        .route("/v1/chat/completions", post(completion))
         .route("/v1/decisions", post(completion))
         .with_state(state)
 }
@@ -77,6 +87,29 @@ async fn completion(
     State(state): State<AppState>,
     Json(request): Json<CompletionRequest>,
 ) -> impl IntoResponse {
+    if request.stream == Some(true) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "streaming_not_supported", "detail": "send stream=false or omit stream"})),
+        )
+            .into_response();
+    }
+    if request.messages.as_ref().is_some_and(Vec::is_empty) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid_request", "detail": "messages must not be empty"})),
+        )
+            .into_response();
+    }
+    if request.messages.is_some()
+        && (request.prompt.is_some() || request.state.is_some() || request.questions.is_some())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid_request", "detail": "provide messages or prompt/state/questions, not both"})),
+        )
+            .into_response();
+    }
     if request.state.is_some() != request.questions.is_some() {
         return (
             StatusCode::BAD_REQUEST,
@@ -92,6 +125,14 @@ async fn completion(
         (None, Some(state), Some(questions)) => {
             Some(format!("{state}\n{}", Value::Object(questions.clone())))
         }
+        (None, None, None) => request.messages.as_ref().map(|messages| {
+            messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "user")
+                .map(|message| message.content.clone())
+                .unwrap_or_else(|| messages_to_prompt(messages))
+        }),
         _ => None,
     };
     let Some(route_input) = route_input else {
@@ -113,9 +154,18 @@ async fn completion(
             state,
             Value::Object(questions.clone())
         ),
-        _ => route_input.clone(),
+        _ => request
+            .messages
+            .as_ref()
+            .map(|messages| messages_to_prompt(messages))
+            .unwrap_or_else(|| route_input.clone()),
     };
 
+    tracing::info!(
+        chat_completion = request.messages.is_some(),
+        prompt_len = route_input.len(),
+        "completion request accepted"
+    );
     let (_, mut record) = cascade::route(
         telemetry::next_req_id(),
         &route_input,
@@ -128,6 +178,10 @@ async fn completion(
     )
     .await;
 
+    tracing::info!(
+        request_id = %record.request_id,
+        "dispatching completion request to downstream backend"
+    );
     match state
         .dispatcher
         .execute(
@@ -144,7 +198,11 @@ async fn completion(
         .await
     {
         Ok(result) => {
-            let payload = result.payload.clone();
+            let payload = if request.messages.is_some() {
+                openai_chat_response(&result.payload, request.model.as_deref())
+            } else {
+                result.payload.clone()
+            };
             let response_text = payload.to_string();
             let request_id = record.request_id.clone();
             record.final_routing.backend = if result.tier == 5 { "jev" } else { "llm" }.into();
@@ -212,6 +270,41 @@ fn capture(sender: &mpsc::Sender<RouteRecord>, record: RouteRecord) {
             warn!(request_id = %record.request_id, "routing capture writer is unavailable; dropping record");
         }
     }
+}
+
+fn messages_to_prompt(messages: &[ChatMessage]) -> String {
+    messages
+        .iter()
+        .map(|message| format!("{}: {}", message.role, message.content))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn openai_chat_response(payload: &Value, requested_model: Option<&str>) -> Value {
+    if payload.get("choices").is_some() {
+        return payload.clone();
+    }
+    let content = payload
+        .get("response")
+        .and_then(Value::as_str)
+        .or_else(|| payload.pointer("/message/content").and_then(Value::as_str))
+        .unwrap_or_default();
+    let model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .or(requested_model)
+        .unwrap_or("unknown");
+    json!({
+        "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+        "object": "chat.completion",
+        "created": chrono::Utc::now().timestamp(),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop"
+        }]
+    })
 }
 
 #[cfg(test)]
