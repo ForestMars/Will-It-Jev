@@ -23,7 +23,7 @@ impl Tier5Runner {
             client: Client::builder().build()?,
             endpoint,
             model,
-            timeout,
+            timeout: timeout.min(Duration::from_secs(25)),
         })
     }
 
