@@ -63,8 +63,8 @@ def load_cases(taxonomy_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]
     seen_ids: set[str] = set()
     for category in categories:
         category_id = category.get("id")
-        if not isinstance(category_id, str) or not category_id:
-            raise ValueError("Every category must have a non-empty string 'id'")
+        if isinstance(category_id, bool) or not isinstance(category_id, int) or category_id < 1:
+            raise ValueError(f"Every category must have a positive integer 'id', got {category_id!r}")
         if category_id in seen_ids:
             raise ValueError(f"Duplicate category id: {category_id}")
         seen_ids.add(category_id)
@@ -77,7 +77,8 @@ def load_cases(taxonomy_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]
             cases.append({
                 "case_id": f"{category_id}:{index:02d}",
                 "expected_task_category": category_id,
-                "category_name": category.get("name", category_id),
+                "category_slug": category.get("name"),
+                "category_name": category.get("desc", category.get("name", str(category_id))),
                 "example_index": index,
                 "prompt": example,
             })
@@ -132,8 +133,9 @@ def summarize(samples: list[dict[str, Any]], categories: list[dict[str, Any]]) -
     for category in categories:
         cid = category["id"]
         rows = [s for s in samples if s["expected_task_category"] == cid]
-        per_category[cid] = {
-            "name": category.get("name", cid),
+        per_category[str(cid)] = {
+            "slug": category.get("name"),
+            "name": category.get("desc", category.get("name", str(cid))),
             "examples": len(rows),
             "route_records_found": sum(s.get("route_record") is not None for s in rows),
             "http_2xx": sum(isinstance(s.get("http_status"), int) and 200 <= s["http_status"] < 300 for s in rows),
