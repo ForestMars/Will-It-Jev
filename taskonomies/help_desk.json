@@ -1,0 +1,242 @@
+{
+  "schema_version": "1.0.0",
+  "taxonomy_id": "help_desk",
+  "name": "Internal IT Support",
+  "version": "1.0.0",
+  "description": "Task categories for classifying internal company IT support requests by the task pursued in the current conversation branch.",
+  "classification_unit": "current_branch_task",
+  "classification_guidance": [
+    "Classify the task pursued by the current turn using the current turn and relevant branch context.",
+    "If the user switches to a different task, assign the category for the new task rather than carrying forward the previous branch category.",
+    "Choose one category that best represents the task. Use other_unclear_multi_intent only when no category is a defensible fit, the request is unclear, or unrelated tasks cannot be separated.",
+    "Task category is independent of Jev eligibility. Do not infer jev_eligible from the category alone."
+  ],
+  "groups": [
+    {
+      "id": "identity_and_access",
+      "name": "Identity and access"
+    },
+    {
+      "id": "applications_and_collaboration",
+      "name": "Applications and collaboration"
+    },
+    {
+      "id": "employee_and_endpoint_lifecycle",
+      "name": "Employee and endpoint lifecycle"
+    },
+    {
+      "id": "infrastructure_and_security",
+      "name": "Infrastructure and security"
+    },
+    {
+      "id": "service_desk_operations",
+      "name": "Service desk operations"
+    },
+    {
+      "id": "fallback",
+      "name": "Fallback"
+    }
+  ],
+  "categories": [
+    {
+      "id": "app_access_request",
+      "name": "Application access request",
+      "group_id": "identity_and_access",
+      "description": "Request to gain access to an application, system, repository, or service.",
+      "examples": [
+        "I need access to Salesforce.",
+        "Can you add me to GitHub?"
+      ]
+    },
+    {
+      "id": "permissions_roles_groups",
+      "name": "Permissions, roles, and groups",
+      "group_id": "identity_and_access",
+      "description": "Change an existing user's role, group membership, privilege, or permission level.",
+      "examples": [
+        "Add me to the finance-admin group.",
+        "Change my role to project editor."
+      ]
+    },
+    {
+      "id": "password_reset_account_unlock",
+      "name": "Password reset or account unlock",
+      "group_id": "identity_and_access",
+      "description": "Reset credentials or unlock an account that is locked out.",
+      "examples": [
+        "I forgot my password.",
+        "Please unlock my account."
+      ]
+    },
+    {
+      "id": "mfa_sso_authentication",
+      "name": "MFA, SSO, and authentication",
+      "group_id": "identity_and_access",
+      "description": "Multi-factor authentication enrollment or recovery, single sign-on, or authentication failures not primarily a password reset or unlock.",
+      "examples": [
+        "I lost my MFA device.",
+        "Single sign-on keeps failing."
+      ]
+    },
+    {
+      "id": "application_troubleshooting",
+      "name": "Application troubleshooting",
+      "group_id": "applications_and_collaboration",
+      "description": "Diagnose or resolve an application error, outage, malfunction, or broken feature.",
+      "examples": [
+        "The expense app crashes when I submit a report.",
+        "The CRM returns an error when I save."
+      ]
+    },
+    {
+      "id": "software_install_config_license",
+      "name": "Software installation, configuration, or licensing",
+      "group_id": "applications_and_collaboration",
+      "description": "Install, configure, update, or obtain a license for software.",
+      "examples": [
+        "Can you install Docker Desktop?",
+        "I need a license for Adobe Acrobat."
+      ]
+    },
+    {
+      "id": "email_calendar",
+      "name": "Email and calendar",
+      "group_id": "applications_and_collaboration",
+      "description": "Email delivery, mailbox settings, calendar behavior, or calendar delegation and sharing.",
+      "examples": [
+        "My emails are not arriving.",
+        "Give my assistant access to my calendar."
+      ]
+    },
+    {
+      "id": "collaboration_messaging",
+      "name": "Collaboration and messaging",
+      "group_id": "applications_and_collaboration",
+      "description": "Messaging, channels, meetings, chat, or collaboration-platform issues.",
+      "examples": [
+        "Add me to the incident-response Slack channel.",
+        "Teams calls have no audio."
+      ]
+    },
+    {
+      "id": "file_storage_sharing",
+      "name": "File storage and sharing",
+      "group_id": "applications_and_collaboration",
+      "description": "Shared drives, cloud storage, document permissions, and file-sharing behavior.",
+      "examples": [
+        "I cannot open the shared folder.",
+        "How do I share this file externally?"
+      ]
+    },
+    {
+      "id": "employee_onboarding",
+      "name": "Employee onboarding",
+      "group_id": "employee_and_endpoint_lifecycle",
+      "description": "Provision accounts, applications, equipment, or access for an incoming employee or contractor.",
+      "examples": [
+        "A new engineer starts Monday; provision their accounts.",
+        "Set up a laptop and access for our new hire."
+      ]
+    },
+    {
+      "id": "employee_offboarding",
+      "name": "Employee offboarding",
+      "group_id": "employee_and_endpoint_lifecycle",
+      "description": "Deprovision access, disable accounts, recover equipment, or perform IT tasks for a departing employee or contractor.",
+      "examples": [
+        "Disable an employee's accounts after their last day.",
+        "Revoke the departing contractor's access."
+      ]
+    },
+    {
+      "id": "device_provisioning",
+      "name": "Device provisioning",
+      "group_id": "employee_and_endpoint_lifecycle",
+      "description": "Request, prepare, replace, or reassign an endpoint or other company device.",
+      "examples": [
+        "I need a new laptop.",
+        "Please replace my damaged company phone."
+      ]
+    },
+    {
+      "id": "endpoint_os_mdm",
+      "name": "Endpoint, operating system, and device management",
+      "group_id": "employee_and_endpoint_lifecycle",
+      "description": "Endpoint operating-system problems, device enrollment, management policies, or compliance state.",
+      "examples": [
+        "My laptop will not install the required OS update.",
+        "My device is not appearing in MDM."
+      ]
+    },
+    {
+      "id": "hardware_peripheral",
+      "name": "Hardware and peripherals",
+      "group_id": "employee_and_endpoint_lifecycle",
+      "description": "Physical device faults or requests involving monitors, docks, printers, keyboards, and other peripherals.",
+      "examples": [
+        "My monitor flickers.",
+        "The office printer is jammed."
+      ]
+    },
+    {
+      "id": "network_vpn_connectivity",
+      "name": "Network, VPN, and connectivity",
+      "group_id": "infrastructure_and_security",
+      "description": "Network access, Wi-Fi, VPN, DNS, connectivity, or related infrastructure reachability issues.",
+      "examples": [
+        "I cannot connect to the corporate VPN.",
+        "The internal site is unreachable on office Wi-Fi."
+      ]
+    },
+    {
+      "id": "security_secrets_badge",
+      "name": "Security, secrets, and badge access",
+      "group_id": "infrastructure_and_security",
+      "description": "Security incident or control requests, credential or secret rotation, and physical badge access.",
+      "examples": [
+        "Rotate the API key for this service.",
+        "My building badge no longer works."
+      ]
+    },
+    {
+      "id": "data_backup_recovery",
+      "name": "Data, backup, and recovery",
+      "group_id": "infrastructure_and_security",
+      "description": "Restore deleted or corrupted data, recover files, or resolve backup and restoration issues.",
+      "examples": [
+        "I accidentally deleted a shared folder; can it be restored?",
+        "Last night's backup failed."
+      ]
+    },
+    {
+      "id": "how_to_knowledge",
+      "name": "How-to and knowledge request",
+      "group_id": "service_desk_operations",
+      "description": "A request for instructions or information about how to use an IT service, tool, or standard process, without asking for a state change or fault repair.",
+      "examples": [
+        "How do I configure my email signature?",
+        "Where can I find the VPN setup guide?"
+      ]
+    },
+    {
+      "id": "ticket_status_followup",
+      "name": "Ticket status or follow-up",
+      "group_id": "service_desk_operations",
+      "description": "Ask for status, ownership, an ETA, or follow-up on an existing support ticket or request.",
+      "examples": [
+        "What is the status of ticket INC12345?",
+        "Has anyone picked up my access request?"
+      ]
+    },
+    {
+      "id": "other_unclear_multi_intent",
+      "name": "Other, unclear, or unresolved multi-intent",
+      "group_id": "fallback",
+      "description": "Use only when the request does not fit another category, lacks enough information to identify a task, or combines unrelated tasks that cannot reasonably be assigned a single primary category.",
+      "examples": [
+        "Can someone help me with something?",
+        "I need a laptop fixed and a payroll question answered."
+      ]
+    }
+  ]
+}
