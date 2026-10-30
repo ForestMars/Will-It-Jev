@@ -3,6 +3,10 @@ package tier3;
 
 service Tier3Scorer {
   rpc Score (ScoreRequest) returns (ScoreResponse);
+  // Joint execution: one shared encoding of `prompt`, one head per requested
+  // task. Additive; sidecars that predate it answer UNIMPLEMENTED and the
+  // router falls back to Score for the route task.
+  rpc ScoreTasks (ScoreTasksRequest) returns (ScoreTasksResponse);
 }
 
 message ScoreRequest {
@@ -14,4 +18,29 @@ message ScoreResponse {
   float confidence = 2;
   string label = 3;
   string model_id = 4;
+}
+
+message ScoreTasksRequest {
+  string prompt = 1;
+  // Task ids, e.g. "route", "tag". The sidecar answers each task it has a
+  // head for and lists the rest in `unsupported`.
+  repeated string tasks = 2;
+}
+
+message LabelScore {
+  string label = 1;
+  float score = 2;
+}
+
+message TaskScore {
+  string task = 1;
+  string label = 2;        // top label for this task
+  float confidence = 3;    // calibrated confidence of `label`
+  repeated LabelScore scores = 4;  // optional full distribution
+}
+
+message ScoreTasksResponse {
+  string model_id = 1;
+  repeated TaskScore results = 2;
+  repeated string unsupported = 3;
 }
