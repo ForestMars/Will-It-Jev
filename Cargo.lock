@@ -196,6 +196,7 @@ dependencies = [
  "aho-corasick",
  "anyhow",
  "arc-swap",
+ "async-trait",
  "axum",
  "chrono",
  "fasttext",
