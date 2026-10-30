@@ -3,6 +3,7 @@ language: "rust"
 adopted: true
 
 services:
+  ollaya: false
   clickhouse: true
   grafana: false
   langfuse: false
