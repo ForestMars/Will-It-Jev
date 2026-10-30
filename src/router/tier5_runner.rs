@@ -90,14 +90,14 @@ impl CircuitBreaker {
     }
 }
 
-pub struct Tier4Runner {
+pub struct Tier5Runner {
     client: Client,
     endpoint: String,
     timeout: Duration,
     breaker: CircuitBreaker,
 }
 
-impl Tier4Runner {
+impl Tier5Runner {
     pub fn new(
         endpoint: String,
         timeout: Duration,
