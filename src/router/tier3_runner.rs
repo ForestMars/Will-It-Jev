@@ -8,7 +8,9 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tonic::transport::Channel;
 
-use super::tier3_proto::{tier3_scorer_client::Tier3ScorerClient, ScoreRequest};
+use super::tier3_proto::{
+    tier3_scorer_client::Tier3ScorerClient, ScoreRequest, ScoreTasksRequest, ScoreTasksResponse,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier3Route {
@@ -30,6 +32,7 @@ pub enum Tier3Outcome {
     },
 }
 
+#[derive(Clone)]
 pub struct Tier3Runner {
     client: Tier3ScorerClient<Channel>,
     /// Bar for resolving to Jev. The expensive error, so this sits higher.
@@ -60,8 +63,24 @@ impl Tier3Runner {
 
     /// `budget` is the time remaining on the request's global deadline.
     pub async fn evaluate(&self, prompt: &str, budget: Duration) -> Tier3Outcome {
+        match self.score_raw(prompt, budget).await {
+            Err(reason) => pass(None, 0.0, reason),
+            Ok(raw) => decide(
+                &raw.label,
+                raw.confidence,
+                &raw.model_id,
+                self.jev_threshold,
+                self.llm_threshold,
+            ),
+        }
+    }
+
+    /// The sidecar's answer with no threshold applied. `evaluate` is this plus
+    /// `decide`; the task-agnostic pipeline calls this and lets the task
+    /// profile do the deciding. The error is the pass-through reason.
+    pub async fn score_raw(&self, prompt: &str, budget: Duration) -> Result<RawScore, &'static str> {
         if budget.is_zero() {
-            return pass(None, 0.0, "deadline_exhausted");
+            return Err("deadline_exhausted");
         }
         let deadline = budget.min(self.max_call);
 
@@ -69,20 +88,61 @@ impl Tier3Runner {
         let mut client = self.client.clone();
         let req = ScoreRequest { prompt: prompt.to_string() };
 
-        let resp = match timeout(deadline, client.score(req)).await {
-            Err(_) => return pass(None, 0.0, "timeout"),
-            Ok(Err(_)) => return pass(None, 0.0, "rpc_error"),
-            Ok(Ok(r)) => r.into_inner(),
-        };
-
-        decide(
-            &resp.label,
-            resp.confidence as f32,
-            &resp.model_id,
-            self.jev_threshold,
-            self.llm_threshold,
-        )
+        match timeout(deadline, client.score(req)).await {
+            Err(_) => Err("timeout"),
+            Ok(Err(_)) => Err("rpc_error"),
+            Ok(Ok(r)) => {
+                let r = r.into_inner();
+                Ok(RawScore {
+                    label: r.label,
+                    confidence: r.confidence as f32,
+                    model_id: r.model_id,
+                })
+            }
+        }
     }
+
+    /// Joint call: one shared encoding, one head per task in `tasks`.
+    pub async fn score_tasks(
+        &self,
+        prompt: &str,
+        tasks: &[String],
+        budget: Duration,
+    ) -> Result<ScoreTasksResponse, TasksError> {
+        if budget.is_zero() {
+            return Err(TasksError::Fault("deadline_exhausted"));
+        }
+        let deadline = budget.min(self.max_call);
+        let mut client = self.client.clone();
+        let req = ScoreTasksRequest {
+            prompt: prompt.to_string(),
+            tasks: tasks.to_vec(),
+        };
+        match timeout(deadline, client.score_tasks(req)).await {
+            Err(_) => Err(TasksError::Fault("timeout")),
+            Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
+                Err(TasksError::Unimplemented)
+            }
+            Ok(Err(_)) => Err(TasksError::Fault("rpc_error")),
+            Ok(Ok(r)) => Ok(r.into_inner()),
+        }
+    }
+}
+
+/// A sidecar's `Score` answer before any threshold is applied.
+#[derive(Debug, Clone)]
+pub struct RawScore {
+    pub label: String,
+    pub confidence: f32,
+    pub model_id: String,
+}
+
+#[derive(Debug)]
+pub enum TasksError {
+    /// The sidecar predates `ScoreTasks`.
+    Unimplemented,
+    /// Same reason strings as `PassThrough`: timeout, rpc_error, deadline_exhausted.
+    Fault(&'static str),
 }
 
 /// Pure decision logic, split out so it is testable without a sidecar.
