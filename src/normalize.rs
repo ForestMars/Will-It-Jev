@@ -42,12 +42,7 @@ impl NormalizedText {
     }
 }
 
-fn push(
-    out: &mut NormalizedText,
-    s: &str,
-    start: usize,
-    end: usize,
-) {
+fn push(out: &mut NormalizedText, s: &str, start: usize, end: usize) {
     out.text.push_str(s);
     for _ in 0..s.len() {
         out.orig_start.push(start);
@@ -100,7 +95,10 @@ mod tests {
 
     #[test]
     fn composed_and_decomposed_inputs_normalize_identically() {
-        assert_eq!(normalize("caf\u{e9}").as_str(), normalize("cafe\u{301}").as_str());
+        assert_eq!(
+            normalize("caf\u{e9}").as_str(),
+            normalize("cafe\u{301}").as_str()
+        );
         assert_eq!(normalize("cafe\u{301}").as_str(), "caf\u{e9}");
     }
 
