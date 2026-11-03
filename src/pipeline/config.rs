@@ -39,7 +39,11 @@ fn default_tag_budget_ms() -> u64 {
 
 impl Default for PipelineSettings {
     fn default() -> Self {
-        Self { tag_via_cascade: false, tag_budget_ms: default_tag_budget_ms(), joint_tiers: Vec::new() }
+        Self {
+            tag_via_cascade: false,
+            tag_budget_ms: default_tag_budget_ms(),
+            joint_tiers: Vec::new(),
+        }
     }
 }
 
@@ -95,7 +99,9 @@ pub fn parse(contents: &str) -> Result<PipelineConfig, Box<dyn Error>> {
             (None | Some("defer"), None) => FallbackPolicy::Defer,
             (None, Some(label)) => FallbackPolicy::Label(label),
             (Some(other), None) => {
-                return Err(format!("task.{name}: fallback must be \"defer\", got {other:?}").into())
+                return Err(
+                    format!("task.{name}: fallback must be \"defer\", got {other:?}").into(),
+                )
             }
             (Some(_), Some(_)) => {
                 return Err(format!("task.{name}: set fallback or fallback_label, not both").into())
@@ -107,18 +113,36 @@ pub fn parse(contents: &str) -> Result<PipelineConfig, Box<dyn Error>> {
                 .strip_prefix("tier")
                 .and_then(|n| n.parse().ok())
                 .filter(|n| (1..=4).contains(n))
-                .ok_or_else(|| format!("task.{name}: unknown key {key:?}; tiers are tier1..tier4"))?;
-            for bar in std::iter::once(policy.min_confidence).chain(policy.label_min_confidence.values().copied()) {
+                .ok_or_else(|| {
+                    format!("task.{name}: unknown key {key:?}; tiers are tier1..tier4")
+                })?;
+            for bar in std::iter::once(policy.min_confidence)
+                .chain(policy.label_min_confidence.values().copied())
+            {
                 if !(0.0..=1.0).contains(&bar) {
-                    return Err(format!("task.{name}.{key}: confidence bar {bar} is outside 0..=1").into());
+                    return Err(format!(
+                        "task.{name}.{key}: confidence bar {bar} is outside 0..=1"
+                    )
+                    .into());
                 }
             }
             tiers.insert(tier, policy);
         }
         let task = TaskId::new(name);
-        profiles.insert(task.clone(), TaskProfile { task, labels: profile.labels, tiers, fallback });
+        profiles.insert(
+            task.clone(),
+            TaskProfile {
+                task,
+                labels: profile.labels,
+                tiers,
+                fallback,
+            },
+        );
     }
-    Ok(PipelineConfig { settings: raw.pipeline, profiles })
+    Ok(PipelineConfig {
+        settings: raw.pipeline,
+        profiles,
+    })
 }
 
 #[cfg(test)]
