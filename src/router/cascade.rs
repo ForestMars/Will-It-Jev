@@ -20,6 +20,8 @@ use crate::telemetry::{
 use super::tier1_runner::{Tier1Engine, AMBIGUITY_UPPER_BOUND};
 use super::tier2_runner::{Tier2Outcome, Tier2Route, Tier2Runner};
 use super::tier3_runner::{Tier3Outcome, Tier3Route, Tier3Runner};
+use super::tier4_runner::{Tier4Outcome, Tier4Route, Tier4Runner};
+use super::tier5_runner::{Tier5Outcome, Tier5Route, Tier5Runner};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
@@ -84,7 +86,7 @@ fn finish_route(
     tier1_outcome: Tier1Record,
     tier2_outcome: Option<Tier2Record>,
     tier3_outcome: Option<Tier3Record>,
-    tier4_outcome: Option<Tier3Record>,
+    tier4_outcome: Option<Tier4Record>,
 ) -> (Decision, RouteRecord) {
     let latency_us = start.elapsed().as_micros();
     let record = RouteRecord {
@@ -121,7 +123,7 @@ pub async fn route(
     t1: Option<&Tier1Engine>,
     t2: Option<&Tier2Runner>,
     t3: Option<&Tier3Runner>,
-    t4: Option<&Tier3Runner>,
+    t4: Option<&Tier4Runner>,
     budget: Duration,
     hashes: &Hashes,
 ) -> (Decision, RouteRecord) {
