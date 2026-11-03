@@ -5,7 +5,7 @@ use tracing::{info, warn};
 
 use super::cascade::Backend;
 use super::tier5_runner::{DownstreamError, Tier5Runner as JevRunner};
-// use super::tier6_runner::Tier6Runner as LlmRunner;
+use super::tier6_runner::Tier6Runner as LlmRunner;
 
 pub struct DownstreamDispatcher {
     jev: Option<JevRunner>,
@@ -194,7 +194,10 @@ impl DownstreamDispatcher {
         let Some(llm) = self.llm.as_ref() else {
             return Err(disabled_failure(6, "llm_disabled"));
         };
-        match llm.invoke(prompt).await {
+        
+        let invoke_result: Result<(Value, Duration), DownstreamError> = llm.invoke(prompt).await;
+
+        match invoke_result {
             Ok((payload, elapsed)) => {
                 downstream_metric(request_id, "tier6", "success", is_failover, elapsed);
                 Ok(DispatchOutcome {
