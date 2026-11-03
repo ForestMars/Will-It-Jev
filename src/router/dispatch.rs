@@ -4,7 +4,7 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use super::cascade::Backend;
-use super::tier4_runner::{DownstreamError, Tier4Runner as JevRunner};
+use super::tier5_runner::{DownstreamError, Tier5Runner as JevRunner};
 use super::tier6_runner::Tier6Runner as LlmRunner;
 
 pub struct DownstreamDispatcher {

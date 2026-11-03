@@ -1,0 +1,22 @@
+# Task profiles for the task-agnostic cascade (src/pipeline). Everything here is off
+# by default; the route task needs no entry because its built-in profile mirrors the
+# thresholds the router uses today.
+
+[pipeline]
+# Run category tagging through the shared tiers, with the Ollama tagger as fallback.
+tag_via_cascade = false
+# Deadline for one tagging run. Keep it below TagConfig.call_timeout (5s).
+tag_budget_ms = 4000
+# Tier numbers whose sidecar implements the ScoreTasks RPC. No shipped sidecar does yet.
+joint_tiers = []
+
+# The tag profile is deliberately not shipped: its confidence bars have to be tuned on
+# tagging data (see taskonomies/), and no sidecar model has a tagging head yet. Shape:
+#
+# [task.tag]
+# labels   = ["engineering", "company_knowledge_base", "help_desk", "customer_support",
+#             "web_search", "other_company_task", "other_general_request"]
+# fallback = "defer"
+#
+# [task.tag.tier4]
+# min_confidence = <tuned value>

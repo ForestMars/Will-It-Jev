@@ -136,13 +136,19 @@ src/
     schema.rs         Serde schemas for tier thresholds, model paths, flags
   logging/
     mod.rs            Low-overhead tracing and telemetry initialization
+  pipeline/           Task-agnostic cascade engine (see "Multi-task cascade" below)
+    task.rs           TaskId, raw readings, TaskProfile (per-task bars, labels, fallback)
+    tier.rs           Tier trait + adapters for tiers 1-4 (joint ScoreTasks for sidecars)
+    runner.rs         CascadeRunner: one pass over the union of open tasks
+    config.rs         config/tasks.toml loader
+    tagger.rs         CascadeTagger: category tagging on the shared tiers
   router/
     cascade.rs        Pipeline dispatcher and lifecycle orchestration
     tier1.rs          Static hash, length bound, and regex evaluator
     tier2.rs          Learned Decision Tier (FastText subword classifier)
     tier3_runner.rs   (ModernBERT ONNX runtime stub)
     tier4.rs          Micro-Transformer / Embedding Evaluators (gRPC client using GGUF) 
-    tier4_runner.rs   Jev Self-evaluation
+    tier5_runner.rs   Jev Self-evaluation
     tier6_runner.rs   Generative LLM Fallback
   tier3/
     calibration.rs    Margin calculation and probability calibration
@@ -468,3 +474,24 @@ Engines must not allocate on the per-request hot path where avoidable, and must 
 ## License
 
 See the `LICENSE` file in the repository root.
+
+---
+
+## Multi-task cascade
+
+The tiers are decoupled from the question they answer. A `Tier` returns raw per-task
+readings and applies no thresholds; a `TaskProfile` says which tiers a task may exit at,
+the confidence bar per tier and label, the allowed labels, and the fallback. The
+`CascadeRunner` walks the tiers once over the union of open tasks, so a tier executes at
+most once per run however many tasks it serves, and each task leaves as soon as its own
+profile resolves it.
+
+* `route` (jev_capable / needs_llm): `TaskProfile::route_default()` reproduces today's
+  thresholds; tests assert it decides identically to `tier3_runner::decide` and the
+  tier 1 and 2 rules. `router::cascade::route` itself has not been moved onto the runner.
+* `tag` (domain categories): `CascadeTagger` implements `tagging::Tagger`, falling back
+  to the Ollama tagger when no tier resolves. Off by default (`tag_via_cascade` in
+  `config/tasks.toml`) and needs a tuned `[task.tag]` profile.
+* Joint execution: the additive `ScoreTasks` RPC scores several tasks from one shared
+  encoding. A sidecar that answers UNIMPLEMENTED is served route-only via `Score`.
+  No shipped sidecar implements it yet.

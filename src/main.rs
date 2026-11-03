@@ -1,6 +1,7 @@
 // src/main.rs
 
 mod config;
+mod pipeline;
 mod router;
 mod tagging;
 mod telemetry;
@@ -8,6 +9,9 @@ mod telemetry;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use crate::tagging::{ClickHouseRawTable, OvenV1Tagger, TagConfig};
+use pipeline::tagger::CascadeTagger;
+use pipeline::tier::{Tier, Tier3Tier};
+use pipeline::{CascadeRunner, TaskId};
 use router::dispatch::DownstreamDispatcher;
 use router::service;
 use router::tier1_runner::{Tier1Automaton, Tier1Engine};
@@ -202,6 +206,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => "disabled".into(),
         },
     };
+    let pipeline_config =
+        pipeline::config::load_or_default(env_or("TASKS_CONFIG", "config/tasks.toml"))?;
     let modernbert = if config.router.tier3.enabled {
         Some(Tier3Runner::new(
             env_or("MODERNBERT_ENDPOINT", "http://[::1]:50052"),
@@ -227,6 +233,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("tier 4 disabled by configuration");
         None
     };
+
+    // Handles for the tagging cascade; the originals move into the router below.
+    let tag_tier3 = modernbert.clone();
+    let tag_tier4 = harrier.clone();
 
     let downstream_timeout =
         Duration::from_millis(env_or("DOWNSTREAM_TIMEOUT_MS", "120000").parse()?);
@@ -300,22 +310,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok::<(), std::io::Error>(())
     });
 
-    let tagger = Arc::new(OvenV1Tagger::new(
+    let ollama_tagger = OvenV1Tagger::new(
         env_or("TAGGER_OLLAMA_URL", "http://127.0.0.1:11434"),
         env_or("TAGGER_MODEL", "qwen3:1.7b"),
-    ));
-    let (tag_queue, tag_handle) = tagging::spawn(
-        tagger,
-        TagConfig {
-            base_path: PathBuf::from("logs/task_tags.jsonl"),
-            clickhouse_url: Some(tag_clickhouse_url),
-            queue_capacity: 1024,
-            concurrency: 4,
-            call_timeout: Duration::from_secs(5),
-            max_age: Duration::from_secs(60),
-            sample_prob: env_or("TAG_SAMPLE_PROB", "1.0").parse()?,
-        },
     );
+    let tag_config = TagConfig {
+        base_path: PathBuf::from("logs/task_tags.jsonl"),
+        clickhouse_url: Some(tag_clickhouse_url),
+        queue_capacity: 1024,
+        concurrency: 4,
+        call_timeout: Duration::from_secs(5),
+        max_age: Duration::from_secs(60),
+        sample_prob: env_or("TAG_SAMPLE_PROB", "1.0").parse()?,
+    };
+    let (tag_queue, tag_handle) = if pipeline_config.settings.tag_via_cascade {
+        // Tagging as the second use case on the shared tiers (tiers 3 and 4 are the
+        // only ones that can carry a tagging head).
+        let profile = pipeline_config.profile(&TaskId::tag()).ok_or(
+            "tasks.toml: tag_via_cascade = true but there is no [task.tag] profile",
+        )?;
+        let joint = &pipeline_config.settings.joint_tiers;
+        let mut tiers: Vec<Arc<dyn Tier>> = Vec::new();
+        if let Some(runner) = tag_tier3.clone() {
+            tiers.push(Arc::new(Tier3Tier::new(3, "modernbert", runner, joint.contains(&3))));
+        }
+        if let Some(runner) = tag_tier4.clone() {
+            tiers.push(Arc::new(Tier3Tier::new(4, "harrier", runner, joint.contains(&4))));
+        }
+        let available: Vec<u8> = tiers.iter().map(|tier| tier.id()).collect();
+        if let Some(missing) = profile.tiers.keys().find(|tier| !available.contains(tier)) {
+            return Err(format!(
+                "tasks.toml: task.tag lists tier{missing}, which is disabled or cannot serve tagging"
+            )
+            .into());
+        }
+        let tagger = Arc::new(CascadeTagger::new(
+            Arc::new(CascadeRunner::new(tiers)),
+            profile,
+            Duration::from_millis(pipeline_config.settings.tag_budget_ms),
+            ollama_tagger,
+        )?);
+        tracing::info!("task tagging runs through the shared cascade tiers");
+        tagging::spawn(tagger, tag_config)
+    } else {
+        tagging::spawn(Arc::new(ollama_tagger), tag_config)
+    };
 
     let app = service::app(
         tier1,

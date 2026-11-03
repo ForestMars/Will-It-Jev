@@ -4,7 +4,7 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use tokio::time::timeout;
 
-use super::tier4_runner::DownstreamError;
+use super::tier5_runner::DownstreamError;
 
 pub struct Tier6Runner {
     client: Client,
