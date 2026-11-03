@@ -17,6 +17,7 @@ use router::service;
 use router::tier1_runner::{Tier1Automaton, Tier1Engine};
 use router::tier2_runner::{Tier2Runner, DEFAULT_CONFIDENCE_THRESHOLD};
 use router::tier3_runner::Tier3Runner;
+use router::tier4_runner::Tier4Runner;
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use sha2::{Digest, Sha256};
