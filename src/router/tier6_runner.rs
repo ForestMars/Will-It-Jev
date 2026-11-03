@@ -1,16 +1,14 @@
+// src/router/tier6_runner.rs
+
 use std::time::{Duration, Instant};
-
-use reqwest::Client;
-use serde_json::{json, Value};
-use tokio::time::timeout;
-
+use serde_json::Value;
 use super::tier5_runner::DownstreamError;
 
+#[derive(Clone)]
 pub struct Tier6Runner {
-    client: Client,
+    client: reqwest::Client,
     endpoint: String,
     model: String,
-    timeout: Duration,
 }
 
 impl Tier6Runner {
@@ -19,47 +17,48 @@ impl Tier6Runner {
         model: String,
         timeout: Duration,
     ) -> Result<Self, reqwest::Error> {
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()?;
         Ok(Self {
-            client: Client::builder().build()?,
+            client,
             endpoint,
             model,
-            timeout: timeout.min(Duration::from_secs(25)),
         })
     }
 
     pub async fn invoke(&self, prompt: &str) -> Result<(Value, Duration), DownstreamError> {
-        let started = Instant::now();
-        let result = timeout(self.timeout, async {
-            let response = self
-                .client
-                .post(&self.endpoint)
-                .json(&json!({
-                    "model": self.model,
-                    "prompt": prompt,
-                    "stream": false,
-                }))
-                .send()
-                .await
-                .map_err(|error| DownstreamError::Transport(error.to_string()))?;
-            let status = response.status();
-            if !status.is_success() {
-                let body = response
-                    .text()
-                    .await
-                    .map_err(|error| DownstreamError::Transport(error.to_string()))?;
-                return Err(DownstreamError::HttpStatus(status.as_u16(), body));
-            }
-            response
-                .json::<Value>()
-                .await
-                .map_err(|error| DownstreamError::InvalidResponse(error.to_string()))
-        })
-        .await;
-        let elapsed = started.elapsed();
-        match result {
-            Err(_) => Err(DownstreamError::Timeout),
-            Ok(Err(error)) => Err(error),
-            Ok(Ok(value)) => Ok((value, elapsed)),
+        let start = Instant::now();
+        let payload = serde_json::json!({
+            "model": &self.model,
+            "prompt": prompt,
+            "stream": false
+        });
+
+        let response = self.client
+            .post(&self.endpoint)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    DownstreamError::Timeout
+                } else {
+                    DownstreamError::Transport(e.to_string())
+                }
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(DownstreamError::HttpStatus(status.as_u16(), text));
         }
+
+        let body = response
+            .json::<Value>()
+            .await
+            .map_err(|e| DownstreamError::Transport(e.to_string()))?;
+            
+        Ok((body, start.elapsed()))
     }
 }
