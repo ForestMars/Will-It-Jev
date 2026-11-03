@@ -18,7 +18,7 @@
 #![allow(dead_code)] // remove once main.rs and service.rs consume this module
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -100,9 +100,13 @@ pub enum TagResult {
 impl From<TaggerVerdict> for TagResult {
     fn from(v: TaggerVerdict) -> Self {
         match v {
-            TaggerVerdict::Tagged { primary, alternatives } => {
-                TagResult::Tagged { primary, alternatives }
-            }
+            TaggerVerdict::Tagged {
+                primary,
+                alternatives,
+            } => TagResult::Tagged {
+                primary,
+                alternatives,
+            },
             TaggerVerdict::NoMatch { nearest, embedding } => {
                 TagResult::NoMatch { nearest, embedding }
             }
@@ -150,10 +154,7 @@ pub trait Tagger: Send + Sync + 'static {
     fn model(&self) -> &str;
     fn version(&self) -> &str;
     fn taxonomy_version(&self) -> &str;
-    fn tag(
-        &self,
-        input: &TagInput,
-    ) -> impl Future<Output = Result<TaggerOutput, TagError>> + Send;
+    fn tag(&self, input: &TagInput) -> impl Future<Output = Result<TaggerOutput, TagError>> + Send;
 }
 
 pub const V1_DOMAINS: [&str; 7] = [
@@ -196,10 +197,7 @@ impl Tagger for OvenV1Tagger {
         "v1.0"
     }
 
-    fn tag(
-        &self,
-        input: &TagInput,
-    ) -> impl Future<Output = Result<TaggerOutput, TagError>> + Send {
+    fn tag(&self, input: &TagInput) -> impl Future<Output = Result<TaggerOutput, TagError>> + Send {
         let client = self.client.clone();
         let base_url = self.base_url.clone();
         let model = self.model.clone();
@@ -246,16 +244,17 @@ impl Tagger for OvenV1Tagger {
                 )));
             }
 
-            let payload: serde_json::Value = response
-                .json()
-                .await
-                .map_err(|error| TagError::Failed(format!("ollama response parse failed: {error}")))?;
+            let payload: serde_json::Value = response.json().await.map_err(|error| {
+                TagError::Failed(format!("ollama response parse failed: {error}"))
+            })?;
 
             let content = payload
                 .get("message")
                 .and_then(|m| m.get("content"))
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| TagError::Failed("ollama response missing message.content".to_string()))?;
+                .ok_or_else(|| {
+                    TagError::Failed("ollama response missing message.content".to_string())
+                })?;
 
             let candidate = content
                 .trim()
@@ -272,8 +271,10 @@ impl Tagger for OvenV1Tagger {
                 .get("primary")
                 .and_then(|primary| primary.get("category_id"))
                 .and_then(serde_json::Value::as_str)
-                .filter(|id| V1_DOMAINS.iter().any(|allowed| *allowed == *id))
-                .ok_or_else(|| TagError::Failed("tagger did not return a valid category id".to_string()))?;
+                .filter(|id| V1_DOMAINS.contains(id))
+                .ok_or_else(|| {
+                    TagError::Failed("tagger did not return a valid category id".to_string())
+                })?;
 
             let score = parsed
                 .get("primary")
@@ -389,17 +390,35 @@ async fn process<T: Tagger>(tagger: &T, cfg: &TagConfig, job: TagJob) -> TagReco
     let started = Instant::now();
 
     let (result, tagger_usage) = if !is_sampled(&job.input.request_id, cfg.sample_prob) {
-        (TagResult::Untagged { reason: UntaggedReason::SampledOut }, None)
+        (
+            TagResult::Untagged {
+                reason: UntaggedReason::SampledOut,
+            },
+            None,
+        )
     } else if queue_wait > cfg.max_age {
-        (TagResult::Untagged { reason: UntaggedReason::Dropped }, None)
+        (
+            TagResult::Untagged {
+                reason: UntaggedReason::Dropped,
+            },
+            None,
+        )
     } else {
         match tokio::time::timeout(cfg.call_timeout, tagger.tag(&job.input)).await {
-            Err(_) | Ok(Err(TagError::Timeout)) => {
-                (TagResult::Untagged { reason: UntaggedReason::Timeout }, None)
-            }
+            Err(_) | Ok(Err(TagError::Timeout)) => (
+                TagResult::Untagged {
+                    reason: UntaggedReason::Timeout,
+                },
+                None,
+            ),
             Ok(Err(TagError::Failed(error))) => {
                 warn!(request_id = %job.input.request_id, error = %error, "task tagger failed");
-                (TagResult::Untagged { reason: UntaggedReason::Error }, None)
+                (
+                    TagResult::Untagged {
+                        reason: UntaggedReason::Error,
+                    },
+                    None,
+                )
             }
             Ok(Ok(output)) => (output.verdict.into(), output.usage),
         }
@@ -443,14 +462,18 @@ pub fn spawn<T: Tagger>(
             .build()
             .map_err(std::io::Error::other)?;
 
-        async fn get_file(base: &PathBuf, date_str: &str) -> std::io::Result<tokio::fs::File> {
+        async fn get_file(base: &Path, date_str: &str) -> std::io::Result<tokio::fs::File> {
             let path = if let Some(parent) = base.parent() {
                 tokio::fs::create_dir_all(parent).await?;
                 parent.join(format!("task_tags.{date_str}.jsonl"))
             } else {
                 PathBuf::from(format!("task_tags.{date_str}.jsonl"))
             };
-            OpenOptions::new().create(true).append(true).open(&path).await
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .await
         }
 
         let mut flush = tokio::time::interval(Duration::from_secs(1));
@@ -638,7 +661,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("tagging-{}-{name}-{unique}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("tagging-{}-{name}-{unique}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         dir.join("task_tags.jsonl")
     }
@@ -650,9 +674,12 @@ mod tests {
         }
     }
 
-    fn read_records(path: &PathBuf) -> Vec<TagRecord> {
+    fn read_records(path: &Path) -> Vec<TagRecord> {
         let today = Utc::now().format("%Y-%m-%d").to_string();
-        let actual_path = path.parent().unwrap().join(format!("task_tags.{today}.jsonl"));
+        let actual_path = path
+            .parent()
+            .unwrap()
+            .join(format!("task_tags.{today}.jsonl"));
         std::fs::read_to_string(actual_path)
             .unwrap()
             .lines()
