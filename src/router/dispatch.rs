@@ -82,11 +82,7 @@ impl DownstreamDispatcher {
                 None
             },
             llm: if llm_enabled {
-                Some(LlmRunner::new(
-                    llm_endpoint,
-                    llm_model,
-                    downstream_timeout,
-                )?)
+                Some(LlmRunner::new(llm_endpoint, llm_model, downstream_timeout)?)
             } else {
                 None
             },
@@ -194,7 +190,7 @@ impl DownstreamDispatcher {
         let Some(llm) = self.llm.as_ref() else {
             return Err(disabled_failure(6, "llm_disabled"));
         };
-        
+
         let invoke_result: Result<(Value, Duration), DownstreamError> = llm.invoke(prompt).await;
 
         match invoke_result {

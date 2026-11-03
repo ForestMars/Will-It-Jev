@@ -12,9 +12,11 @@ use chrono::Utc;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::normalize::normalize;
+
 use crate::telemetry::{
     FinalRouting, Hashes, RouteRecord, Sampling, Tier1Outcome as Tier1Record,
-    Tier2Outcome as Tier2Record, Tier3Outcome as Tier3Record, Tier4Outcome as Tier4Record
+    Tier2Outcome as Tier2Record, Tier3Outcome as Tier3Record, Tier4Outcome as Tier4Record,
 };
 
 use super::tier1_runner::{Tier1Engine, AMBIGUITY_UPPER_BOUND};
@@ -74,6 +76,13 @@ fn resolved(
     }
 }
 
+struct TierOutcomes {
+    tier1: Tier1Record,
+    tier2: Option<Tier2Record>,
+    tier3: Option<Tier3Record>,
+    tier4: Option<Tier4Record>,
+}
+
 fn finish_route(
     request_id: &str,
     decision: Decision,
@@ -81,10 +90,7 @@ fn finish_route(
     start: Instant,
     timestamp: &chrono::DateTime<Utc>,
     hashes: &Hashes,
-    tier1_outcome: Tier1Record,
-    tier2_outcome: Option<Tier2Record>,
-    tier3_outcome: Option<Tier3Record>,
-    tier4_outcome: Option<Tier4Record>,
+    outcomes: TierOutcomes,
 ) -> (Decision, RouteRecord) {
     let latency_us = start.elapsed().as_micros();
     let record = RouteRecord {
@@ -92,10 +98,10 @@ fn finish_route(
         timestamp: timestamp.clone(),
         prompt_raw: prompt.to_string(),
         hashes: hashes.clone(),
-        tier1_outcome,
-        tier2_outcome,
-        tier3_outcome,
-        tier4_outcome,
+        tier1_outcome: outcomes.tier1,
+        tier2_outcome: outcomes.tier2,
+        tier3_outcome: outcomes.tier3,
+        tier4_outcome: outcomes.tier4,
         cascade_decision_tier: decision.decided_by_tier,
         final_routing: FinalRouting {
             backend: decision.backend.to_string(),
@@ -116,12 +122,11 @@ fn finish_route(
 }
 
 pub async fn route(
-    _req: u64,
     prompt: &str,
     t1: Option<&Tier1Engine>,
     t2: Option<&Tier2Runner>,
     t3: Option<&Tier3Runner>,
-    // Architectural Note: Tier 4 (Harrier) reuses Tier3Runner because it shares 
+    // Architectural Note: Tier 4 (Harrier) reuses Tier3Runner because it shares
     // the exact same remote wire protocol and outcome structure as Tier 3.
     t4: Option<&Tier3Runner>,
     budget: Duration,
@@ -130,12 +135,14 @@ pub async fn route(
     let request_id = Uuid::new_v4().to_string();
     let start = Instant::now();
     let timestamp = Utc::now();
+    let normalized_prompt = normalize(prompt);
+    let inference_prompt = normalized_prompt.as_str();
 
     // ---- Tier 1: heuristic pattern engine, in-process ----
     let tier1_record = if let Some(t1) = t1 {
         info!("[request_id={request_id}] TRY tier=1 (heuristic) prompt={prompt:?}");
         let t = Instant::now();
-        let r1 = t1.classify(prompt);
+        let r1 = t1.classify(inference_prompt);
         let record = Tier1Record {
             confidence: r1.confidence,
             decided: r1.decided,
@@ -157,16 +164,18 @@ pub async fn route(
                 start.elapsed(),
             );
             return finish_route(
-                &request_id,
+&request_id,
                 decision,
                 prompt,
                 start,
                 &timestamp,
                 hashes,
-                record,
-                None,
-                None,
-                None,
+                TierOutcomes {
+                    tier1: record,
+                    tier2: None,
+                    tier3: None,
+                    tier4: None,
+                },
             );
         }
 
@@ -192,7 +201,7 @@ pub async fn route(
     let tier2_record = if let Some(t2) = t2 {
         info!("[request_id={request_id}] TRY tier=2 (fasttext) prompt={prompt:?}");
         let t = Instant::now();
-        match t2.evaluate(prompt) {
+        match t2.evaluate(inference_prompt) {
             Tier2Outcome::Resolved {
                 route,
                 confidence,
@@ -204,7 +213,7 @@ pub async fn route(
                 info!("[request_id={request_id}] SCORE  tier=2 raw={confidence:.3} calibrated={calibrated_score:.3}");
                 let backend = match route {
                     Tier2Route::Jev => Backend::Jev,
-                    Tier2Route::LLM => Backend::Llm,
+                    Tier2Route::Llm => Backend::Llm,
                 };
                 let decision = resolved(
                     &request_id,
@@ -216,21 +225,23 @@ pub async fn route(
                     start.elapsed(),
                 );
                 return finish_route(
-                    &request_id,
+&request_id,
                     decision,
                     prompt,
                     start,
                     &timestamp,
                     hashes,
-                    tier1_record,
-                    Some(Tier2Record {
+                    TierOutcomes {
+                        tier1: tier1_record,
+                        tier2: Some(Tier2Record {
                         p_jev,
                         p_llm,
                         raw_probabilities,
                         reason: "resolved".to_string(),
                     }),
-                    None,
-                    None,
+                        tier3: None,
+                        tier4: None,
+                    },
                 );
             }
 
@@ -268,7 +279,7 @@ pub async fn route(
         info!("[request_id={request_id}] TRY tier=3 (modernbert/onnx) prompt={prompt:?}");
         let t = Instant::now();
         let left = budget.saturating_sub(start.elapsed());
-        let tier3_result = t3.evaluate(prompt, left).await;
+        let tier3_result = t3.evaluate(inference_prompt, left).await;
         let tier3_record = match &tier3_result {
             Tier3Outcome::Resolved { confidence, .. } => Some(Tier3Record {
                 score: *confidence,
@@ -299,16 +310,18 @@ pub async fn route(
                     start.elapsed(),
                 );
                 return finish_route(
-                    &request_id,
+&request_id,
                     decision,
                     prompt,
                     start,
                     &timestamp,
                     hashes,
-                    tier1_record,
-                    tier2_record,
-                    tier3_record,
-                    None,
+                    TierOutcomes {
+                        tier1: tier1_record,
+                        tier2: tier2_record,
+                        tier3: tier3_record,
+                        tier4: None,
+                    },
                 );
             }
             Tier3Outcome::PassThrough {
@@ -333,13 +346,13 @@ pub async fn route(
     };
 
     // ---- Tier 4: Harrier sidecar over gRPC ----
-    // Tier 4 uses Tier3Runner/Tier3Outcome intentionally because Harrier is an 
+    // Tier 4 uses Tier3Runner/Tier3Outcome intentionally because Harrier is an
     // alternate model instance speaking the identical gRPC interface as Tier 3.
     let tier4_record = if let Some(t4) = t4 {
         let left = budget.saturating_sub(start.elapsed());
-        info!("[request_id={request_id}] TRY budget_left={left:?} tier=4 (harrier)");
+        info!("[request_id={request_id}] TRY budget_left={left:?} tier=4 (gRPC scorer)");
         let t = Instant::now();
-        let tier4_result = t4.evaluate(prompt, left).await;
+        let tier4_result = t4.evaluate(inference_prompt, left).await;
         let tier4_record = match &tier4_result {
             Tier3Outcome::Resolved { confidence, .. } => Some(Tier4Record {
                 score: *confidence,
@@ -370,16 +383,18 @@ pub async fn route(
                     start.elapsed(),
                 );
                 return finish_route(
-                    &request_id,
+&request_id,
                     decision,
                     prompt,
                     start,
                     &timestamp,
                     hashes,
-                    tier1_record,
-                    tier2_record,
-                    tier3_record,
-                    tier4_record,
+                    TierOutcomes {
+                        tier1: tier1_record,
+                        tier2: tier2_record,
+                        tier3: tier3_record,
+                        tier4: tier4_record,
+                    },
                 );
             }
             Tier3Outcome::PassThrough {
@@ -415,16 +430,18 @@ pub async fn route(
         start.elapsed(),
     );
     finish_route(
-        &request_id,
+&request_id,
         decision,
         prompt,
         start,
         &timestamp,
         hashes,
-        tier1_record,
-        tier2_record,
-        tier3_record,
-        tier4_record,
+        TierOutcomes {
+            tier1: tier1_record,
+            tier2: tier2_record,
+            tier3: tier3_record,
+            tier4: tier4_record,
+        },
     )
 }
 
@@ -447,7 +464,7 @@ mod tests {
         };
 
         let (_, record) = route(
-            1,
+            
             "ambiguous request",
             None,
             None,

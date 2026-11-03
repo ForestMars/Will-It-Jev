@@ -14,7 +14,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 use tracing::warn;
 
-use crate::telemetry::{self, Hashes, RouteRecord};
+use crate::telemetry::{Hashes, RouteRecord};
 
 use super::{
     cascade::{self, Backend},
@@ -23,6 +23,13 @@ use super::{
     tier2_runner::Tier2Runner,
     tier3_runner::Tier3Runner,
 };
+
+pub struct RouterTiers {
+    pub tier1: Option<Tier1Engine>,
+    pub tier2: Option<Tier2Runner>,
+    pub tier3: Option<Tier3Runner>,
+    pub tier4: Option<Tier3Runner>,
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -54,10 +61,7 @@ struct ChatMessage {
 }
 
 pub fn app(
-    tier1: Option<Tier1Engine>,
-    tier2: Option<Tier2Runner>,
-    tier3: Option<Tier3Runner>,
-    tier4: Option<Tier3Runner>,
+    tiers: RouterTiers,
     dispatcher: DownstreamDispatcher,
     hashes: Hashes,
     capture_tx: mpsc::Sender<RouteRecord>,
@@ -65,10 +69,10 @@ pub fn app(
     budget: Duration,
 ) -> Router {
     let state = AppState {
-        tier1: tier1.map(Arc::new),
-        tier2: tier2.map(Arc::new),
-        tier3: tier3.map(Arc::new),
-        tier4: tier4.map(Arc::new),
+        tier1: tiers.tier1.map(Arc::new),
+        tier2: tiers.tier2.map(Arc::new),
+        tier3: tiers.tier3.map(Arc::new),
+        tier4: tiers.tier4.map(Arc::new),
         dispatcher: Arc::new(dispatcher),
         hashes: Arc::new(hashes),
         capture_tx,
@@ -167,7 +171,6 @@ async fn completion(
         "completion request accepted"
     );
     let (_, mut record) = cascade::route(
-        telemetry::next_req_id(),
         &route_input,
         state.tier1.as_deref(),
         state.tier2.as_deref(),
@@ -249,7 +252,9 @@ async fn completion(
             state.tag_queue.enqueue(TagInput {
                 request_id,
                 prompt: route_input.clone(),
-                response: Some(format!("{{\"error\":\"generative_provider_unavailable\",\"detail\":{detail:?}}}")),
+                response: Some(format!(
+                    "{{\"error\":\"generative_provider_unavailable\",\"detail\":{detail:?}}}"
+                )),
             });
             (
                 StatusCode::BAD_GATEWAY,
@@ -387,10 +392,12 @@ mod tests {
         );
         let (tx, _rx) = mpsc::channel(2);
         let application = app(
-            Some(tier1),
-            Some(tier2),
-            None,
-            Some(tier3),
+            RouterTiers {
+                tier1: Some(tier1),
+                tier2: Some(tier2),
+                tier3: None,
+                tier4: Some(tier3),
+            },
             dispatcher,
             Hashes {
                 tier1_toml: String::new(),
@@ -418,7 +425,9 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let payload: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(payload["answers"]["answer"]["choice"], "yes");
         assert!(payload["answers"].get("__router_jev_eligible").is_none());
@@ -444,13 +453,21 @@ mod tests {
     }
 
     impl crate::tagging::Tagger for NoopTagger {
-        fn model(&self) -> &str { "noop-tagger" }
-        fn version(&self) -> &str { "test" }
-        fn taxonomy_version(&self) -> &str { "test-v1" }
+        fn model(&self) -> &str {
+            "noop-tagger"
+        }
+        fn version(&self) -> &str {
+            "test"
+        }
+        fn taxonomy_version(&self) -> &str {
+            "test-v1"
+        }
         fn tag(
             &self,
             input: &crate::tagging::TagInput,
-        ) -> impl std::future::Future<Output = Result<crate::tagging::TaggerOutput, crate::tagging::TagError>> + Send {
+        ) -> impl std::future::Future<
+            Output = Result<crate::tagging::TaggerOutput, crate::tagging::TagError>,
+        > + Send {
             let input_tx = self.input_tx.clone();
             let input = input.clone();
             let release = Arc::clone(&self.release);
