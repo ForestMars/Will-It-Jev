@@ -1,6 +1,7 @@
 // src/main.rs
 
 mod config;
+pub mod normalize;
 mod pipeline;
 mod router;
 mod tagging;
@@ -17,7 +18,6 @@ use router::service;
 use router::tier1_runner::{Tier1Automaton, Tier1Engine};
 use router::tier2_runner::{Tier2Runner, DEFAULT_CONFIDENCE_THRESHOLD};
 use router::tier3_runner::Tier3Runner;
-use router::tier4_runner::Tier4Runner;
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use sha2::{Digest, Sha256};
@@ -127,8 +127,9 @@ fn clickhouse_url_with_auth(
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler");
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
         tokio::select! {
             result = tokio::signal::ctrl_c() => {
                 if let Err(error) = result {
@@ -159,7 +160,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer().with_target(false).compact())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .compact(),
+        )
         .init();
 
     tracing::info!("Cascade Router initialized successfully");
@@ -180,7 +185,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let tier1_path = env_or("TIER1_CONFIG", "config/tier1.toml");
     let tier1 = if config.router.tier1.enabled {
-        Some(Tier1Engine::new(Tier1Automaton::from_toml_file(&tier1_path)?)?)
+        Some(Tier1Engine::new(Tier1Automaton::from_toml_file(
+            &tier1_path,
+        )?)?)
     } else {
         tracing::info!("tier 1 disabled by configuration");
         None
@@ -192,8 +199,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     if let Some(model_path) = model_path.as_deref() {
-        if model_path == "models/tier2.bin" && !std::path::Path::new("models/tier2_small.bin").exists() {
-            tracing::warn!(model_path, "using legacy fastText tier-2 model; prefer models/tier2_small.bin when available");
+        if model_path == "models/tier2.bin"
+            && !std::path::Path::new("models/tier2_small.bin").exists()
+        {
+            tracing::warn!(
+                model_path,
+                "using legacy fastText tier-2 model; prefer models/tier2_small.bin when available"
+            );
         }
     }
     let tier2 = model_path
@@ -201,7 +213,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|path| Tier2Runner::new(path, DEFAULT_CONFIDENCE_THRESHOLD))
         .transpose()?;
     let hashes = telemetry::Hashes {
-        tier1_toml: if tier1.is_some() { sha256_file(&tier1_path)? } else { "disabled".into() },
+        tier1_toml: if tier1.is_some() {
+            sha256_file(&tier1_path)?
+        } else {
+            "disabled".into()
+        },
         tier2_bin: match model_path.as_deref() {
             Some(path) => sha256_file(path)?,
             None => "disabled".into(),
@@ -211,24 +227,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pipeline::config::load_or_default(env_or("TASKS_CONFIG", "config/tasks.toml"))?;
     let modernbert = if config.router.tier3.enabled {
         Some(Tier3Runner::new(
-            env_or("MODERNBERT_ENDPOINT", "http://[::1]:50052"),
-            0.95,
-            0.70,
-            Duration::from_millis(500),
+            env_or(
+                "MODERNBERT_ENDPOINT",
+                config
+                    .router
+                    .tier3
+                    .endpoint
+                    .as_deref()
+                    .unwrap_or("http://[::1]:50052"),
+            ),
+            config.router.tier3.jev_threshold,
+            config.router.tier3.llm_threshold,
+            Duration::from_millis(config.router.tier3.timeout_ms),
         )?)
     } else {
         tracing::info!("tier 3 disabled by configuration");
         None
     };
-    let harrier = if config.router.tier4.enabled {
+    // Tier 4 is a cascade position, not a model identity. Use a distinct
+    // variable so it cannot collide with the existing downstream TIER4_ENDPOINT.
+    let tier4_endpoint = std::env::var("TIER4_GRPC_ENDPOINT")
+        .or_else(|_| std::env::var("TIER4_HARRIER_ENDPOINT"))
+        .or_else(|_| std::env::var("TIER3_ENDPOINT"))
+        .unwrap_or_else(|_| {
+            config
+                .router
+                .tier4
+                .endpoint
+                .as_deref()
+                .unwrap_or("http://[::1]:50051")
+                .to_string()
+        });
+    let tier4 = if config.router.tier4.enabled {
         Some(Tier3Runner::new(
-            env_or(
-                "TIER4_HARRIER_ENDPOINT",
-                &env_or("TIER3_ENDPOINT", "http://[::1]:50051"),
-            ),
-            0.95,
-            0.70,
-            Duration::from_millis(500),
+            tier4_endpoint,
+            config.router.tier4.jev_threshold,
+            config.router.tier4.llm_threshold,
+            Duration::from_millis(config.router.tier4.timeout_ms),
         )?)
     } else {
         tracing::info!("tier 4 disabled by configuration");
@@ -237,7 +272,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Handles for the tagging cascade; the originals move into the router below.
     let tag_tier3 = modernbert.clone();
-    let tag_tier4 = harrier.clone();
+    let tag_tier4 = tier4.clone();
 
     let downstream_timeout =
         Duration::from_millis(env_or("DOWNSTREAM_TIMEOUT_MS", "120000").parse()?);
@@ -327,16 +362,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tag_queue, tag_handle) = if pipeline_config.settings.tag_via_cascade {
         // Tagging as the second use case on the shared tiers (tiers 3 and 4 are the
         // only ones that can carry a tagging head).
-        let profile = pipeline_config.profile(&TaskId::tag()).ok_or(
-            "tasks.toml: tag_via_cascade = true but there is no [task.tag] profile",
-        )?;
+        let profile = pipeline_config
+            .profile(&TaskId::tag())
+            .ok_or("tasks.toml: tag_via_cascade = true but there is no [task.tag] profile")?;
         let joint = &pipeline_config.settings.joint_tiers;
         let mut tiers: Vec<Arc<dyn Tier>> = Vec::new();
         if let Some(runner) = tag_tier3.clone() {
-            tiers.push(Arc::new(Tier3Tier::new(3, "modernbert", runner, joint.contains(&3))));
+            tiers.push(Arc::new(Tier3Tier::new(
+                3,
+                "modernbert",
+                runner,
+                joint.contains(&3),
+            )));
         }
         if let Some(runner) = tag_tier4.clone() {
-            tiers.push(Arc::new(Tier3Tier::new(4, "harrier", runner, joint.contains(&4))));
+            tiers.push(Arc::new(Tier3Tier::new(
+                4,
+                "tier4",
+                runner,
+                joint.contains(&4),
+            )));
         }
         let available: Vec<u8> = tiers.iter().map(|tier| tier.id()).collect();
         if let Some(missing) = profile.tiers.keys().find(|tier| !available.contains(tier)) {
@@ -358,16 +403,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let app = service::app(
-        tier1,
-        tier2,
-        modernbert,
-        harrier,
-        dispatcher,
-        hashes,
-        capture_tx.clone(),
-        tag_queue.clone(),
-        Duration::from_millis(env_or("ROUTER_BUDGET_MS", "600").parse()?),
-    );
+    service::RouterTiers {
+        tier1: tier1,
+        tier2: tier2,
+        tier3: modernbert,
+        tier4: tier4,
+    },
+    dispatcher,
+    hashes,
+    capture_tx.clone(),
+    tag_queue.clone(),
+    Duration::from_millis(env_or("ROUTER_BUDGET_MS", "600").parse()?),
+);
     let bind_address = env_or("ROUTER_BIND", "127.0.0.1:8080");
     let listener = tokio::net::TcpListener::bind(&bind_address).await?;
     tracing::info!(address = %listener.local_addr()?, "gateway listening");
