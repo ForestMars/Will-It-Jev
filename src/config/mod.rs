@@ -5,49 +5,108 @@ use std::{error::Error, fs, path::Path};
 pub use schema::AppConfig;
 
 pub fn load_from_path(path: impl AsRef<Path>) -> Result<AppConfig, Box<dyn Error>> {
-	let contents = fs::read_to_string(path)?;
-	parse(&contents)
+    let contents = fs::read_to_string(path)?;
+    parse(&contents)
 }
 
 fn parse(contents: &str) -> Result<AppConfig, Box<dyn Error>> {
-	let config: AppConfig = toml::from_str(contents)?;
-	if ![
-		config.router.tier1.enabled,
-		config.router.tier2.enabled,
-		config.router.tier3.enabled,
-		config.router.tier4.enabled,
-		config.router.tier5.enabled,
-		config.router.tier6.enabled,
-	]
-	.into_iter()
-	.any(|enabled| enabled)
-	{
-		return Err("at least one router tier must be enabled".into());
-	}
-	Ok(config)
+    let config: AppConfig = toml::from_str(contents)?;
+    if ![
+        config.router.tier1.enabled,
+        config.router.tier2.enabled,
+        config.router.tier3.enabled,
+        config.router.tier4.enabled,
+        config.router.tier5.enabled,
+        config.router.tier6.enabled,
+    ]
+    .into_iter()
+    .any(|enabled| enabled)
+    {
+        return Err("at least one router tier must be enabled".into());
+    }
+    for (name, tier) in [
+        ("tier3", &config.router.tier3),
+        ("tier4", &config.router.tier4),
+    ] {
+        if !tier.enabled {
+            continue;
+        }
+        if tier
+            .endpoint
+            .as_deref()
+            .is_some_and(|endpoint| endpoint.trim().is_empty())
+        {
+            return Err(anyhow::anyhow!(
+                "router.{name}.endpoint must be non-empty when configured"
+            )
+            .into());
+        }
+        for (field, threshold) in [
+            ("jev_threshold", tier.jev_threshold),
+            ("llm_threshold", tier.llm_threshold),
+        ] {
+            if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+                return Err(anyhow::anyhow!(
+                    "router.{name}.{field} must be finite and between 0 and 1"
+                )
+                .into());
+            }
+        }
+        if tier.timeout_ms == 0 {
+            return Err(
+                anyhow::anyhow!("router.{name}.timeout_ms must be greater than zero").into(),
+            );
+        }
+    }
+    Ok(config)
 }
 
 #[cfg(test)]
 mod tests {
-	use super::*;
+    use super::*;
 
-	#[test]
-	fn omitted_tiers_are_disabled() {
-		let config = parse(
-			"[router.tier1]\nenabled = true\n[router.tier3]\nenabled = false\n",
+    #[test]
+    fn omitted_tiers_are_disabled() {
+        let config =
+            parse("[router.tier1]\nenabled = true\n[router.tier3]\nenabled = false\n").unwrap();
+
+        assert!(config.router.tier1.enabled);
+        assert!(!config.router.tier2.enabled);
+        assert!(!config.router.tier3.enabled);
+        assert!(!config.router.tier4.enabled);
+        assert!(!config.router.tier5.enabled);
+        assert!(!config.router.tier6.enabled);
+    }
+
+    #[test]
+    fn parses_grpc_scorer_settings() {
+        let config = parse(
+			"[router.tier3]\nenabled = true\nendpoint = \"http://127.0.0.1:50052\"\njev_threshold = 0.91\nllm_threshold = 0.71\ntimeout_ms = 650\n[router.tier4]\nenabled = true\nendpoint = \"http://127.0.0.1:50051\"\njev_threshold = 0.92\nllm_threshold = 0.72\ntimeout_ms = 750\n",
 		)
 		.unwrap();
+        assert_eq!(
+            config.router.tier3.endpoint.as_deref(),
+            Some("http://127.0.0.1:50052")
+        );
+        assert_eq!(config.router.tier3.jev_threshold, 0.91);
+        assert_eq!(config.router.tier3.llm_threshold, 0.71);
+        assert_eq!(config.router.tier3.timeout_ms, 650);
+        assert_eq!(
+            config.router.tier4.endpoint.as_deref(),
+            Some("http://127.0.0.1:50051")
+        );
+        assert_eq!(config.router.tier4.jev_threshold, 0.92);
+        assert_eq!(config.router.tier4.llm_threshold, 0.72);
+        assert_eq!(config.router.tier4.timeout_ms, 750);
+    }
 
-		assert!(config.router.tier1.enabled);
-		assert!(!config.router.tier2.enabled);
-		assert!(!config.router.tier3.enabled);
-		assert!(!config.router.tier4.enabled);
-		assert!(!config.router.tier5.enabled);
-		assert!(!config.router.tier6.enabled);
-	}
+    #[test]
+    fn rejects_blank_configured_scorer_endpoint() {
+        assert!(parse("[router.tier3]\nenabled = true\nendpoint = \"   \"\n").is_err());
+    }
 
-	#[test]
-	fn rejects_config_with_no_enabled_tiers() {
-		assert!(parse("[router.tier1]\nenabled = false\n").is_err());
-	}
+    #[test]
+    fn rejects_config_with_no_enabled_tiers() {
+        assert!(parse("[router.tier1]\nenabled = false\n").is_err());
+    }
 }
