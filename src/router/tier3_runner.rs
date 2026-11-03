@@ -1,6 +1,6 @@
 // src/router/tier3.rs
 //
-// Tier 3: Harrier, reached over gRPC (sidecars/harrier/server.py).
+// Tier 4: Harrier, reached over gRPC (sidecars/harrier/server.py).
 // Tier 2 (FastText, in-process) lives in router/tier2.rs.
 
 use std::time::Duration;
