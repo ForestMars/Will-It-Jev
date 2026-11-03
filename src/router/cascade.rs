@@ -14,14 +14,14 @@ use uuid::Uuid;
 
 use crate::telemetry::{
     FinalRouting, Hashes, RouteRecord, Sampling, Tier1Outcome as Tier1Record,
-    Tier2Outcome as Tier2Record, Tier3Outcome as Tier3Record,
+    Tier2Outcome as Tier2Record, Tier3Outcome as Tier3Record, Tier4Outcome as Tier4Record
 };
 
 use super::tier1_runner::{Tier1Engine, AMBIGUITY_UPPER_BOUND};
 use super::tier2_runner::{Tier2Outcome, Tier2Route, Tier2Runner};
 use super::tier3_runner::{Tier3Outcome, Tier3Route, Tier3Runner};
 use super::tier4_runner::{Tier4Outcome, Tier4Route, Tier4Runner};
-use super::tier5_runner::{Tier5Outcome, Tier5Route, Tier5Runner};
+// use super::tier5_runner::{Tier5Outcome, Tier5Route, Tier5Runner};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
