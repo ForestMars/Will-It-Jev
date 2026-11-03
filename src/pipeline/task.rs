@@ -162,7 +162,7 @@ impl TaskProfile {
         let guess = Some(reading.label.clone());
 
         if let Some(allowed) = &self.labels {
-            if !allowed.iter().any(|label| *label == reading.label) {
+            if !allowed.contains(&reading.label) {
                 return pass("unknown_label", None, confidence);
             }
         }
@@ -175,7 +175,11 @@ impl TaskProfile {
             .get(&reading.label)
             .copied()
             .unwrap_or(policy.min_confidence);
-        let clears = if policy.strict { confidence > bar } else { confidence >= bar };
+        let clears = if policy.strict {
+            confidence > bar
+        } else {
+            confidence >= bar
+        };
         if clears {
             Decision::Resolve(Reading {
                 label: reading.label.clone(),
@@ -193,10 +197,22 @@ impl TaskProfile {
     pub fn route_default() -> Self {
         use crate::router::tier1_runner::AMBIGUITY_UPPER_BOUND;
         use crate::router::tier2_runner::DEFAULT_CONFIDENCE_THRESHOLD;
-        let sidecar = || TierPolicy::new(0.95).with_label(LABEL_JEV, 0.95).with_label(LABEL_LLM, 0.70);
+        let sidecar = || {
+            TierPolicy::new(0.95)
+                .with_label(LABEL_JEV, 0.95)
+                .with_label(LABEL_LLM, 0.70)
+        };
         let mut tiers = BTreeMap::new();
-        tiers.insert(1, TierPolicy::new(AMBIGUITY_UPPER_BOUND).strict().never(LABEL_LLM));
-        tiers.insert(2, TierPolicy::new(DEFAULT_CONFIDENCE_THRESHOLD).never(LABEL_LLM));
+        tiers.insert(
+            1,
+            TierPolicy::new(AMBIGUITY_UPPER_BOUND)
+                .strict()
+                .never(LABEL_LLM),
+        );
+        tiers.insert(
+            2,
+            TierPolicy::new(DEFAULT_CONFIDENCE_THRESHOLD).never(LABEL_LLM),
+        );
         tiers.insert(3, sidecar());
         tiers.insert(4, sidecar());
         Self {
@@ -209,7 +225,11 @@ impl TaskProfile {
 }
 
 fn pass(reason: &'static str, top_guess: Option<String>, score: f32) -> Decision {
-    Decision::Pass { reason, top_guess, score }
+    Decision::Pass {
+        reason,
+        top_guess,
+        score,
+    }
 }
 
 #[cfg(test)]
@@ -234,7 +254,20 @@ mod tests {
     #[test]
     fn route_profile_matches_legacy_sidecar_decision() {
         let profile = TaskProfile::route_default();
-        let confidences = [f32::NAN, -1.0, 0.0, 0.5, 0.69, 0.70, 0.71, 0.94, 0.95, 0.96, 1.0, 2.0];
+        let confidences = [
+            f32::NAN,
+            -1.0,
+            0.0,
+            0.5,
+            0.69,
+            0.70,
+            0.71,
+            0.94,
+            0.95,
+            0.96,
+            1.0,
+            2.0,
+        ];
         for tier in [3u8, 4] {
             for label in [LABEL_JEV, LABEL_LLM, "???"] {
                 for conf in confidences {
@@ -246,11 +279,19 @@ mod tests {
                                 Tier3Route::Jev => LABEL_JEV,
                                 Tier3Route::Llm => LABEL_LLM,
                             };
-                            assert_eq!(resolved_label(&new), Some(want), "tier {tier} {label} {conf}");
+                            assert_eq!(
+                                resolved_label(&new),
+                                Some(want),
+                                "tier {tier} {label} {conf}"
+                            );
                         }
                         Tier3Outcome::PassThrough { reason, .. } => match new {
-                            Decision::Pass { reason: r, .. } => assert_eq!(r, reason, "tier {tier} {label} {conf}"),
-                            other => panic!("tier {tier} {label} {conf}: legacy passed, profile gave {other:?}"),
+                            Decision::Pass { reason: r, .. } => {
+                                assert_eq!(r, reason, "tier {tier} {label} {conf}")
+                            }
+                            other => panic!(
+                                "tier {tier} {label} {conf}: legacy passed, profile gave {other:?}"
+                            ),
                         },
                     }
                 }
@@ -268,9 +309,17 @@ mod tests {
                 let (route, _, calibrated) = calibrate(p_jev, p_llm);
                 let legacy_resolves =
                     route == Tier2Route::Jev && calibrated >= DEFAULT_CONFIDENCE_THRESHOLD;
-                let label = if route == Tier2Route::Jev { LABEL_JEV } else { LABEL_LLM };
+                let label = if route == Tier2Route::Jev {
+                    LABEL_JEV
+                } else {
+                    LABEL_LLM
+                };
                 let new = profile.decide(2, &scored(label, calibrated));
-                assert_eq!(resolved_label(&new).is_some(), legacy_resolves, "p_jev={p_jev} p_llm={p_llm}");
+                assert_eq!(
+                    resolved_label(&new).is_some(),
+                    legacy_resolves,
+                    "p_jev={p_jev} p_llm={p_llm}"
+                );
             }
         }
     }
@@ -278,7 +327,10 @@ mod tests {
     #[test]
     fn route_profile_tier2_bar_is_inclusive() {
         let profile = TaskProfile::route_default();
-        assert!(resolved_label(&profile.decide(2, &scored(LABEL_JEV, DEFAULT_CONFIDENCE_THRESHOLD))).is_some());
+        assert!(resolved_label(
+            &profile.decide(2, &scored(LABEL_JEV, DEFAULT_CONFIDENCE_THRESHOLD))
+        )
+        .is_some());
         assert!(resolved_label(&profile.decide(2, &scored(LABEL_LLM, 1.0))).is_none());
     }
 
@@ -296,11 +348,17 @@ mod tests {
         let profile = TaskProfile::route_default();
         assert!(matches!(
             profile.decide(3, &TierReading::Abstain("timeout")),
-            Decision::Pass { reason: "timeout", .. }
+            Decision::Pass {
+                reason: "timeout",
+                ..
+            }
         ));
         assert!(matches!(
             profile.decide(5, &scored(LABEL_JEV, 1.0)),
-            Decision::Pass { reason: "tier_not_configured", .. }
+            Decision::Pass {
+                reason: "tier_not_configured",
+                ..
+            }
         ));
     }
 
@@ -311,7 +369,10 @@ mod tests {
         profile.labels = Some(vec!["engineering".into()]);
         assert!(matches!(
             profile.decide(3, &scored("help_desk", 1.0)),
-            Decision::Pass { reason: "unknown_label", .. }
+            Decision::Pass {
+                reason: "unknown_label",
+                ..
+            }
         ));
     }
 }
