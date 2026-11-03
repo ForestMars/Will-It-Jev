@@ -16,9 +16,7 @@ use std::time::Duration;
 
 use super::runner::{CascadeRunner, Resolution};
 use super::task::{FallbackPolicy, Reading, TaskProfile};
-use crate::tagging::{
-    CategoryScore, TagError, TagInput, Tagger, TaggerOutput, TaggerVerdict,
-};
+use crate::tagging::{CategoryScore, TagError, TagInput, Tagger, TaggerOutput, TaggerVerdict};
 
 pub struct CascadeTagger<F: Tagger> {
     runner: Arc<CascadeRunner>,
@@ -37,9 +35,17 @@ impl<F: Tagger> CascadeTagger<F> {
         fallback: F,
     ) -> Result<Self, String> {
         if profile.fallback != FallbackPolicy::Defer {
-            return Err(format!("task.{}: a tagging profile must use fallback = \"defer\"", profile.task));
+            return Err(format!(
+                "task.{}: a tagging profile must use fallback = \"defer\"",
+                profile.task
+            ));
         }
-        Ok(Self { runner, profile, budget, fallback })
+        Ok(Self {
+            runner,
+            profile,
+            budget,
+            fallback,
+        })
     }
 }
 
@@ -48,11 +54,17 @@ fn verdict(reading: &Reading) -> TaggerVerdict {
         .scores
         .iter()
         .filter(|(label, _)| *label != reading.label)
-        .map(|(label, score)| CategoryScore { category_id: label.clone(), score: *score })
+        .map(|(label, score)| CategoryScore {
+            category_id: label.clone(),
+            score: *score,
+        })
         .collect();
     alternatives.sort_by(|a, b| b.score.total_cmp(&a.score));
     TaggerVerdict::Tagged {
-        primary: CategoryScore { category_id: reading.label.clone(), score: reading.confidence },
+        primary: CategoryScore {
+            category_id: reading.label.clone(),
+            score: reading.confidence,
+        },
         alternatives,
     }
 }
@@ -71,23 +83,30 @@ impl<F: Tagger> Tagger for CascadeTagger<F> {
         self.fallback.taxonomy_version()
     }
 
-    fn tag(
-        &self,
-        input: &TagInput,
-    ) -> impl Future<Output = Result<TaggerOutput, TagError>> + Send {
-        async move {
-            let outcome = self
-                .runner
-                .run(&input.prompt, std::slice::from_ref(&self.profile), self.budget)
-                .await;
-            match outcome.tasks.get(&self.profile.task).map(|t| &t.resolution) {
-                Some(Resolution::Tier { tier, model_id, reading }) => {
-                    tracing::debug!(request_id = %input.request_id, tier, model_id, "tag resolved in cascade");
-                    Ok(TaggerOutput { verdict: verdict(reading), usage: None })
-                }
-                _ => self.fallback.tag(input).await,
+    async fn tag(&self, input: &TagInput) -> Result<TaggerOutput, TagError> {
+        let outcome = self
+            .runner
+            .run(
+                &input.prompt,
+                std::slice::from_ref(&self.profile),
+                self.budget,
+            )
+            .await;
+        match outcome.tasks.get(&self.profile.task).map(|t| &t.resolution) {
+            Some(Resolution::Tier {
+                tier,
+                model_id,
+                reading,
+            }) => {
+                tracing::debug!(request_id = %input.request_id, tier, model_id, "tag resolved in cascade");
+                Ok(TaggerOutput {
+                    verdict: verdict(reading),
+                    usage: None,
+                })
             }
+            _ => self.fallback.tag(input).await,
         }
+    
     }
 }
 
@@ -113,7 +132,11 @@ mod tests {
         async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
             TierOutput {
                 model_id: "scripted".into(),
-                readings: ctx.tasks.iter().map(|t| (t.clone(), self.0.clone())).collect(),
+                readings: ctx
+                    .tasks
+                    .iter()
+                    .map(|t| (t.clone(), self.0.clone()))
+                    .collect(),
             }
         }
     }
@@ -138,7 +161,10 @@ mod tests {
             async {
                 Ok(TaggerOutput {
                     verdict: TaggerVerdict::Tagged {
-                        primary: CategoryScore { category_id: "other_general_request".into(), score: 1.0 },
+                        primary: CategoryScore {
+                            category_id: "other_general_request".into(),
+                            score: 1.0,
+                        },
                         alternatives: vec![],
                     },
                     usage: None,
@@ -150,14 +176,22 @@ mod tests {
     fn profile() -> TaskProfile {
         TaskProfile {
             task: TaskId::tag(),
-            labels: Some(vec!["engineering".into(), "help_desk".into(), "web_search".into()]),
+            labels: Some(vec![
+                "engineering".into(),
+                "help_desk".into(),
+                "web_search".into(),
+            ]),
             tiers: [(4u8, TierPolicy::new(0.8))].into(),
             fallback: FallbackPolicy::Defer,
         }
     }
 
     fn input() -> TagInput {
-        TagInput { request_id: "r".into(), prompt: "fix my laptop".into(), response: None }
+        TagInput {
+            request_id: "r".into(),
+            prompt: "fix my laptop".into(),
+            response: None,
+        }
     }
 
     fn tagger(reading: TierReading, fb: Fallback) -> CascadeTagger<Fallback> {
@@ -170,21 +204,42 @@ mod tests {
         let reading = Reading {
             label: "help_desk".into(),
             confidence: 0.9,
-            scores: vec![("engineering".into(), 0.02), ("help_desk".into(), 0.9), ("web_search".into(), 0.05)],
+            scores: vec![
+                ("engineering".into(), 0.02),
+                ("help_desk".into(), 0.9),
+                ("web_search".into(), 0.05),
+            ],
         };
         let t = tagger(TierReading::Scored(reading), Fallback::default());
         let out = t.tag(&input()).await.unwrap();
-        let TaggerVerdict::Tagged { primary, alternatives } = out.verdict else { panic!("not tagged") };
+        let TaggerVerdict::Tagged {
+            primary,
+            alternatives,
+        } = out.verdict
+        else {
+            panic!("not tagged")
+        };
         assert_eq!(primary.category_id, "help_desk");
-        assert_eq!(alternatives.iter().map(|a| a.category_id.as_str()).collect::<Vec<_>>(), ["web_search", "engineering"]);
+        assert_eq!(
+            alternatives
+                .iter()
+                .map(|a| a.category_id.as_str())
+                .collect::<Vec<_>>(),
+            ["web_search", "engineering"]
+        );
         assert_eq!(t.fallback.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn unresolved_tag_goes_to_the_fallback_tagger() {
-        let t = tagger(TierReading::Abstain("unsupported_task"), Fallback::default());
+        let t = tagger(
+            TierReading::Abstain("unsupported_task"),
+            Fallback::default(),
+        );
         let out = t.tag(&input()).await.unwrap();
-        let TaggerVerdict::Tagged { primary, .. } = out.verdict else { panic!("not tagged") };
+        let TaggerVerdict::Tagged { primary, .. } = out.verdict else {
+            panic!("not tagged")
+        };
         assert_eq!(primary.category_id, "other_general_request");
         assert_eq!(t.fallback.calls.load(Ordering::SeqCst), 1);
     }
@@ -194,6 +249,8 @@ mod tests {
         let mut p = profile();
         p.fallback = FallbackPolicy::Label("other_general_request".into());
         let runner = Arc::new(CascadeRunner::new(vec![]));
-        assert!(CascadeTagger::new(runner, p, Duration::from_secs(1), Fallback::default()).is_err());
+        assert!(
+            CascadeTagger::new(runner, p, Duration::from_secs(1), Fallback::default()).is_err()
+        );
     }
 }
