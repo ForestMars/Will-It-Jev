@@ -1,8 +1,8 @@
 // src/router/tier6_runner.rs
 
-use std::time::{Duration, Instant};
-use serde_json::Value;
 use super::tier5_runner::DownstreamError;
+use serde_json::Value;
+use std::time::{Duration, Instant};
 
 #[derive(Clone)]
 pub struct Tier6Runner {
@@ -12,14 +12,8 @@ pub struct Tier6Runner {
 }
 
 impl Tier6Runner {
-    pub fn new(
-        endpoint: String,
-        model: String,
-        timeout: Duration,
-    ) -> Result<Self, reqwest::Error> {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()?;
+    pub fn new(endpoint: String, model: String, timeout: Duration) -> Result<Self, reqwest::Error> {
+        let client = reqwest::Client::builder().timeout(timeout).build()?;
         Ok(Self {
             client,
             endpoint,
@@ -35,7 +29,8 @@ impl Tier6Runner {
             "stream": false
         });
 
-        let response = self.client
+        let response = self
+            .client
             .post(&self.endpoint)
             .json(&payload)
             .send()
@@ -58,7 +53,7 @@ impl Tier6Runner {
             .json::<Value>()
             .await
             .map_err(|e| DownstreamError::Transport(e.to_string()))?;
-            
+
         Ok((body, start.elapsed()))
     }
 }
