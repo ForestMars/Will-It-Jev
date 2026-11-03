@@ -44,7 +44,11 @@ struct CircuitState {
 }
 
 impl CircuitBreaker {
-    pub fn new(failure_threshold: usize, failure_window: Duration, open_duration: Duration) -> Self {
+    pub fn new(
+        failure_threshold: usize,
+        failure_window: Duration,
+        open_duration: Duration,
+    ) -> Self {
         Self {
             failure_threshold: failure_threshold.max(1),
             failure_window,
@@ -58,7 +62,10 @@ impl CircuitBreaker {
 
     pub fn is_open(&self) -> bool {
         let now = Instant::now();
-        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.open_until.is_some_and(|until| until > now) {
             return true;
         }
@@ -68,7 +75,10 @@ impl CircuitBreaker {
 
     pub fn record_failure(&self) {
         let now = Instant::now();
-        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         while state
             .failures
             .front()
@@ -84,7 +94,10 @@ impl CircuitBreaker {
     }
 
     pub fn record_success(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.failures.clear();
         state.open_until = None;
     }
@@ -109,11 +122,7 @@ impl Tier5Runner {
             client: Client::builder().build()?,
             endpoint,
             timeout,
-            breaker: CircuitBreaker::new(
-                failure_threshold,
-                failure_window,
-                breaker_open_duration,
-            ),
+            breaker: CircuitBreaker::new(failure_threshold, failure_window, breaker_open_duration),
         })
     }
 
