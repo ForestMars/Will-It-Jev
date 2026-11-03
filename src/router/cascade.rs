@@ -20,8 +20,6 @@ use crate::telemetry::{
 use super::tier1_runner::{Tier1Engine, AMBIGUITY_UPPER_BOUND};
 use super::tier2_runner::{Tier2Outcome, Tier2Route, Tier2Runner};
 use super::tier3_runner::{Tier3Outcome, Tier3Route, Tier3Runner};
-use super::tier4_runner::{Tier4Outcome, Tier4Route, Tier4Runner};
-// use super::tier5_runner::{Tier5Outcome, Tier5Route, Tier5Runner};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
@@ -123,7 +121,9 @@ pub async fn route(
     t1: Option<&Tier1Engine>,
     t2: Option<&Tier2Runner>,
     t3: Option<&Tier3Runner>,
-    t4: Option<&Tier4Runner>,
+    // Architectural Note: Tier 4 (Harrier) reuses Tier3Runner because it shares 
+    // the exact same remote wire protocol and outcome structure as Tier 3.
+    t4: Option<&Tier3Runner>,
     budget: Duration,
     hashes: &Hashes,
 ) -> (Decision, RouteRecord) {
@@ -333,17 +333,19 @@ pub async fn route(
     };
 
     // ---- Tier 4: Harrier sidecar over gRPC ----
+    // Tier 4 uses Tier3Runner/Tier3Outcome intentionally because Harrier is an 
+    // alternate model instance speaking the identical gRPC interface as Tier 3.
     let tier4_record = if let Some(t4) = t4 {
         let left = budget.saturating_sub(start.elapsed());
         info!("[request_id={request_id}] TRY budget_left={left:?} tier=4 (harrier)");
         let t = Instant::now();
         let tier4_result = t4.evaluate(prompt, left).await;
         let tier4_record = match &tier4_result {
-            Tier3Outcome::Resolved { confidence, .. } => Some(Tier3Record {
+            Tier3Outcome::Resolved { confidence, .. } => Some(Tier4Record {
                 score: *confidence,
                 reason: "resolved".to_string(),
             }),
-            Tier3Outcome::PassThrough { score, reason, .. } => Some(Tier3Record {
+            Tier3Outcome::PassThrough { score, reason, .. } => Some(Tier4Record {
                 score: *score,
                 reason: reason.to_string(),
             }),
