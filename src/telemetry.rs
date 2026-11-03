@@ -24,6 +24,7 @@ pub struct RouteRecord {
     pub tier1_outcome: Tier1Outcome,
     pub tier2_outcome: Option<Tier2Outcome>,
     pub tier3_outcome: Option<Tier3Outcome>,
+    pub tier4_outcome: Option<Tier4Outcome>,
     #[serde(default)]
     pub tier4_outcome: Option<Tier3Outcome>,
     #[serde(default)]
@@ -74,6 +75,14 @@ pub struct Tier2Outcome {
 pub struct Tier3Outcome {
     pub score: f32,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tier4Outcome {
+    // Match the fields used by your Tier 4 runner output
+    pub route: String,
+    pub confidence: f32,
+    pub latency_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
