@@ -1,78 +1,80 @@
-use std::time::Duration;
+// src/router/tier4_runner.rs
+//
+// Tier 4: Decoder State Evaluation Runner
+// Applies a task (passed in as context) to an encoded input via the remote
+// sidecar endpoint, returning a confidence score and evaluation reason.
+// Tier 4 is entirely agnostic of downstream routing backends (like Jev or LLM).
+
+use std::time::{Duration, Instant};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-/// Represents the routing decision or classification returned by Tier 4.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum Tier4Route {
-    Primary,
-    Secondary,
-    Fallback,
-    Custom(String),
-}
-
-/// Represents the full evaluation outcome from Tier 4, including confidence metrics and telemetry details.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tier4Outcome {
-    pub route: Tier4Route,
-    pub confidence: f32,
-    pub raw_score: Option<f32>,
-    pub latency_ms: u64,
+    pub score: f32,
+    pub reason: String,
 }
 
-/// Runner responsible for communicating with the Tier 4 backend endpoint (e.g., Harrier / secondary transformer model).
 #[derive(Clone)]
 pub struct Tier4Runner {
-    client: reqwest::Client,
+    client: Client,
     endpoint: String,
-    high_threshold: f32,
-    low_threshold: f32,
     timeout: Duration,
 }
 
 impl Tier4Runner {
-    /// Creates a new `Tier4Runner` instance with custom endpoint configuration and thresholds.
-    pub fn new(
-        endpoint: impl Into<String>,
-        high_threshold: f32,
-        low_threshold: f32,
-        timeout: Duration,
-    ) -> Result<Self, reqwest::Error> {
-        let client = reqwest::Client::builder()
+    /// Creates a new `Tier4Runner` instance targeting the decoder state endpoint.
+    pub fn new(endpoint: String, timeout: Duration) -> Result<Self, reqwest::Error> {
+        let client = Client::builder()
             .timeout(timeout)
             .build()?;
         Ok(Self {
             client,
-            endpoint: endpoint.into(),
-            high_threshold,
-            low_threshold,
+            endpoint,
             timeout,
         })
     }
 
-    /// Evaluates a prompt and context against the Tier 4 model endpoint.
+    /// Evaluates the prompt/context against the decoder state endpoint within the allowed budget.
     pub async fn evaluate(
         &self,
         prompt: &str,
-        context: &str,
+        budget: Duration,
     ) -> Result<Tier4Outcome, Box<dyn std::error::Error + Send + Sync>> {
-        let start = std::time::Instant::now();
+        let _start = Instant::now();
         
+        // Use the remaining cascade budget or the configured runner timeout, whichever is smaller
+        let effective_timeout = std::cmp::min(self.timeout, budget);
+
         let payload = serde_json::json!({
             "prompt": prompt,
-            "context": context,
-            "high_threshold": self.high_threshold,
-            "low_threshold": self.low_threshold,
         });
 
         let response = self.client
             .post(&self.endpoint)
+            .timeout(effective_timeout)
             .json(&payload)
             .send()
             .await?;
 
-        let mut outcome = response.json::<Tier4Outcome>().await?;
-        outcome.latency_ms = start.elapsed().as_millis() as u64;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("decoder state endpoint returned status {status}: {body}").into());
+        }
 
-        Ok(outcome)
+        // Parse response expected from the decoder state service
+        #[derive(Deserialize)]
+        struct RawResponse {
+            score: f32,
+            reason: Option<String>,
+        }
+
+        let parsed = response.json::<RawResponse>().await?;
+
+        Ok(Tier4Outcome {
+            score: parsed.score,
+            reason: parsed.reason.unwrap_or_else(|| "decoder_state_evaluated".into()),
+        })
     }
 }
