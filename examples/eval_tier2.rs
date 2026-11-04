@@ -46,7 +46,7 @@ fn load_cases(path: &str) -> Result<Vec<Case>, Box<dyn std::error::Error>> {
             .ok_or_else(|| format!("{path}:{line_number}: expected label and prompt"))?;
         let label = match label {
             "__label__jev" => Tier2Route::Jev,
-            "__label__llm" => Tier2Route::LLM,
+            "__label__llm" => Tier2Route::Llm,
             _ => return Err(format!("{path}:{line_number}: unknown label {label:?}").into()),
         };
         let prompt = prompt.trim();
@@ -281,7 +281,7 @@ mod tests {
 
     #[test]
     fn llm_guess_never_commits_to_jev() {
-        let result = scored_case(Tier2Route::Jev, Tier2Route::LLM, 1.0);
+        let result = scored_case(Tier2Route::Jev, Tier2Route::Llm, 1.0);
         assert!(!commits_jev(&result, DEFAULT_CONFIDENCE_THRESHOLD));
     }
 
@@ -336,7 +336,7 @@ mod tests {
             scored_case(Tier2Route::Jev, Tier2Route::Jev, 0.73),
             scored_case(Tier2Route::Jev, Tier2Route::Jev, 0.41),
             scored_case(Tier2Route::Jev, Tier2Route::Jev, 0.73),
-            scored_case(Tier2Route::LLM, Tier2Route::LLM, 0.99),
+            scored_case(Tier2Route::Llm, Tier2Route::Llm, 0.99),
         ];
 
         assert_eq!(threshold_candidates(&scored), vec![0.0, 0.41, 0.73, 1.0]);

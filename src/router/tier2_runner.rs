@@ -13,7 +13,7 @@ pub const DEFAULT_CONFIDENCE_THRESHOLD: f32 = 0.95;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier2Route {
     Jev,
-    LLM,
+    Llm,
 }
 
 #[derive(Debug, Clone)]
@@ -55,7 +55,7 @@ pub fn calibrate(p_jev: f32, p_llm: f32) -> (Tier2Route, f32, f32) {
     let (route, top_prob) = if p_jev >= p_llm {
         (Tier2Route::Jev, p_jev)
     } else {
-        (Tier2Route::LLM, p_llm)
+        (Tier2Route::Llm, p_llm)
     };
 
     (route, top_prob, margin.clamp(0.0, 1.0))
@@ -114,7 +114,7 @@ impl Tier2Runner {
 
         if normalized.is_empty() {
             return Tier2Outcome::PassThrough {
-                top_guess: Tier2Route::LLM,
+                top_guess: Tier2Route::Llm,
                 score: 0.0,
                 reason: "empty_input",
                 p_jev: 0.0,
@@ -126,7 +126,7 @@ impl Tier2Runner {
         let predictions = self.model.predict(&normalized, 2, 0.0);
         if predictions.is_empty() {
             return Tier2Outcome::PassThrough {
-                top_guess: Tier2Route::LLM,
+                top_guess: Tier2Route::Llm,
                 score: 0.0,
                 reason: "no_predictions",
                 p_jev: 0.0,
@@ -135,7 +135,10 @@ impl Tier2Runner {
             };
         }
 
-        let raw_probabilities = predictions.iter().map(|prediction| prediction.prob).collect();
+        let raw_probabilities = predictions
+            .iter()
+            .map(|prediction| prediction.prob)
+            .collect();
 
         // Ground truth trace: every label the model returned, with its raw probability.
         tracing::info!(
@@ -216,8 +219,8 @@ mod tests {
         ) {
             let (_, top_prob, calibrated) = calibrate(p_jev, p_llm);
 
-            prop_assert!(top_prob >= 0.0 && top_prob <= 1.0);
-            prop_assert!(calibrated >= 0.0 && calibrated <= 1.0);
+            prop_assert!((0.0..=1.0).contains(&top_prob));
+            prop_assert!((0.0..=1.0).contains(&calibrated));
         }
 
         // 3. Invariant: swapping the two class probabilities leaves the score unchanged.

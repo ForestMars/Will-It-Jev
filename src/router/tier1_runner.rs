@@ -3,7 +3,6 @@
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use arc_swap::ArcSwap;
 use serde::Deserialize;
-use serde_json;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -30,8 +29,12 @@ pub struct FuzzyConfig {
     pub imperative_zone_bytes: usize,
 }
 
-fn default_max_distance() -> usize { 1 }
-fn default_imperative_zone_bytes() -> usize { 48 }
+fn default_max_distance() -> usize {
+    1
+}
+fn default_imperative_zone_bytes() -> usize {
+    48
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Tier1Config {
@@ -114,11 +117,14 @@ fn is_pure_arithmetic(prompt: &str) -> bool {
         return false;
     }
 
-    expr.chars().all(|c| PURE_ARITHMETIC_ALLOWED_CHARS.contains(c))
+    expr.chars()
+        .all(|c| PURE_ARITHMETIC_ALLOWED_CHARS.contains(c))
 }
 
 impl Tier1Automaton {
-    pub fn from_toml_file<P: AsRef<Path>>(path: P) -> Result<Tier1Config, Box<dyn std::error::Error>> {
+    pub fn from_toml_file<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<Tier1Config, Box<dyn std::error::Error>> {
         let content = fs::read_to_string(path)?;
         let config: Tier1Config = toml::from_str(&content)?;
         Ok(config)
@@ -325,7 +331,7 @@ impl Tier1Engine {
 
             let raw_confidence = 0.5 + combined_jev - combined_llm;
             let confidence = raw_confidence.clamp(0.0, 1.0);
-            let decided = confidence < AMBIGUITY_LOWER_BOUND || confidence > AMBIGUITY_UPPER_BOUND;
+            let decided = !(AMBIGUITY_LOWER_BOUND..=AMBIGUITY_UPPER_BOUND).contains(&confidence);
 
             Tier1Result {
                 confidence,
@@ -429,7 +435,10 @@ mod tests {
 
         let result = engine.classify("What is 2+2?");
         assert!(result.decided, "2+2 should resolve at tier 1: {result:?}");
-        assert!(result.confidence > 0.9, "expected a high-confidence Jev exit: {result:?}");
+        assert!(
+            result.confidence > 0.9,
+            "expected a high-confidence Jev exit: {result:?}"
+        );
     }
 
     #[test]
@@ -439,7 +448,9 @@ mod tests {
 
     #[test]
     fn test_is_pure_arithmetic_rejects_natural_language() {
-        assert!(!is_pure_arithmetic("What is a good 5-step plan for learning Rust?"));
+        assert!(!is_pure_arithmetic(
+            "What is a good 5-step plan for learning Rust?"
+        ));
     }
 
     #[test]

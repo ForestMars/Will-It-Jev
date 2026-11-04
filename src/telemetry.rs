@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+#[allow(dead_code)]
 static REQ_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[allow(dead_code)]
@@ -11,6 +12,7 @@ pub fn init() {
     // Keeping this as a no-op avoids duplicate global subscriber initialization.
 }
 
+#[allow(dead_code)]
 pub fn next_req_id() -> u64 {
     REQ_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
@@ -24,8 +26,7 @@ pub struct RouteRecord {
     pub tier1_outcome: Tier1Outcome,
     pub tier2_outcome: Option<Tier2Outcome>,
     pub tier3_outcome: Option<Tier3Outcome>,
-    #[serde(default)]
-    pub tier4_outcome: Option<Tier3Outcome>,
+    pub tier4_outcome: Option<Tier4Outcome>,
     #[serde(default)]
     pub cascade_decision_tier: u8,
     pub final_routing: FinalRouting,
@@ -75,6 +76,8 @@ pub struct Tier3Outcome {
     pub score: f32,
     pub reason: String,
 }
+
+pub type Tier4Outcome = Tier3Outcome;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FinalRouting {

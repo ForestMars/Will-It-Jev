@@ -1,7 +1,7 @@
-// src/router/tier3.rs
+// src/router/tier3_runner.rs
 //
-// Tier 3: Harrier, reached over gRPC (sidecars/harrier/server.py).
-// Tier 2 (FastText, in-process) lives in router/tier2.rs.
+// Shared gRPC scorer client used by Tier 3 and Tier 4. Both cascade positions
+// use the same Score/ScoreTasks wire protocol and outcome structures.
 
 use std::time::Duration;
 
@@ -78,7 +78,11 @@ impl Tier3Runner {
     /// The sidecar's answer with no threshold applied. `evaluate` is this plus
     /// `decide`; the task-agnostic pipeline calls this and lets the task
     /// profile do the deciding. The error is the pass-through reason.
-    pub async fn score_raw(&self, prompt: &str, budget: Duration) -> Result<RawScore, &'static str> {
+    pub async fn score_raw(
+        &self,
+        prompt: &str,
+        budget: Duration,
+    ) -> Result<RawScore, &'static str> {
         if budget.is_zero() {
             return Err("deadline_exhausted");
         }
@@ -86,7 +90,9 @@ impl Tier3Runner {
 
         // Cloning a tonic client is cheap (shared channel), and score() needs &mut.
         let mut client = self.client.clone();
-        let req = ScoreRequest { prompt: prompt.to_string() };
+        let req = ScoreRequest {
+            prompt: prompt.to_string(),
+        };
 
         match timeout(deadline, client.score(req)).await {
             Err(_) => Err("timeout"),
@@ -95,7 +101,7 @@ impl Tier3Runner {
                 let r = r.into_inner();
                 Ok(RawScore {
                     label: r.label,
-                    confidence: r.confidence as f32,
+                    confidence: r.confidence,
                     model_id: r.model_id,
                 })
             }
@@ -153,7 +159,11 @@ pub fn decide(
     jev_threshold: f32,
     llm_threshold: f32,
 ) -> Tier3Outcome {
-    let confidence = if confidence.is_nan() { 0.0 } else { confidence.clamp(0.0, 1.0) };
+    let confidence = if confidence.is_nan() {
+        0.0
+    } else {
+        confidence.clamp(0.0, 1.0)
+    };
 
     let route = match label {
         "jev_capable" => Tier3Route::Jev,
@@ -178,7 +188,11 @@ pub fn decide(
 }
 
 fn pass(top_guess: Option<Tier3Route>, score: f32, reason: &'static str) -> Tier3Outcome {
-    Tier3Outcome::PassThrough { top_guess, score, reason }
+    Tier3Outcome::PassThrough {
+        top_guess,
+        score,
+        reason,
+    }
 }
 
 #[cfg(test)]
@@ -190,11 +204,17 @@ mod tests {
         // 0.90 clears the LLM bar but not the Jev bar.
         assert!(matches!(
             decide("jev_capable", 0.90, "harrier", 0.95, 0.70),
-            Tier3Outcome::PassThrough { reason: "below_threshold", .. }
+            Tier3Outcome::PassThrough {
+                reason: "below_threshold",
+                ..
+            }
         ));
         assert!(matches!(
             decide("needs_llm", 0.90, "harrier", 0.95, 0.70),
-            Tier3Outcome::Resolved { route: Tier3Route::Llm, .. }
+            Tier3Outcome::Resolved {
+                route: Tier3Route::Llm,
+                ..
+            }
         ));
     }
 
@@ -202,7 +222,10 @@ mod tests {
     fn jev_resolves_above_its_bar() {
         assert!(matches!(
             decide("jev_capable", 0.97, "harrier", 0.95, 0.70),
-            Tier3Outcome::Resolved { route: Tier3Route::Jev, .. }
+            Tier3Outcome::Resolved {
+                route: Tier3Route::Jev,
+                ..
+            }
         ));
     }
 
@@ -210,7 +233,10 @@ mod tests {
     fn unknown_label_and_nan_never_resolve() {
         assert!(matches!(
             decide("???", 0.99, "harrier", 0.95, 0.70),
-            Tier3Outcome::PassThrough { reason: "unknown_label", .. }
+            Tier3Outcome::PassThrough {
+                reason: "unknown_label",
+                ..
+            }
         ));
         assert!(matches!(
             decide("jev_capable", f32::NAN, "harrier", 0.95, 0.70),

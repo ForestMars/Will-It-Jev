@@ -11,13 +11,19 @@ use std::time::{Duration, Instant};
 
 use tracing::debug;
 
+use crate::normalize::normalize;
+
 use super::task::{Decision, FallbackPolicy, Reading, TaskId, TaskProfile, TierReading};
 use super::tier::{Tier, TierContext};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Resolution {
     /// A tier cleared the task's bar.
-    Tier { tier: u8, model_id: String, reading: Reading },
+    Tier {
+        tier: u8,
+        model_id: String,
+        reading: Reading,
+    },
     /// No tier resolved it and the profile names a fallback label.
     Fallback { label: String },
     /// No tier resolved it and the profile leaves that to the caller.
@@ -65,10 +71,21 @@ impl CascadeRunner {
 
     /// `budget` is the global deadline for the whole run. Profiles must have distinct
     /// task ids.
-    pub async fn run(&self, prompt: &str, profiles: &[TaskProfile], budget: Duration) -> RunOutcome {
+    pub async fn run(
+        &self,
+        prompt: &str,
+        profiles: &[TaskProfile],
+        budget: Duration,
+    ) -> RunOutcome {
         let start = Instant::now();
+        let normalized_prompt = normalize(prompt);
+        let inference_prompt = normalized_prompt.as_str();
         let mut active: BTreeSet<TaskId> = profiles.iter().map(|p| p.task.clone()).collect();
-        debug_assert_eq!(active.len(), profiles.len(), "duplicate task ids in profiles");
+        debug_assert_eq!(
+            active.len(),
+            profiles.len(),
+            "duplicate task ids in profiles"
+        );
 
         let mut resolved: BTreeMap<TaskId, Resolution> = BTreeMap::new();
         let mut traces: BTreeMap<TaskId, Vec<TierTrace>> = BTreeMap::new();
@@ -90,12 +107,16 @@ impl CascadeRunner {
             let t = Instant::now();
             let output = tier
                 .evaluate(&TierContext {
-                    prompt,
+                    prompt: inference_prompt,
                     tasks: &ids,
                     budget: budget.saturating_sub(start.elapsed()),
                 })
                 .await;
-            tier_calls.push(TierCall { tier: tier.id(), tasks: ids, took: t.elapsed() });
+            tier_calls.push(TierCall {
+                tier: tier.id(),
+                tasks: ids,
+                took: t.elapsed(),
+            });
 
             for profile in wanted {
                 let reading = output
@@ -116,21 +137,29 @@ impl CascadeRunner {
                     );
                     active.remove(&profile.task);
                 }
-                traces.entry(profile.task.clone()).or_default().push(TierTrace {
-                    tier: tier.id(),
-                    model_id: output.model_id.clone(),
-                    decision,
-                });
+                traces
+                    .entry(profile.task.clone())
+                    .or_default()
+                    .push(TierTrace {
+                        tier: tier.id(),
+                        model_id: output.model_id.clone(),
+                        decision,
+                    });
             }
         }
 
         let tasks = profiles
             .iter()
             .map(|profile| {
-                let resolution = resolved.remove(&profile.task).unwrap_or_else(|| match &profile.fallback {
-                    FallbackPolicy::Label(label) => Resolution::Fallback { label: label.clone() },
-                    FallbackPolicy::Defer => Resolution::Deferred,
-                });
+                let resolution =
+                    resolved
+                        .remove(&profile.task)
+                        .unwrap_or_else(|| match &profile.fallback {
+                            FallbackPolicy::Label(label) => Resolution::Fallback {
+                                label: label.clone(),
+                            },
+                            FallbackPolicy::Defer => Resolution::Deferred,
+                        });
                 let trace = traces.remove(&profile.task).unwrap_or_default();
                 (profile.task.clone(), TaskOutcome { resolution, trace })
             })
@@ -152,7 +181,7 @@ mod tests {
     struct Fake {
         id: u8,
         answers: Vec<(TaskId, TierReading)>,
-        calls: Arc<Mutex<Vec<(u8, Vec<TaskId>)>>>,
+        calls: Calls,
     }
 
     #[async_trait]
@@ -164,7 +193,10 @@ mod tests {
             "fake"
         }
         async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
-            self.calls.lock().unwrap().push((self.id, ctx.tasks.to_vec()));
+            self.calls
+                .lock()
+                .unwrap()
+                .push((self.id, ctx.tasks.to_vec()));
             let readings = ctx
                 .tasks
                 .iter()
@@ -178,7 +210,10 @@ mod tests {
                     (t.clone(), r)
                 })
                 .collect();
-            TierOutput { model_id: format!("fake{}", self.id), readings }
+            TierOutput {
+                model_id: format!("fake{}", self.id),
+                readings,
+            }
         }
     }
 
@@ -201,7 +236,13 @@ mod tests {
         let calls: Calls = Arc::default();
         let tiers = tiers
             .into_iter()
-            .map(|(id, answers)| Arc::new(Fake { id, answers, calls: calls.clone() }) as Arc<dyn Tier>)
+            .map(|(id, answers)| {
+                Arc::new(Fake {
+                    id,
+                    answers,
+                    calls: calls.clone(),
+                }) as Arc<dyn Tier>
+            })
             .collect();
         (CascadeRunner::new(tiers), calls)
     }
@@ -216,59 +257,119 @@ mod tests {
                 (TaskId::tag(), scored("engineering", 0.9)),
             ],
         )]);
-        let profiles = [TaskProfile::route_default(), tag_profile(&[3], 0.8, FallbackPolicy::Defer)];
+        let profiles = [
+            TaskProfile::route_default(),
+            tag_profile(&[3], 0.8, FallbackPolicy::Defer),
+        ];
         let out = runner.run("p", &profiles, Duration::from_secs(1)).await;
 
-        assert_eq!(calls.lock().unwrap().len(), 1, "one execution for two tasks");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "one execution for two tasks"
+        );
         assert_eq!(out.tier_calls[0].tasks.len(), 2);
-        assert!(matches!(out.tasks[&TaskId::route()].resolution, Resolution::Tier { tier: 3, .. }));
-        assert!(matches!(out.tasks[&TaskId::tag()].resolution, Resolution::Tier { tier: 3, .. }));
+        assert!(matches!(
+            out.tasks[&TaskId::route()].resolution,
+            Resolution::Tier { tier: 3, .. }
+        ));
+        assert!(matches!(
+            out.tasks[&TaskId::tag()].resolution,
+            Resolution::Tier { tier: 3, .. }
+        ));
     }
 
     /// One task exits early; the other continues, and the later tier sees only it.
     #[tokio::test]
     async fn resolved_task_leaves_and_the_other_continues() {
         let (runner, calls) = runner(vec![
-            (3, vec![(TaskId::route(), scored(LABEL_JEV, 0.99)), (TaskId::tag(), scored("help_desk", 0.4))]),
+            (
+                3,
+                vec![
+                    (TaskId::route(), scored(LABEL_JEV, 0.99)),
+                    (TaskId::tag(), scored("help_desk", 0.4)),
+                ],
+            ),
             (4, vec![(TaskId::tag(), scored("help_desk", 0.92))]),
         ]);
-        let profiles = [TaskProfile::route_default(), tag_profile(&[3, 4], 0.8, FallbackPolicy::Defer)];
+        let profiles = [
+            TaskProfile::route_default(),
+            tag_profile(&[3, 4], 0.8, FallbackPolicy::Defer),
+        ];
         let out = runner.run("p", &profiles, Duration::from_secs(1)).await;
 
         let calls = calls.lock().unwrap();
         assert_eq!(calls[0], (3, vec![TaskId::route(), TaskId::tag()]));
         assert_eq!(calls[1], (4, vec![TaskId::tag()]));
-        assert!(matches!(out.tasks[&TaskId::route()].resolution, Resolution::Tier { tier: 3, .. }));
-        assert!(matches!(out.tasks[&TaskId::tag()].resolution, Resolution::Tier { tier: 4, .. }));
+        assert!(matches!(
+            out.tasks[&TaskId::route()].resolution,
+            Resolution::Tier { tier: 3, .. }
+        ));
+        assert!(matches!(
+            out.tasks[&TaskId::tag()].resolution,
+            Resolution::Tier { tier: 4, .. }
+        ));
         assert_eq!(out.tasks[&TaskId::tag()].trace.len(), 2);
     }
 
     /// Profiles are tuned independently: the same reading resolves one task and not another.
     #[tokio::test]
     async fn each_task_applies_its_own_bar() {
-        let (runner, _) = runner(vec![(3, vec![(TaskId::route(), scored(LABEL_LLM, 0.75)), (TaskId::tag(), scored("engineering", 0.75))])]);
-        let profiles = [TaskProfile::route_default(), tag_profile(&[3], 0.9, FallbackPolicy::Defer)];
+        let (runner, _) = runner(vec![(
+            3,
+            vec![
+                (TaskId::route(), scored(LABEL_LLM, 0.75)),
+                (TaskId::tag(), scored("engineering", 0.75)),
+            ],
+        )]);
+        let profiles = [
+            TaskProfile::route_default(),
+            tag_profile(&[3], 0.9, FallbackPolicy::Defer),
+        ];
         let out = runner.run("p", &profiles, Duration::from_secs(1)).await;
         // route: llm bar is 0.70 so 0.75 resolves; tag: bar 0.9 so it does not.
-        assert!(matches!(out.tasks[&TaskId::route()].resolution, Resolution::Tier { .. }));
+        assert!(matches!(
+            out.tasks[&TaskId::route()].resolution,
+            Resolution::Tier { .. }
+        ));
         assert_eq!(out.tasks[&TaskId::tag()].resolution, Resolution::Deferred);
     }
 
     #[tokio::test]
     async fn fallbacks_apply_when_no_tier_resolves() {
         let (runner, _) = runner(vec![(3, vec![])]);
-        let profiles = [TaskProfile::route_default(), tag_profile(&[3], 0.8, FallbackPolicy::Defer)];
+        let profiles = [
+            TaskProfile::route_default(),
+            tag_profile(&[3], 0.8, FallbackPolicy::Defer),
+        ];
         let out = runner.run("p", &profiles, Duration::from_secs(1)).await;
-        assert_eq!(out.tasks[&TaskId::route()].resolution, Resolution::Fallback { label: LABEL_LLM.into() });
+        assert_eq!(
+            out.tasks[&TaskId::route()].resolution,
+            Resolution::Fallback {
+                label: LABEL_LLM.into()
+            }
+        );
         assert_eq!(out.tasks[&TaskId::tag()].resolution, Resolution::Deferred);
     }
 
     #[tokio::test]
     async fn tiers_outside_a_profile_are_skipped_and_empty_runs_stop() {
-        let (runner, calls) = runner(vec![(1, vec![]), (3, vec![(TaskId::tag(), scored("engineering", 0.95))]), (4, vec![])]);
+        let (runner, calls) = runner(vec![
+            (1, vec![]),
+            (3, vec![(TaskId::tag(), scored("engineering", 0.95))]),
+            (4, vec![]),
+        ]);
         let profiles = [tag_profile(&[3, 4], 0.8, FallbackPolicy::Defer)];
         runner.run("p", &profiles, Duration::from_secs(1)).await;
         // tier 1 has no tag policy; tier 4 is never reached because tier 3 resolved it.
-        assert_eq!(calls.lock().unwrap().iter().map(|c| c.0).collect::<Vec<_>>(), vec![3]);
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|c| c.0)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
     }
 }
