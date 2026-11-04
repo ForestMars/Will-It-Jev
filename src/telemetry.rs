@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+#[allow(dead_code)]
 static REQ_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[allow(dead_code)]
@@ -11,6 +12,7 @@ pub fn init() {
     // Keeping this as a no-op avoids duplicate global subscriber initialization.
 }
 
+#[allow(dead_code)]
 pub fn next_req_id() -> u64 {
     REQ_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
