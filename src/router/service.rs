@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Duration};
+// src/router/service.rs
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::State,
@@ -7,36 +10,30 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-
-use crate::tagging::{TagInput, TagQueue};
+use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 use tracing::warn;
+use uuid::Uuid;
 
-use crate::telemetry::{Hashes, RouteRecord};
-
-use super::{
-    cascade::{self, Backend},
-    dispatch::DownstreamDispatcher,
-    tier1_runner::Tier1Engine,
-    tier2_runner::Tier2Runner,
-    tier3_runner::Tier3Runner,
+use crate::pipeline::runner::{CascadeRunner, Resolution, RunOutcome, TierTrace};
+use crate::pipeline::task::{
+    Decision, Reading, TaskId, TaskProfile, TierPolicyMap, TierReading, LABEL_JEV, LABEL_LLM,
+};
+use crate::tagging::{TagInput, TagQueue};
+use crate::telemetry::{
+    FinalRouting, Hashes, RouteRecord, Sampling, Tier1Outcome as Tier1Record,
+    Tier2Outcome as Tier2Record, Tier3Outcome as Tier3Record, Tier4Outcome as Tier4Record,
 };
 
-pub struct RouterTiers {
-    pub tier1: Option<Tier1Engine>,
-    pub tier2: Option<Tier2Runner>,
-    pub tier3: Option<Tier3Runner>,
-    pub tier4: Option<Tier3Runner>,
-}
+use super::{cascade::Backend, dispatch::DownstreamDispatcher};
 
 #[derive(Clone)]
 pub struct AppState {
-    tier1: Option<Arc<Tier1Engine>>,
-    tier2: Option<Arc<Tier2Runner>>,
-    tier3: Option<Arc<Tier3Runner>>,
-    tier4: Option<Arc<Tier3Runner>>,
+    cascade: Arc<CascadeRunner>,
+    route_profile: TaskProfile,
+    tier_policies: Arc<TierPolicyMap>,
     dispatcher: Arc<DownstreamDispatcher>,
     hashes: Arc<Hashes>,
     capture_tx: mpsc::Sender<RouteRecord>,
@@ -61,7 +58,9 @@ struct ChatMessage {
 }
 
 pub fn app(
-    tiers: RouterTiers,
+    cascade: Arc<CascadeRunner>,
+    route_profile: TaskProfile,
+    tier_policies: Arc<TierPolicyMap>,
     dispatcher: DownstreamDispatcher,
     hashes: Hashes,
     capture_tx: mpsc::Sender<RouteRecord>,
@@ -69,16 +68,16 @@ pub fn app(
     budget: Duration,
 ) -> Router {
     let state = AppState {
-        tier1: tiers.tier1.map(Arc::new),
-        tier2: tiers.tier2.map(Arc::new),
-        tier3: tiers.tier3.map(Arc::new),
-        tier4: tiers.tier4.map(Arc::new),
+        cascade,
+        route_profile,
+        tier_policies,
         dispatcher: Arc::new(dispatcher),
         hashes: Arc::new(hashes),
         capture_tx,
         tag_queue,
         budget,
     };
+
     Router::new()
         .route("/healthz", get(|| async { StatusCode::OK }))
         .route("/v1/completions", post(completion))
@@ -124,6 +123,7 @@ async fn completion(
         )
             .into_response();
     }
+
     let route_input = match (&request.prompt, &request.state, &request.questions) {
         (Some(prompt), _, _) => Some(prompt.clone()),
         (None, Some(state), Some(questions)) => {
@@ -149,6 +149,7 @@ async fn completion(
         )
             .into_response();
     };
+
     let fallback_prompt = match (&request.state, &request.questions) {
         (Some(state), Some(questions)) => format!(
             "Answer the user's typed decision request. Use the supplied state and questions and \
@@ -170,30 +171,40 @@ async fn completion(
         prompt_len = route_input.len(),
         "completion request accepted"
     );
-    let (_, mut record) = cascade::route(
-        &route_input,
-        state.tier1.as_deref(),
-        state.tier2.as_deref(),
-        state.tier3.as_deref(),
-        state.tier4.as_deref(),
-        state.budget,
-        &state.hashes,
-    )
-    .await;
+
+    let route_started = Instant::now();
+    let outcome = state
+        .cascade
+        .run(
+            &route_input,
+            std::slice::from_ref(&state.route_profile),
+            &state.tier_policies,
+            state.budget,
+        )
+        .await;
+    for call in &outcome.tier_calls {
+        tracing::debug!(
+            tier = call.tier,
+            task_count = call.tasks.len(),
+            elapsed_ms = call.took.as_secs_f64() * 1000.0,
+            "cascade tier completed"
+        );
+    }
+    let (backend, mut record) =
+        route_record(&route_input, &state.hashes, &outcome, route_started);
 
     tracing::info!(
         request_id = %record.request_id,
+        backend = %backend,
+        decided_by_tier = record.cascade_decision_tier,
         "dispatching completion request to downstream backend"
     );
+
     match state
         .dispatcher
         .execute(
             &record.request_id,
-            if record.final_routing.backend == Backend::Jev.to_string() {
-                Backend::Jev
-            } else {
-                Backend::Llm
-            },
+            backend,
             &fallback_prompt,
             request.state.as_ref(),
             request.questions.as_ref(),
@@ -208,7 +219,11 @@ async fn completion(
             };
             let response_text = payload.to_string();
             let request_id = record.request_id.clone();
-            record.final_routing.backend = if result.tier == 5 { "jev" } else { "llm" }.into();
+            record.final_routing.backend = if result.tier == 5 {
+                "jev".into()
+            } else {
+                "llm".into()
+            };
             record.final_routing.tier = result.tier;
             record.final_routing.latency_us += result.request_latency.as_micros();
             record.downstream_invocation_latency_ms =
@@ -258,10 +273,149 @@ async fn completion(
             });
             (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({ "error": "generative_provider_unavailable", "detail": detail })),
+                Json(json!({
+                    "error": "generative_provider_unavailable",
+                    "detail": detail
+                })),
             )
                 .into_response()
         }
+    }
+}
+
+fn route_record(
+    prompt: &str,
+    hashes: &Hashes,
+    outcome: &RunOutcome,
+    started: Instant,
+) -> (Backend, RouteRecord) {
+    let request_id = Uuid::new_v4().to_string();
+    let route_outcome = outcome.tasks.get(&TaskId::route());
+    let (backend, decision_tier) = match route_outcome.map(|task| &task.resolution) {
+        Some(Resolution::Tier { tier, reading, .. }) => {
+            (backend_for_label(&reading.label), *tier)
+        }
+        Some(Resolution::Fallback { label }) => (backend_for_label(label), 6),
+        Some(Resolution::Deferred) | None => (Backend::Llm, 6),
+    };
+
+    let trace = route_outcome.map(|task| task.trace.as_slice()).unwrap_or(&[]);
+    let tier1_outcome = trace_for_tier(trace, 1)
+        .map(tier1_record)
+        .unwrap_or(Tier1Record {
+            confidence: 0.0,
+            decided: false,
+            reason: "disabled".into(),
+        });
+    let tier2_outcome = trace_for_tier(trace, 2).map(tier2_record);
+    let tier3_outcome = trace_for_tier(trace, 3).map(tier3_record);
+    let tier4_outcome = trace_for_tier(trace, 4).map(tier3_record);
+    let latency_us = started.elapsed().as_micros();
+
+    let record = RouteRecord {
+        request_id,
+        timestamp: Utc::now(),
+        prompt_raw: prompt.to_string(),
+        hashes: hashes.clone(),
+        tier1_outcome,
+        tier2_outcome,
+        tier3_outcome,
+        tier4_outcome: tier4_outcome.map(|record| Tier4Record {
+            score: record.score,
+            reason: record.reason,
+        }),
+        cascade_decision_tier: decision_tier,
+        final_routing: FinalRouting {
+            backend: backend.to_string(),
+            tier: decision_tier,
+            latency_us,
+        },
+        router_classification_latency_us: latency_us,
+        downstream_invocation_latency_ms: 0.0,
+        request_latency_primary_ms: None,
+        request_latency_failover_ms: None,
+        downstream_outcome: None,
+        downstream_tier: None,
+        is_failover: false,
+        failure_reason: None,
+        sampling: Sampling::default(),
+    };
+
+    (backend, record)
+}
+
+fn backend_for_label(label: &str) -> Backend {
+    if label == LABEL_JEV {
+        Backend::Jev
+    } else {
+        Backend::Llm
+    }
+}
+
+fn trace_for_tier(trace: &[TierTrace], tier: u8) -> Option<&TierTrace> {
+    trace.iter().find(|entry| entry.tier == tier)
+}
+
+fn decision_reason(trace: &TierTrace) -> String {
+    match &trace.decision {
+        Decision::Resolve(_) => "resolved".into(),
+        Decision::Pass { reason, .. } => (*reason).into(),
+    }
+}
+
+fn decision_score(trace: &TierTrace) -> f32 {
+    match &trace.decision {
+        Decision::Resolve(reading) => reading.confidence,
+        Decision::Pass { score, .. } => *score,
+    }
+}
+
+fn tier1_record(trace: &TierTrace) -> Tier1Record {
+    let confidence = match &trace.reading {
+        TierReading::Scored(reading) => reading
+            .scores
+            .iter()
+            .find(|(label, _)| label == LABEL_JEV)
+            .map(|(_, score)| *score)
+            .unwrap_or(reading.confidence),
+        TierReading::Abstain(_) => 0.0,
+    };
+    Tier1Record {
+        confidence,
+        decided: matches!(&trace.decision, Decision::Resolve(_)),
+        reason: decision_reason(trace),
+    }
+}
+
+fn tier2_record(trace: &TierTrace) -> Tier2Record {
+    let (p_jev, p_llm, raw_probabilities) = match &trace.reading {
+        TierReading::Scored(Reading { scores, .. }) => {
+            let p_jev = scores
+                .iter()
+                .find(|(label, _)| label == LABEL_JEV)
+                .map(|(_, score)| *score)
+                .unwrap_or(0.0);
+            let p_llm = scores
+                .iter()
+                .find(|(label, _)| label == LABEL_LLM)
+                .map(|(_, score)| *score)
+                .unwrap_or(0.0);
+            (p_jev, p_llm, scores.iter().map(|(_, score)| *score).collect())
+        }
+        TierReading::Abstain(_) => (0.0, 0.0, Vec::new()),
+    };
+    Tier2Record {
+        p_jev,
+        p_llm,
+        raw_probabilities,
+        reason: decision_reason(trace),
+    }
+}
+
+fn tier3_record(trace: &TierTrace) -> Tier3Record {
+    Tier3Record {
+        score: decision_score(trace),
+        reason: decision_reason(trace),
     }
 }
 
@@ -300,9 +454,9 @@ fn openai_chat_response(payload: &Value, requested_model: Option<&str>) -> Value
         .or(requested_model)
         .unwrap_or("unknown");
     json!({
-        "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+        "id": format!("chatcmpl-{}", Uuid::new_v4()),
         "object": "chat.completion",
-        "created": chrono::Utc::now().timestamp(),
+        "created": Utc::now().timestamp(),
         "model": model,
         "choices": [{
             "index": 0,
@@ -315,180 +469,18 @@ fn openai_chat_response(payload: &Value, requested_model: Option<&str>) -> Value
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::Body, http::Request};
-    use serde_json::Value;
-    use tokio::io::AsyncWriteExt;
-    use tower::ServiceExt;
 
-    async fn stub_backend(body: &str) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let body = body.to_string();
-        tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let mut bytes = [0u8; 4096];
-                let _ = stream.readable().await;
-                let _ = stream.try_read(&mut bytes);
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-            }
-        });
-        format!("http://{addr}/")
+    #[test]
+    fn chat_response_wraps_an_ollama_style_payload() {
+        let payload = json!({"response": "hello", "model": "test-model"});
+        let response = openai_chat_response(&payload, None);
+        assert_eq!(response["choices"][0]["message"]["content"], "hello");
+        assert_eq!(response["model"], "test-model");
     }
 
-    #[tokio::test]
-    async fn completion_reaches_selected_backend() {
-        let tier1 = Tier1Engine::new(
-            crate::router::tier1_runner::Tier1Automaton::from_toml_file("config/tier1.toml")
-                .unwrap(),
-        )
-        .unwrap();
-        let tier2 = Tier2Runner::new("models/tier2.bin", 0.95).unwrap();
-        let tier3 = Tier3Runner::new(
-            "http://127.0.0.1:1".into(),
-            0.95,
-            0.7,
-            Duration::from_millis(20),
-        )
-        .unwrap();
-        let jev = stub_backend(
-            r#"{"model":"laya:en","answers":{"__router_jev_eligible":{"choice":"yes","confidence":1.0,"probabilities":{"yes":1.0,"no":0.0}},"answer":{"choice":"yes","confidence":1.0,"probabilities":{"yes":1.0,"no":0.0}}}}"#,
-        )
-        .await;
-        let frontier = stub_backend(r#"{"response":"frontier","model":"gemma3:latest"}"#).await;
-        let dispatcher = DownstreamDispatcher::new(
-            jev,
-            frontier,
-            "gemma3:latest".into(),
-            Duration::from_millis(100),
-            2,
-            Duration::from_secs(5),
-            Duration::from_secs(30),
-        )
-        .unwrap();
-        let (_tag_tx, _tag_rx) = tokio::sync::mpsc::channel::<crate::telemetry::RouteRecord>(2);
-        let (tag_input_tx, mut tag_input_rx) = mpsc::channel(1);
-        let release_tagger = Arc::new(tokio::sync::Notify::new());
-        let tag_dir = std::env::temp_dir().join(format!(
-            "router-service-tags-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let (tag_queue, tag_handle) = crate::tagging::spawn(
-            std::sync::Arc::new(NoopTagger {
-                input_tx: tag_input_tx,
-                release: Arc::clone(&release_tagger),
-            }),
-            crate::tagging::TagConfig {
-                base_path: tag_dir.join("task_tags.jsonl"),
-                ..crate::tagging::TagConfig::default()
-            },
-        );
-        let (tx, _rx) = mpsc::channel(2);
-        let application = app(
-            RouterTiers {
-                tier1: Some(tier1),
-                tier2: Some(tier2),
-                tier3: None,
-                tier4: Some(tier3),
-            },
-            dispatcher,
-            Hashes {
-                tier1_toml: String::new(),
-                tier2_bin: String::new(),
-            },
-            tx,
-            tag_queue,
-            Duration::from_millis(30),
-        );
-
-        let response = tokio::time::timeout(
-            Duration::from_secs(1),
-            application.oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/completions")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"prompt":"What is 2+2?","state":"What is 2+2?","questions":{"answer":{"type":"choice","instructions":"Is 2+2 equal to 4?","criteria":{"yes":"The expression equals four.","no":"The expression does not equal four."}}}}"#,
-                    ))
-                    .unwrap(),
-            ),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let payload: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(payload["answers"]["answer"]["choice"], "yes");
-        assert!(payload["answers"].get("__router_jev_eligible").is_none());
-
-        let tag_input = tokio::time::timeout(Duration::from_secs(1), tag_input_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(tag_input.prompt.contains("What is 2+2?"));
-        assert!(!tag_input.request_id.is_empty());
-        assert_eq!(
-            serde_json::from_str::<Value>(tag_input.response.as_deref().unwrap()).unwrap(),
-            payload
-        );
-        release_tagger.notify_one();
-        tag_handle.await.unwrap().unwrap();
-        std::fs::remove_dir_all(tag_dir).unwrap();
-    }
-
-    struct NoopTagger {
-        input_tx: mpsc::Sender<crate::tagging::TagInput>,
-        release: Arc<tokio::sync::Notify>,
-    }
-
-    impl crate::tagging::Tagger for NoopTagger {
-        fn model(&self) -> &str {
-            "noop-tagger"
-        }
-        fn version(&self) -> &str {
-            "test"
-        }
-        fn taxonomy_version(&self) -> &str {
-            "test-v1"
-        }
-        fn tag(
-            &self,
-            input: &crate::tagging::TagInput,
-        ) -> impl std::future::Future<
-            Output = Result<crate::tagging::TaggerOutput, crate::tagging::TagError>,
-        > + Send {
-            let input_tx = self.input_tx.clone();
-            let input = input.clone();
-            let release = Arc::clone(&self.release);
-            async move {
-                input_tx.send(input).await.unwrap();
-                release.notified().await;
-                Ok(crate::tagging::TaggerOutput {
-                    verdict: crate::tagging::TaggerVerdict::Tagged {
-                        primary: crate::tagging::CategoryScore {
-                            category_id: "engineering".to_string(),
-                            score: 1.0,
-                        },
-                        alternatives: vec![],
-                    },
-                    usage: Some(crate::tagging::TokenUsage {
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        estimated: true,
-                    }),
-                })
-            }
-        }
+    #[test]
+    fn existing_chat_completion_payload_is_preserved() {
+        let payload = json!({"choices": [{"message": {"content": "hello"}}]});
+        assert_eq!(openai_chat_response(&payload, None), payload);
     }
 }

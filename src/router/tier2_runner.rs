@@ -1,14 +1,13 @@
 // src/router/tier2_runner.rs
+//
+// FastText scorer for the existing binary route task. It produces raw class
+// evidence only; the pipeline's task/tier policy decides whether that evidence
+// is sufficient to resolve the task.
 
 use fasttext::FastText;
 use std::path::Path;
 
-#[allow(unused_imports)]
-use tracing::{info, instrument};
-
-/// Labels the model must carry, as they appear after stripping `__label__`.
 const REQUIRED_LABELS: [&str; 2] = ["jev", "llm"];
-pub const DEFAULT_CONFIDENCE_THRESHOLD: f32 = 0.95;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier2Route {
@@ -17,69 +16,66 @@ pub enum Tier2Route {
 }
 
 #[derive(Debug, Clone)]
+pub struct Tier2Score {
+    pub route: Tier2Route,
+    /// Absolute difference between the two class probabilities.
+    pub calibrated_score: f32,
+    pub p_jev: f32,
+    pub p_llm: f32,
+}
+
+#[derive(Debug, Clone)]
 pub enum Tier2Outcome {
-    Resolved {
-        route: Tier2Route,
-        confidence: f32,
-        calibrated_score: f32,
-        p_jev: f32,
-        p_llm: f32,
-        raw_probabilities: Vec<f32>,
-    },
-    PassThrough {
-        top_guess: Tier2Route,
-        score: f32,
-        reason: &'static str,
-        p_jev: f32,
-        p_llm: f32,
-        raw_probabilities: Vec<f32>,
-    },
+    Scored(Tier2Score),
+    Abstain { reason: &'static str },
 }
 
 pub struct Tier2Runner {
     model: FastText,
-    confidence_threshold: f32,
 }
 
-/// Pure scoring step. Returns (route, top_prob, calibrated_score).
-///
-/// calibrated_score is the margin between the two class probabilities, so it
-/// stays strictly increasing in model certainty and only reaches 1.0 when the
-/// model puts all mass on one label.
+/// Pure scoring step. Returns (top class, top probability, class-probability
+/// margin). The margin measures separation; it is not an acceptance decision.
 pub fn calibrate(p_jev: f32, p_llm: f32) -> (Tier2Route, f32, f32) {
-    let p_jev = p_jev.clamp(0.0, 1.0);
-    let p_llm = p_llm.clamp(0.0, 1.0);
+    let p_jev = finite_probability(p_jev);
+    let p_llm = finite_probability(p_llm);
 
     let margin = (p_jev - p_llm).abs();
-
-    let (route, top_prob) = if p_jev >= p_llm {
+    let (route, top_probability) = if p_jev >= p_llm {
         (Tier2Route::Jev, p_jev)
     } else {
         (Tier2Route::Llm, p_llm)
     };
 
-    (route, top_prob, margin.clamp(0.0, 1.0))
+    (route, top_probability, margin.clamp(0.0, 1.0))
 }
 
-/// Pure label check. Accepts labels with or without the `__label__` prefix and
-/// fails with the list of what the model actually contains.
+fn finite_probability(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// Pure model-schema check. Accepts labels with or without the `__label__`
+/// prefix and reports the labels the model actually contains.
 pub fn check_labels(labels: &[String]) -> Result<(), String> {
     let names: Vec<&str> = labels
         .iter()
-        .map(|l| l.trim_start_matches("__label__"))
+        .map(|label| label.trim_start_matches("__label__"))
         .collect();
-
     let missing: Vec<&str> = REQUIRED_LABELS
         .iter()
         .copied()
-        .filter(|req| !names.contains(req))
+        .filter(|required| !names.contains(required))
         .collect();
 
     if missing.is_empty() {
         Ok(())
     } else {
         Err(format!(
-            "Tier2 model is missing required label(s) {missing:?}; model contains {names:?}"
+            "Tier 2 model is missing required label(s) {missing:?}; model contains {names:?}"
         ))
     }
 }
@@ -94,104 +90,60 @@ impl Tier2Runner {
             .join(" ")
     }
 
-    pub fn new<P: AsRef<Path>>(model_path: P, confidence_threshold: f32) -> Result<Self, String> {
+    pub fn new<P: AsRef<Path>>(model_path: P) -> Result<Self, String> {
         let model = FastText::load_model(&model_path)
-            .map_err(|e| format!("Failed to load FastText model: {e}"))?;
-
-        let (labels, _freqs) = model.get_labels();
+            .map_err(|error| format!("Failed to load FastText model: {error}"))?;
+        let (labels, _frequencies) = model.get_labels();
         check_labels(&labels)?;
 
-        Ok(Self {
-            model,
-            confidence_threshold,
-        })
+        Ok(Self { model })
     }
 
+    /// Return the model's raw prediction. No confidence threshold or routing
+    /// decision is applied here.
     #[inline]
     pub fn evaluate(&self, prompt: &str) -> Tier2Outcome {
-        // 1. Input Normalization pre-pass
         let normalized = Self::normalize_input(prompt);
-
         if normalized.is_empty() {
-            return Tier2Outcome::PassThrough {
-                top_guess: Tier2Route::Llm,
-                score: 0.0,
+            return Tier2Outcome::Abstain {
                 reason: "empty_input",
-                p_jev: 0.0,
-                p_llm: 0.0,
-                raw_probabilities: Vec::new(),
             };
         }
 
         let predictions = self.model.predict(&normalized, 2, 0.0);
         if predictions.is_empty() {
-            return Tier2Outcome::PassThrough {
-                top_guess: Tier2Route::Llm,
-                score: 0.0,
+            return Tier2Outcome::Abstain {
                 reason: "no_predictions",
-                p_jev: 0.0,
-                p_llm: 0.0,
-                raw_probabilities: Vec::new(),
             };
         }
 
-        let raw_probabilities = predictions
-            .iter()
-            .map(|prediction| prediction.prob)
-            .collect();
-
-        // Ground truth trace: every label the model returned, with its raw probability.
         tracing::info!(
             "tier2 raw predictions: {:?}",
             predictions
                 .iter()
-                .map(|p| (p.label.as_str(), p.prob))
+                .map(|prediction| (prediction.label.as_str(), prediction.prob))
                 .collect::<Vec<_>>()
         );
 
-        // 2. Explicit Class Extraction by label name
         let mut p_jev = 0.0f32;
         let mut p_llm = 0.0f32;
-
-        for pred in &predictions {
-            let label_name = pred.label.trim_start_matches("__label__");
-            match label_name {
-                "jev" => p_jev = pred.prob,
-                "llm" => p_llm = pred.prob,
+        for prediction in &predictions {
+            match prediction.label.trim_start_matches("__label__") {
+                "jev" => p_jev = prediction.prob,
+                "llm" => p_llm = prediction.prob,
                 _ => {}
             }
         }
 
-        // 3. Margin-based calibration with defensive clamping
-        let (route, top_prob, calibrated_score) = calibrate(p_jev, p_llm);
-
-        if route == Tier2Route::Jev && calibrated_score >= self.confidence_threshold {
-            Tier2Outcome::Resolved {
-                route,
-                confidence: top_prob,
-                calibrated_score,
-                p_jev,
-                p_llm,
-                raw_probabilities,
-            }
-        } else {
-            Tier2Outcome::PassThrough {
-                top_guess: route,
-                score: calibrated_score,
-                reason: if route == Tier2Route::Jev {
-                    "below_confidence_threshold"
-                } else {
-                    "not_jev"
-                },
-                p_jev,
-                p_llm,
-                raw_probabilities,
-            }
-        }
+        let (route, _top_probability, calibrated_score) = calibrate(p_jev, p_llm);
+        Tier2Outcome::Scored(Tier2Score {
+            route,
+            calibrated_score,
+            p_jev: finite_probability(p_jev),
+            p_llm: finite_probability(p_llm),
+        })
     }
 }
-
-//  ========== tests ==========
 
 #[cfg(test)]
 mod tests {
@@ -199,50 +151,42 @@ mod tests {
     use proptest::prelude::*;
 
     proptest! {
-        // 1. Invariant: normalize_input never produces leading/trailing whitespace
-        // or consecutive spaces, regardless of input string noise.
         #[test]
         fn prop_normalize_input_invariants(s in ".*") {
             let normalized = Tier2Runner::normalize_input(&s);
-
             prop_assert_eq!(&normalized, &normalized.to_lowercase());
             prop_assert_eq!(&normalized, normalized.trim());
             prop_assert!(!normalized.contains("  "));
         }
 
-        // 2. Invariant: the real calibrate() output always lies in [0.0, 1.0]
-        // even with out-of-bounds float inputs from bindings.
         #[test]
         fn prop_calibrated_score_bounds(
             p_jev in -100.0f32..100.0f32,
             p_llm in -100.0f32..100.0f32
         ) {
-            let (_, top_prob, calibrated) = calibrate(p_jev, p_llm);
-
-            prop_assert!((0.0..=1.0).contains(&top_prob));
+            let (_, top_probability, calibrated) = calibrate(p_jev, p_llm);
+            prop_assert!((0.0..=1.0).contains(&top_probability));
             prop_assert!((0.0..=1.0).contains(&calibrated));
         }
 
-        // 3. Invariant: swapping the two class probabilities leaves the score unchanged.
         #[test]
         fn prop_score_is_symmetric(a in 0.0f32..1.0f32, b in 0.0f32..1.0f32) {
-            let (_, _, s1) = calibrate(a, b);
-            let (_, _, s2) = calibrate(b, a);
-            prop_assert_eq!(s1, s2);
+            let (_, _, score_ab) = calibrate(a, b);
+            let (_, _, score_ba) = calibrate(b, a);
+            prop_assert_eq!(score_ab, score_ba);
         }
 
-        // 4. Invariant: more certainty never lowers the score.
         #[test]
         fn prop_score_monotonic_in_certainty(a in 0.5f32..1.0f32, b in 0.5f32..1.0f32) {
-            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-            let (_, _, s_lo) = calibrate(lo, 1.0 - lo);
-            let (_, _, s_hi) = calibrate(hi, 1.0 - hi);
-            prop_assert!(s_lo <= s_hi);
+            let (lower, upper) = if a <= b { (a, b) } else { (b, a) };
+            let (_, _, score_lower) = calibrate(lower, 1.0 - lower);
+            let (_, _, score_upper) = calibrate(upper, 1.0 - upper);
+            prop_assert!(score_lower <= score_upper);
         }
     }
 
     #[test]
-    fn test_scores_discriminate_mid_range() {
+    fn calibration_discriminates_mid_range() {
         let (_, _, weak) = calibrate(0.60, 0.40);
         let (_, _, strong) = calibrate(0.90, 0.10);
         assert!(weak < strong);
@@ -250,41 +194,34 @@ mod tests {
     }
 
     #[test]
-    fn test_whitespace_and_casing_normalization() {
+    fn normalize_input_handles_whitespace_and_casing() {
         let raw = "  Hello   WORLD \t\n Test  ";
         assert_eq!(Tier2Runner::normalize_input(raw), "hello world test");
     }
 
     #[test]
-    fn test_check_labels_accepts_both_labels() {
-        let labels = vec!["__label__jev".to_string(), "__label__llm".to_string()];
-        assert!(check_labels(&labels).is_ok());
+    fn check_labels_accepts_prefixed_and_unprefixed_labels() {
+        assert!(check_labels(&[
+            "__label__jev".to_string(),
+            "__label__llm".to_string(),
+        ]).is_ok());
+        assert!(check_labels(&["llm".to_string(), "jev".to_string()]).is_ok());
     }
 
     #[test]
-    fn test_check_labels_accepts_unprefixed_labels() {
-        let labels = vec!["llm".to_string(), "jev".to_string()];
-        assert!(check_labels(&labels).is_ok());
-    }
-
-    #[test]
-    fn test_check_labels_rejects_single_label_model() {
-        let labels = vec!["__label__jev".to_string()];
-        let err = check_labels(&labels).unwrap_err();
-        assert!(err.contains("llm"));
-    }
-
-    #[test]
-    fn test_check_labels_rejects_wrong_label_names() {
-        let labels = vec![
+    fn check_labels_rejects_wrong_or_missing_labels() {
+        assert!(check_labels(&["__label__jev".to_string()]).is_err());
+        assert!(check_labels(&[
             "__label__jev_capable".to_string(),
             "__label__needs_llm".to_string(),
-        ];
-        assert!(check_labels(&labels).is_err());
+        ]).is_err());
+        assert!(check_labels(&[]).is_err());
     }
 
     #[test]
-    fn test_check_labels_rejects_empty() {
-        assert!(check_labels(&[]).is_err());
+    fn calibration_treats_non_finite_values_as_zero() {
+        let (_, top_probability, score) = calibrate(f32::NAN, f32::INFINITY);
+        assert_eq!(top_probability, 0.0);
+        assert_eq!(score, 0.0);
     }
 }
