@@ -39,6 +39,11 @@ class Tier3ScorerStub:
                 request_serializer=tier3__pb2.ScoreRequest.SerializeToString,
                 response_deserializer=tier3__pb2.ScoreResponse.FromString,
                 _registered_method=True)
+        self.ScoreTasks = channel.unary_unary(
+                '/tier3.Tier3Scorer/ScoreTasks',
+                request_serializer=tier3__pb2.ScoreTasksRequest.SerializeToString,
+                response_deserializer=tier3__pb2.ScoreTasksResponse.FromString,
+                _registered_method=True)
 
 
 class Tier3ScorerServicer:
@@ -50,6 +55,15 @@ class Tier3ScorerServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ScoreTasks(self, request, context):
+        """Joint execution: one shared encoding of `prompt`, one head per requested
+        task. Additive; sidecars that predate it answer UNIMPLEMENTED and the
+        router falls back to Score for the route task.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_Tier3ScorerServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -57,6 +71,11 @@ def add_Tier3ScorerServicer_to_server(servicer, server):
                     servicer.Score,
                     request_deserializer=tier3__pb2.ScoreRequest.FromString,
                     response_serializer=tier3__pb2.ScoreResponse.SerializeToString,
+            ),
+            'ScoreTasks': grpc.unary_unary_rpc_method_handler(
+                    servicer.ScoreTasks,
+                    request_deserializer=tier3__pb2.ScoreTasksRequest.FromString,
+                    response_serializer=tier3__pb2.ScoreTasksResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -86,6 +105,33 @@ class Tier3Scorer:
             '/tier3.Tier3Scorer/Score',
             tier3__pb2.ScoreRequest.SerializeToString,
             tier3__pb2.ScoreResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ScoreTasks(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/tier3.Tier3Scorer/ScoreTasks',
+            tier3__pb2.ScoreTasksRequest.SerializeToString,
+            tier3__pb2.ScoreTasksResponse.FromString,
             options,
             channel_credentials,
             insecure,
