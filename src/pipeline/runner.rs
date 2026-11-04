@@ -180,10 +180,12 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::Mutex;
 
+    type TierCallLog = Arc<Mutex<Vec<(u8, Vec<TaskId>)>>>;
+
     struct FakeTier {
         id: u8,
         answers: Vec<(TaskId, TierReading)>,
-        calls: Arc<Mutex<Vec<(u8, Vec<TaskId>)>>>,
+        calls: TierCallLog,
     }
 
     #[async_trait]
