@@ -473,16 +473,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tagging::spawn(Arc::new(ollama_tagger), tag_config)
     };
 
-    let app = service::app(
+    let app = service::app(service::AppDependencies {
         cascade,
         route_profile,
         tier_policies,
         dispatcher,
         hashes,
-        capture_tx.clone(),
-        tag_queue.clone(),
-        Duration::from_millis(env_or("ROUTER_BUDGET_MS", "600").parse()?),
-    );
+        capture_tx: capture_tx.clone(),
+        tag_queue: tag_queue.clone(),
+        budget: Duration::from_millis(env_or("ROUTER_BUDGET_MS", "600").parse()?),
+    });
     let bind_address = env_or("ROUTER_BIND", "127.0.0.1:8080");
     let listener = tokio::net::TcpListener::bind(&bind_address).await?;
     tracing::info!(address = %listener.local_addr()?, "gateway listening");

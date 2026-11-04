@@ -68,6 +68,7 @@ pub enum TierReading {
 /// This is stored in the pipeline policy registry, never inside TaskProfile.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(dead_code)]
 pub struct TierPolicy {
     pub min_confidence: f32,
     #[serde(default)]
