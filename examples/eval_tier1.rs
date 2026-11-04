@@ -78,7 +78,7 @@ fn predict(r: &Tier1Result) -> Pred {
 fn rule_of(reason: &str) -> String {
     let stripped = reason.trim_start_matches(|c: char| c.is_ascii_digit() || c == ' ');
     stripped
-        .split(|c| c == '(' || c == ':')
+        .split(['(', ':'])
         .next()
         .unwrap_or(stripped)
         .trim()
@@ -113,7 +113,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let at = format!("{cases_path}:{}", i + 1);
         let case: Case = serde_json::from_str(line).map_err(|e| format!("{at}: {e}"))?;
-        let gold = gold_of(&case.label).ok_or_else(|| format!("{at}: unknown label {:?}", case.label))?;
+        let gold =
+            gold_of(&case.label).ok_or_else(|| format!("{at}: unknown label {:?}", case.label))?;
         let prompt = case
             .prompt
             .or(case.text)
@@ -141,7 +142,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("config: {config_path}");
     println!("cases:  {cases_path}  ({} rows)\n", rows.len());
 
-    println!("{:<10} {:>9} {:>9} {:>7} {:>7}", "", "pred JEV", "pred LLM", "DEFER", "total");
+    println!(
+        "{:<10} {:>9} {:>9} {:>7} {:>7}",
+        "", "pred JEV", "pred LLM", "DEFER", "total"
+    );
     for (name, g) in [("gold JEV", Route::Jev), ("gold LLM", Route::Llm)] {
         println!(
             "{:<10} {:>9} {:>9} {:>7} {:>7}",
@@ -160,9 +164,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let decided = rows.iter().filter(|r| r.pred != Pred::Defer).count();
 
     println!();
-    println!("committed-jev precision : {}", ratio(tp_jev, tp_jev + fp_jev));
-    println!("jev coverage            : {}", ratio(tp_jev, gold_total(Route::Jev)));
-    println!("llm-verdict precision   : {}", ratio(tp_llm, tp_llm + fp_llm));
+    println!(
+        "committed-jev precision : {}",
+        ratio(tp_jev, tp_jev + fp_jev)
+    );
+    println!(
+        "jev coverage            : {}",
+        ratio(tp_jev, gold_total(Route::Jev))
+    );
+    println!(
+        "llm-verdict precision   : {}",
+        ratio(tp_llm, tp_llm + fp_llm)
+    );
     println!("tier-1 decided rate     : {}", ratio(decided, rows.len()));
 
     // Per-rule breakdown: which rules commit, and how often they are right.
@@ -177,7 +190,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("\n{:<48} {:>4} {:>6} {:>6} {:>6}", "rule", "n", "right", "wrong", "defer");
+    println!(
+        "\n{:<48} {:>4} {:>6} {:>6} {:>6}",
+        "rule", "n", "right", "wrong", "defer"
+    );
     for (rule, (n, ok, wrong, defer)) in &by_rule {
         println!("{rule:<48} {n:>4} {ok:>6} {wrong:>6} {defer:>6}");
     }
