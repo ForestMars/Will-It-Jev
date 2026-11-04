@@ -95,7 +95,7 @@ fn finish_route(
     let latency_us = start.elapsed().as_micros();
     let record = RouteRecord {
         request_id: request_id.to_string(),
-        timestamp: timestamp.clone(),
+        timestamp: *timestamp, // dereferences the borrowed DateTime and avoids the redundant-field-name warning 
         prompt_raw: prompt.to_string(),
         hashes: hashes.clone(),
         tier1_outcome: outcomes.tier1,
