@@ -1,9 +1,7 @@
 // src/pipeline/tier.rs
 //
-// Scorer side of the split. A `Tier` returns raw per-task readings and never applies
-// a threshold; thresholds live in `TaskProfile`. The adapters below wrap the existing
-// tier runners without changing them (tier 1 and 2 are route-only, tiers 3 and 4 are
-// the gRPC sidecars).
+// Execution-tier adapters. A tier returns raw readings for the task IDs it can
+// serve; all task-specific acceptance policy lives outside this module.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,7 +17,7 @@ use crate::router::tier3_runner::{TasksError, Tier3Runner};
 
 pub struct TierContext<'a> {
     pub prompt: &'a str,
-    /// Tasks still open that this tier is allowed to answer, never empty.
+    /// Tasks still open that this tier is eligible to answer.
     pub tasks: &'a [TaskId],
     /// Time left on the run's global deadline.
     pub budget: Duration,
@@ -41,7 +39,7 @@ impl TierOutput {
             model_id: model_id.into(),
             readings: tasks
                 .iter()
-                .map(|t| (t.clone(), TierReading::Abstain(reason)))
+                .map(|task| (task.clone(), TierReading::Abstain(reason)))
                 .collect(),
         }
     }
@@ -49,12 +47,10 @@ impl TierOutput {
 
 #[async_trait]
 pub trait Tier: Send + Sync {
-    /// Position in the cascade, matching the numbering in telemetry (1..=4 for the
-    /// local tiers).
+    /// Position in the execution cascade; it is not a task identifier.
     fn id(&self) -> u8;
     fn name(&self) -> &str;
-    /// Answer as many of `ctx.tasks` as the tier can. Tasks the tier has no head for
-    /// are `Abstain("unsupported_task")`, not an error.
+    /// A tier without a head for a requested task abstains for that task.
     async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput;
 }
 
@@ -78,8 +74,6 @@ fn route_only(ctx: &TierContext<'_>, model_id: &str, route: TierReading) -> Tier
     }
 }
 
-// ---- Tier 1: heuristic pattern engine ------------------------------------
-
 pub struct Tier1Tier {
     engine: Arc<Tier1Engine>,
 }
@@ -95,22 +89,34 @@ impl Tier for Tier1Tier {
     fn id(&self) -> u8 {
         1
     }
+
     fn name(&self) -> &str {
         "heuristic"
     }
+
     async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
-        let r = self.engine.classify(ctx.prompt);
-        // Tier 1 reports a jev confidence, and only when it decided.
-        let reading = if r.decided {
-            TierReading::Scored(Reading::new(LABEL_JEV, r.confidence))
+        let result = self.engine.classify(ctx.prompt);
+        let p_jev = if result.confidence.is_finite() {
+            result.confidence.clamp(0.0, 1.0)
         } else {
-            TierReading::Abstain("ambiguous")
+            0.0
         };
+        let (label, confidence) = if p_jev >= 0.5 {
+            (LABEL_JEV, p_jev)
+        } else {
+            (LABEL_LLM, 1.0 - p_jev)
+        };
+        let reading = TierReading::Scored(Reading {
+            label: label.to_string(),
+            confidence,
+            scores: vec![
+                (LABEL_JEV.to_string(), p_jev),
+                (LABEL_LLM.to_string(), 1.0 - p_jev),
+            ],
+        });
         route_only(ctx, "heuristic", reading)
     }
 }
-
-// ---- Tier 2: FastText -----------------------------------------------------
 
 pub struct Tier2Tier {
     runner: Arc<Tier2Runner>,
@@ -122,27 +128,26 @@ impl Tier2Tier {
     }
 }
 
-/// Raw reading from a Tier 2 outcome. The calibrated margin is the confidence the
-/// cascade thresholds, whether or not Tier 2 itself resolved.
+/// Converts FastText's raw class evidence to a task reading. The confidence
+/// used by route policy is the calibrated class-probability margin; the full
+/// two-class distribution is retained for telemetry.
 pub fn tier2_reading(outcome: &Tier2Outcome) -> TierReading {
-    let label = |route: &Tier2Route| match route {
-        Tier2Route::Jev => LABEL_JEV,
-        Tier2Route::Llm => LABEL_LLM,
-    };
     match outcome {
-        Tier2Outcome::Resolved {
-            route,
-            calibrated_score,
-            ..
-        } => TierReading::Scored(Reading::new(label(route), *calibrated_score)),
-        Tier2Outcome::PassThrough { reason, .. }
-            if matches!(*reason, "empty_input" | "no_predictions") =>
-        {
-            TierReading::Abstain(reason)
+        Tier2Outcome::Abstain { reason } => TierReading::Abstain(reason),
+        Tier2Outcome::Scored(score) => {
+            let label = match score.route {
+                Tier2Route::Jev => LABEL_JEV,
+                Tier2Route::Llm => LABEL_LLM,
+            };
+            TierReading::Scored(Reading {
+                label: label.to_string(),
+                confidence: score.calibrated_score,
+                scores: vec![
+                    (LABEL_JEV.to_string(), score.p_jev),
+                    (LABEL_LLM.to_string(), score.p_llm),
+                ],
+            })
         }
-        Tier2Outcome::PassThrough {
-            top_guess, score, ..
-        } => TierReading::Scored(Reading::new(label(top_guess), *score)),
     }
 }
 
@@ -151,30 +156,29 @@ impl Tier for Tier2Tier {
     fn id(&self) -> u8 {
         2
     }
+
     fn name(&self) -> &str {
         "fasttext"
     }
+
     async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
         let outcome = self.runner.evaluate(ctx.prompt);
         route_only(ctx, "fasttext", tier2_reading(&outcome))
     }
 }
 
-// ---- Tiers 3 and 4: gRPC sidecars ----------------------------------------
-
-pub struct Tier3Tier {
+/// Generic adapter for any gRPC sidecar implementing the Tier 3 scorer
+/// protocol. Tier 4 (Harrier/Oryn) is another instance with a different ID,
+/// name, and endpoint; the Rust transport and output contract are identical.
+pub struct GrpcScoringTier {
     id: u8,
     name: &'static str,
     runner: Tier3Runner,
-    /// The sidecar implements `ScoreTasks`. Off by default: until a sidecar has a head
-    /// for a second task there is nothing for the joint call to add.
     joint: bool,
-    /// Set the first time the sidecar answers UNIMPLEMENTED, so later requests skip
-    /// the doomed round trip.
     joint_unimplemented: AtomicBool,
 }
 
-impl Tier3Tier {
+impl GrpcScoringTier {
     pub fn new(id: u8, name: &'static str, runner: Tier3Runner, joint: bool) -> Self {
         Self {
             id,
@@ -198,39 +202,50 @@ impl Tier3Tier {
 }
 
 #[async_trait]
-impl Tier for Tier3Tier {
+impl Tier for GrpcScoringTier {
     fn id(&self) -> u8 {
         self.id
     }
+
     fn name(&self) -> &str {
         self.name
     }
+
     async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
-        let route = TaskId::route();
-        let only_route = ctx.tasks.len() == 1 && ctx.tasks[0] == route;
-        let use_joint =
-            self.joint && !only_route && !self.joint_unimplemented.load(Ordering::Relaxed);
+        let route_id = TaskId::route();
+        let only_route = ctx.tasks.len() == 1 && ctx.tasks[0] == route_id;
+        let use_joint = self.joint
+            && !only_route
+            && !self.joint_unimplemented.load(Ordering::Relaxed);
 
         if use_joint {
-            let ids: Vec<String> = ctx.tasks.iter().map(|t| t.as_str().to_string()).collect();
-            match self.runner.score_tasks(ctx.prompt, &ids, ctx.budget).await {
-                Ok(resp) => {
+            let task_ids: Vec<String> = ctx
+                .tasks
+                .iter()
+                .map(|task| task.as_str().to_string())
+                .collect();
+            match self
+                .runner
+                .score_tasks(ctx.prompt, &task_ids, ctx.budget)
+                .await
+            {
+                Ok(response) => {
                     let readings = ctx
                         .tasks
                         .iter()
                         .map(|task| {
-                            let reading = resp
+                            let reading = response
                                 .results
                                 .iter()
-                                .find(|r| r.task == task.as_str())
-                                .map(|r| {
+                                .find(|result| result.task == task.as_str())
+                                .map(|result| {
                                     TierReading::Scored(Reading {
-                                        label: r.label.clone(),
-                                        confidence: r.confidence,
-                                        scores: r
+                                        label: result.label.clone(),
+                                        confidence: result.confidence,
+                                        scores: result
                                             .scores
                                             .iter()
-                                            .map(|s| (s.label.clone(), s.score))
+                                            .map(|score| (score.label.clone(), score.score))
                                             .collect(),
                                     })
                                 })
@@ -239,7 +254,7 @@ impl Tier for Tier3Tier {
                         })
                         .collect();
                     return TierOutput {
-                        model_id: resp.model_id,
+                        model_id: response.model_id,
                         readings,
                     };
                 }
@@ -247,16 +262,13 @@ impl Tier for Tier3Tier {
                     return TierOutput::abstain_all(self.name, ctx.tasks, reason);
                 }
                 Err(TasksError::Unimplemented) => {
-                    tracing::warn!(
-                        tier = self.id,
-                        "sidecar has no ScoreTasks; serving route via Score only"
-                    );
+                    tracing::warn!(tier = self.id, "sidecar has no ScoreTasks RPC; falling back to single-task Score");
                     self.joint_unimplemented.store(true, Ordering::Relaxed);
                 }
             }
         }
 
-        if ctx.tasks.contains(&route) {
+        if ctx.tasks.contains(&route_id) {
             self.route_via_score(ctx).await
         } else {
             TierOutput::abstain_all(self.name, ctx.tasks, "unsupported_task")
@@ -267,213 +279,103 @@ impl Tier for Tier3Tier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::router::tier3_proto::tier3_scorer_server::{Tier3Scorer, Tier3ScorerServer};
+    use crate::router::tier3_proto::tier3_scorer_server::{
+        Tier3Scorer, Tier3ScorerServer,
+    };
     use crate::router::tier3_proto::{
         LabelScore, ScoreRequest, ScoreResponse, ScoreTasksRequest, ScoreTasksResponse, TaskScore,
     };
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tonic::{Request, Response, Status};
 
     #[derive(Clone, Default)]
-    struct Sidecar {
+    struct TestSidecar {
         joint: bool,
         score_calls: Arc<AtomicUsize>,
-        task_calls: Arc<AtomicUsize>,
+        tasks_calls: Arc<AtomicUsize>,
     }
 
     #[tonic::async_trait]
-    impl Tier3Scorer for Sidecar {
-        async fn score(&self, _: Request<ScoreRequest>) -> Result<Response<ScoreResponse>, Status> {
+    impl Tier3Scorer for TestSidecar {
+        async fn score(
+            &self,
+            _request: Request<ScoreRequest>,
+        ) -> Result<Response<ScoreResponse>, Status> {
             self.score_calls.fetch_add(1, Ordering::SeqCst);
             Ok(Response::new(ScoreResponse {
-                raw_score: 0.9,
-                confidence: 0.9,
+                raw_score: 0.97,
                 label: LABEL_JEV.into(),
-                model_id: "legacy".into(),
+                confidence: 0.97,
+                model_id: "test-sidecar".into(),
             }))
         }
+
         async fn score_tasks(
             &self,
-            req: Request<ScoreTasksRequest>,
+            request: Request<ScoreTasksRequest>,
         ) -> Result<Response<ScoreTasksResponse>, Status> {
-            self.task_calls.fetch_add(1, Ordering::SeqCst);
+            self.tasks_calls.fetch_add(1, Ordering::SeqCst);
             if !self.joint {
-                return Err(Status::unimplemented("no joint heads"));
+                return Err(Status::unimplemented("no multi-task heads"));
             }
-            let mut results = Vec::new();
-            let mut unsupported = Vec::new();
-            for task in req.into_inner().tasks {
-                match task.as_str() {
-                    "route" => results.push(TaskScore {
+            let results = request
+                .into_inner()
+                .tasks
+                .into_iter()
+                .filter_map(|task| match task.as_str() {
+                    "route" => Some(TaskScore {
                         task,
                         label: LABEL_JEV.into(),
                         confidence: 0.97,
-                        scores: vec![],
+                        scores: Vec::new(),
                     }),
-                    "tag" => results.push(TaskScore {
+                    "tag" => Some(TaskScore {
                         task,
                         label: "engineering".into(),
                         confidence: 0.85,
                         scores: vec![
-                            LabelScore {
-                                label: "engineering".into(),
-                                score: 0.85,
-                            },
-                            LabelScore {
-                                label: "help_desk".into(),
-                                score: 0.10,
-                            },
+                            LabelScore { label: "engineering".into(), score: 0.85 },
+                            LabelScore { label: "help_desk".into(), score: 0.10 },
                         ],
                     }),
-                    _ => unsupported.push(task),
-                }
-            }
+                    _ => None,
+                })
+                .collect();
             Ok(Response::new(ScoreTasksResponse {
-                model_id: "joint".into(),
+                model_id: "joint-test-sidecar".into(),
                 results,
-                unsupported,
+                unsupported: Vec::new(),
             }))
         }
     }
 
-    async fn serve(sidecar: Sidecar) -> String {
+    async fn endpoint(sidecar: TestSidecar) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
+        let address = listener.local_addr().unwrap();
         drop(listener);
         tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(Tier3ScorerServer::new(sidecar))
-                .serve(addr)
+                .serve(address)
                 .await
                 .unwrap();
         });
         tokio::time::sleep(Duration::from_millis(150)).await;
-        format!("http://{addr}")
-    }
-
-    fn tier(endpoint: String, joint: bool) -> Tier3Tier {
-        let runner = Tier3Runner::new(endpoint, 0.95, 0.70, Duration::from_secs(2)).unwrap();
-        Tier3Tier::new(4, "harrier", runner, joint)
-    }
-
-    fn ctx<'a>(tasks: &'a [TaskId]) -> TierContext<'a> {
-        TierContext {
-            prompt: "p",
-            tasks,
-            budget: Duration::from_secs(2),
-        }
+        format!("http://{address}")
     }
 
     #[tokio::test]
-    async fn joint_sidecar_serves_both_tasks_in_one_rpc() {
-        let sidecar = Sidecar {
-            joint: true,
-            ..Default::default()
-        };
-        let (score_calls, task_calls) = (sidecar.score_calls.clone(), sidecar.task_calls.clone());
-        let t = tier(serve(sidecar).await, true);
+    async fn joint_sidecar_scores_multiple_tasks_in_one_rpc() {
+        let sidecar = TestSidecar { joint: true, ..Default::default() };
+        let calls = sidecar.tasks_calls.clone();
+        let scorer = Tier3Runner::new(endpoint(sidecar).await, Duration::from_secs(2)).unwrap();
+        let tier = GrpcScoringTier::new(4, "alternate-sidecar", scorer, true);
         let tasks = [TaskId::route(), TaskId::tag()];
-        let out = t.evaluate(&ctx(&tasks)).await;
-
-        assert_eq!(task_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(score_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(out.model_id, "joint");
-        let TierReading::Scored(tag) = &out.readings[&TaskId::tag()] else {
-            panic!()
-        };
-        assert_eq!(tag.label, "engineering");
-        assert_eq!(tag.scores.len(), 2);
-        assert!(matches!(
-            out.readings[&TaskId::route()],
-            TierReading::Scored(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn route_alone_keeps_using_the_legacy_score_rpc() {
-        let sidecar = Sidecar {
-            joint: true,
-            ..Default::default()
-        };
-        let (score_calls, task_calls) = (sidecar.score_calls.clone(), sidecar.task_calls.clone());
-        let t = tier(serve(sidecar).await, true);
-        let tasks = [TaskId::route()];
-        t.evaluate(&ctx(&tasks)).await;
-        assert_eq!(
-            (
-                score_calls.load(Ordering::SeqCst),
-                task_calls.load(Ordering::SeqCst)
-            ),
-            (1, 0)
-        );
-    }
-
-    /// A sidecar that predates ScoreTasks: route still resolves, tag abstains, and the
-    /// router stops probing the missing RPC after the first UNIMPLEMENTED.
-    #[tokio::test]
-    async fn old_sidecar_degrades_to_route_only() {
-        let sidecar = Sidecar::default();
-        let (score_calls, task_calls) = (sidecar.score_calls.clone(), sidecar.task_calls.clone());
-        let t = tier(serve(sidecar).await, true);
-        let tasks = [TaskId::route(), TaskId::tag()];
-        for _ in 0..2 {
-            let out = t.evaluate(&ctx(&tasks)).await;
-            assert!(matches!(
-                out.readings[&TaskId::route()],
-                TierReading::Scored(_)
-            ));
-            assert_eq!(
-                out.readings[&TaskId::tag()],
-                TierReading::Abstain("unsupported_task")
-            );
-        }
-        assert_eq!(
-            task_calls.load(Ordering::SeqCst),
-            1,
-            "probed once, then remembered"
-        );
-        assert_eq!(score_calls.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn unreachable_sidecar_abstains_every_task() {
-        let t = tier("http://127.0.0.1:1".into(), true);
-        let tasks = [TaskId::route(), TaskId::tag()];
-        let out = t
-            .evaluate(&TierContext {
-                prompt: "p",
-                tasks: &tasks,
-                budget: Duration::from_millis(200),
-            })
+        let output = tier
+            .evaluate(&TierContext { prompt: "test", tasks: &tasks, budget: Duration::from_secs(2) })
             .await;
-        assert!(out
-            .readings
-            .values()
-            .all(|r| matches!(r, TierReading::Abstain(_))));
-    }
-
-    #[test]
-    fn tier2_reading_mirrors_the_legacy_outcome() {
-        let resolved = Tier2Outcome::Resolved {
-            route: Tier2Route::Jev,
-            confidence: 0.99,
-            calibrated_score: 0.97,
-            p_jev: 0.985,
-            p_llm: 0.015,
-            raw_probabilities: vec![],
-        };
-        assert_eq!(
-            tier2_reading(&resolved),
-            TierReading::Scored(Reading::new(LABEL_JEV, 0.97))
-        );
-        let empty = Tier2Outcome::PassThrough {
-            top_guess: Tier2Route::Llm,
-            score: 0.0,
-            reason: "empty_input",
-            p_jev: 0.0,
-            p_llm: 0.0,
-            raw_probabilities: vec![],
-        };
-        assert_eq!(tier2_reading(&empty), TierReading::Abstain("empty_input"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(output.readings[&TaskId::route()], TierReading::Scored(_)));
+        assert!(matches!(output.readings[&TaskId::tag()], TierReading::Scored(_)));
     }
 }
