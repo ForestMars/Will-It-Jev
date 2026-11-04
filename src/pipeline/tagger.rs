@@ -4,7 +4,6 @@
 // tag task supplies its own profile and is evaluated with the same shared
 // cascade and separate tier/task policy registry as the route task.
 
-use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -88,50 +87,45 @@ impl<F: Tagger> Tagger for CascadeTagger<F> {
         self.fallback.taxonomy_version()
     }
 
-    fn tag(
-        &self,
-        input: &TagInput,
-    ) -> impl Future<Output = Result<TaggerOutput, TagError>> + Send {
-        async move {
-            // Preserve the existing tagger input contract: the domain task may use
-            // both the request and the generated response. Route inference, by
-            // contrast, runs before a response exists.
-            let task_input = match input.response.as_deref().filter(|response| !response.is_empty()) {
-                Some(response) => format!("Prompt:\n{}\n\nResponse:\n{}", input.prompt, response),
-                None => input.prompt.clone(),
-            };
-            let outcome = self
-                .runner
-                .run(
-                    &task_input,
-                    std::slice::from_ref(&self.profile),
-                    &self.tier_policies,
-                    self.budget,
-                )
-                .await;
-            match outcome
-                .tasks
-                .get(&self.profile.task)
-                .map(|task| &task.resolution)
-            {
-                Some(Resolution::Tier {
+    async fn tag(&self, input: &TagInput) -> Result<TaggerOutput, TagError> {
+        // Preserve the existing tagger input contract: the domain task may use
+        // both the request and the generated response. Route inference, by
+        // contrast, runs before a response exists.
+        let task_input = match input.response.as_deref().filter(|response| !response.is_empty()) {
+            Some(response) => format!("Prompt:\n{}\n\nResponse:\n{}", input.prompt, response),
+            None => input.prompt.clone(),
+        };
+        let outcome = self
+            .runner
+            .run(
+                &task_input,
+                std::slice::from_ref(&self.profile),
+                &self.tier_policies,
+                self.budget,
+            )
+            .await;
+        match outcome
+            .tasks
+            .get(&self.profile.task)
+            .map(|task| &task.resolution)
+        {
+            Some(Resolution::Tier {
+                tier,
+                model_id,
+                reading,
+            }) => {
+                tracing::debug!(
+                    request_id = %input.request_id,
                     tier,
                     model_id,
-                    reading,
-                }) => {
-                    tracing::debug!(
-                        request_id = %input.request_id,
-                        tier,
-                        model_id,
-                        "tag resolved in cascade"
-                    );
-                    Ok(TaggerOutput {
-                        verdict: verdict(reading),
-                        usage: None,
-                    })
-                }
-                _ => self.fallback.tag(input).await,
+                    "tag resolved in cascade"
+                );
+                Ok(TaggerOutput {
+                    verdict: verdict(reading),
+                    usage: None,
+                })
             }
+            _ => self.fallback.tag(input).await,
         }
     }
 }
@@ -139,6 +133,7 @@ impl<F: Tagger> Tagger for CascadeTagger<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
     use crate::pipeline::runner::CascadeRunner;
     use crate::pipeline::task::{TaskId, TierPolicy, TierReading};
     use crate::pipeline::tier::{Tier, TierContext, TierOutput};
