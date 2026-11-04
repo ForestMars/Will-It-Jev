@@ -6,6 +6,7 @@ pub mod service;
 pub mod tier1_runner;
 pub mod tier2_runner;
 pub mod tier3_runner;
+// tier4 reuses tier3 output 
 pub mod tier5_runner;
 pub mod tier6_runner;
 
