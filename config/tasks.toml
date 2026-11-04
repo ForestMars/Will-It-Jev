@@ -1,22 +1,59 @@
-# Task profiles for the task-agnostic cascade (src/pipeline). Everything here is off
-# by default; the route task needs no entry because its built-in profile mirrors the
-# thresholds the router uses today.
+# Task definitions and task/tier resolution policies are separate concerns.
+# [task.*] describes a prediction objective only; no tier IDs belong here.
+# [tier_policy.tierN.*] configures when a particular execution tier may resolve it.
 
 [pipeline]
-# Run category tagging through the shared tiers, with the Ollama tagger as fallback.
+# The normal OvenV1Tagger remains the default tagger. Enable only after a sidecar
+# has a trained `tag` head and matching tier policies are configured below.
 tag_via_cascade = false
-# Deadline for one tagging run. Keep it below TagConfig.call_timeout (5s).
+# Must remain below TagConfig.call_timeout (5 seconds).
 tag_budget_ms = 4000
-# Tier numbers whose sidecar implements the ScoreTasks RPC. No shipped sidecar does yet.
+# Local scorer tiers whose sidecars support the joint ScoreTasks RPC.
 joint_tiers = []
 
-# The tag profile is deliberately not shipped: its confidence bars have to be tuned on
-# tagging data (see taskonomies/), and no sidecar model has a tagging head yet. Shape:
+[task.route]
+labels = ["jev_capable", "needs_llm"]
+fallback_label = "needs_llm"
+
+[task.tag]
+labels = [
+    "engineering",
+    "company_knowledge_base",
+    "help_desk",
+    "customer_support",
+    "web_search",
+    "other_company_task",
+    "other_general_request",
+]
+fallback = "defer"
+
+# Route resolution calibration. Tier 1 and Tier 2 remain route-only scorers;
+# tiers 3 and 4 may serve any task for which their sidecar exposes a head.
+[tier_policy.tier1.route]
+min_confidence = 0.78
+strict = true
+never_resolve = ["needs_llm"]
+
+[tier_policy.tier2.route]
+min_confidence = 0.95
+never_resolve = ["needs_llm"]
+
+[tier_policy.tier3.route]
+min_confidence = 0.95
+label_min_confidence = { jev_capable = 0.95, needs_llm = 0.70 }
+
+[tier_policy.tier4.route]
+min_confidence = 0.95
+label_min_confidence = { jev_capable = 0.95, needs_llm = 0.70 }
+
+# Tagging policies are intentionally not enabled by default. Once the selected
+# sidecar has a `tag` output head, add tuned policy entries such as:
 #
-# [task.tag]
-# labels   = ["engineering", "company_knowledge_base", "help_desk", "customer_support",
-#             "web_search", "other_company_task", "other_general_request"]
-# fallback = "defer"
+# [tier_policy.tier3.tag]
+# min_confidence = 0.85
 #
-# [task.tag.tier4]
-# min_confidence = <tuned value>
+# [tier_policy.tier4.tag]
+# min_confidence = 0.85
+#
+# Then set pipeline.tag_via_cascade = true and include the corresponding tier
+# numbers in pipeline.joint_tiers. Calibration must be measured on tagging data.
