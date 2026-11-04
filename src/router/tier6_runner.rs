@@ -49,11 +49,16 @@ impl Tier6Runner {
             return Err(DownstreamError::HttpStatus(status.as_u16(), text));
         }
 
-        let body = response
+        let mut body = response
             .json::<Value>()
             .await
             .map_err(|e| DownstreamError::Transport(e.to_string()))?;
 
+        if let Some(object) = body.as_object_mut() {
+            object.remove("context");
+        }
+
         Ok((body, start.elapsed()))
+
     }
 }
