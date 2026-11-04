@@ -56,7 +56,7 @@ impl Tier3Runner {
                 let response = response.into_inner();
                 Ok(RawScore {
                     label: response.label,
-                    confidence: response.confidence as f32,
+                    confidence: response.confidence,
                     model_id: response.model_id,
                 })
             }
