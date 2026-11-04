@@ -29,6 +29,17 @@ use crate::telemetry::{
 
 use super::{cascade::Backend, dispatch::DownstreamDispatcher};
 
+pub struct AppDependencies {
+    pub cascade: Arc<CascadeRunner>,
+    pub route_profile: TaskProfile,
+    pub tier_policies: Arc<TierPolicyMap>,
+    pub dispatcher: DownstreamDispatcher,
+    pub hashes: Hashes,
+    pub capture_tx: mpsc::Sender<RouteRecord>,
+    pub tag_queue: TagQueue,
+    pub budget: Duration,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     cascade: Arc<CascadeRunner>,
@@ -57,25 +68,16 @@ struct ChatMessage {
     content: String,
 }
 
-pub fn app(
-    cascade: Arc<CascadeRunner>,
-    route_profile: TaskProfile,
-    tier_policies: Arc<TierPolicyMap>,
-    dispatcher: DownstreamDispatcher,
-    hashes: Hashes,
-    capture_tx: mpsc::Sender<RouteRecord>,
-    tag_queue: TagQueue,
-    budget: Duration,
-) -> Router {
+pub fn app(dependencies: AppDependencies) -> Router {
     let state = AppState {
-        cascade,
-        route_profile,
-        tier_policies,
-        dispatcher: Arc::new(dispatcher),
-        hashes: Arc::new(hashes),
-        capture_tx,
-        tag_queue,
-        budget,
+        cascade: dependencies.cascade,
+        route_profile: dependencies.route_profile,
+        tier_policies: dependencies.tier_policies,
+        dispatcher: Arc::new(dependencies.dispatcher),
+        hashes: Arc::new(dependencies.hashes),
+        capture_tx: dependencies.capture_tx,
+        tag_queue: dependencies.tag_queue,
+        budget: dependencies.budget,
     };
 
     Router::new()
@@ -300,6 +302,14 @@ fn route_record(
     };
 
     let trace = route_outcome.map(|task| task.trace.as_slice()).unwrap_or(&[]);
+    for entry in trace {
+        tracing::debug!(
+            tier = entry.tier,
+            model_id = %entry.model_id,
+            decision = ?entry.decision,
+            "route task tier trace"
+        );
+    }
     let tier1_outcome = trace_for_tier(trace, 1)
         .map(tier1_record)
         .unwrap_or(Tier1Record {
