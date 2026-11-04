@@ -79,6 +79,7 @@ pub struct TierPolicy {
     pub strict: bool,
 }
 
+#[cfg(test)]
 impl TierPolicy {
     pub fn new(min_confidence: f32) -> Self {
         Self {
