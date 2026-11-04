@@ -98,6 +98,7 @@ pub enum TagResult {
 }
 
 impl From<TaggerVerdict> for TagResult {
+    
     fn from(v: TaggerVerdict) -> Self {
         match v {
             TaggerVerdict::Tagged {
@@ -154,7 +155,9 @@ pub trait Tagger: Send + Sync + 'static {
     fn model(&self) -> &str;
     fn version(&self) -> &str;
     fn taxonomy_version(&self) -> &str;
-    fn tag(&self, input: &TagInput) -> impl Future<Output = Result<TaggerOutput, TagError>> + Send;
+    // fn tag(&self, input: &TagInput) -> impl Future<Output = Result<TaggerOutput, TagError>> + Send;
+    // fn tag(&self, _: &TagInput) -> impl std::future::Future<Output = Result<TaggerOutput, TagError>> + Send;
+    fn tag(&self, _: &TagInput) -> impl ::std::future::Future<Output = Result<TaggerOutput, TagError>> + Send;
 }
 
 pub const V1_DOMAINS: [&str; 7] = [
