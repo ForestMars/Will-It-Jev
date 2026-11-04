@@ -11,7 +11,8 @@ pub fn load_from_path(path: impl AsRef<Path>) -> Result<AppConfig, Box<dyn Error
 
 fn parse(contents: &str) -> Result<AppConfig, Box<dyn Error>> {
     let config: AppConfig = toml::from_str(contents)?;
-    if ![
+
+    let any_tier_enabled = [
         config.router.tier1.enabled,
         config.router.tier2.enabled,
         config.router.tier3.enabled,
@@ -20,10 +21,15 @@ fn parse(contents: &str) -> Result<AppConfig, Box<dyn Error>> {
         config.router.tier6.enabled,
     ]
     .into_iter()
-    .any(|enabled| enabled)
-    {
+    .any(|enabled| enabled);
+
+    if !any_tier_enabled {
         return Err("at least one router tier must be enabled".into());
     }
+
+    // Task confidence thresholds now live in config/tasks.toml under
+    // [tier_policy.tierN.task]. router.toml contains only execution-tier
+    // settings, so this module validates endpoints and timeout caps only.
     for (name, tier) in [
         ("tier3", &config.router.tier3),
         ("tier4", &config.router.tier4),
@@ -31,33 +37,26 @@ fn parse(contents: &str) -> Result<AppConfig, Box<dyn Error>> {
         if !tier.enabled {
             continue;
         }
+
         if tier
             .endpoint
             .as_deref()
             .is_some_and(|endpoint| endpoint.trim().is_empty())
         {
-            return Err(anyhow::anyhow!(
+            return Err(format!(
                 "router.{name}.endpoint must be non-empty when configured"
             )
             .into());
         }
-        for (field, threshold) in [
-            ("jev_threshold", tier.jev_threshold),
-            ("llm_threshold", tier.llm_threshold),
-        ] {
-            if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
-                return Err(anyhow::anyhow!(
-                    "router.{name}.{field} must be finite and between 0 and 1"
-                )
-                .into());
-            }
-        }
-        if tier.timeout_ms == 0 {
-            return Err(
-                anyhow::anyhow!("router.{name}.timeout_ms must be greater than zero").into(),
-            );
+
+        if tier.timeout_ms == Some(0) {
+            return Err(format!(
+                "router.{name}.timeout_ms must be greater than zero"
+            )
+            .into());
         }
     }
+
     Ok(config)
 }
 
@@ -67,8 +66,10 @@ mod tests {
 
     #[test]
     fn omitted_tiers_are_disabled() {
-        let config =
-            parse("[router.tier1]\nenabled = true\n[router.tier3]\nenabled = false\n").unwrap();
+        let config = parse(
+            "[router.tier1]\nenabled = true\n[router.tier3]\nenabled = false\n",
+        )
+        .unwrap();
 
         assert!(config.router.tier1.enabled);
         assert!(!config.router.tier2.enabled);
@@ -79,30 +80,48 @@ mod tests {
     }
 
     #[test]
-    fn parses_grpc_scorer_settings() {
+    fn parses_grpc_execution_settings_without_task_thresholds() {
         let config = parse(
-			"[router.tier3]\nenabled = true\nendpoint = \"http://127.0.0.1:50052\"\njev_threshold = 0.91\nllm_threshold = 0.71\ntimeout_ms = 650\n[router.tier4]\nenabled = true\nendpoint = \"http://127.0.0.1:50051\"\njev_threshold = 0.92\nllm_threshold = 0.72\ntimeout_ms = 750\n",
-		)
-		.unwrap();
+            r#"
+            [router.tier3]
+            enabled = true
+            endpoint = "http://127.0.0.1:50052"
+            timeout_ms = 650
+
+            [router.tier4]
+            enabled = true
+            endpoint = "http://127.0.0.1:50051"
+            timeout_ms = 750
+            "#,
+        )
+        .unwrap();
+
         assert_eq!(
             config.router.tier3.endpoint.as_deref(),
             Some("http://127.0.0.1:50052")
         );
-        assert_eq!(config.router.tier3.jev_threshold, 0.91);
-        assert_eq!(config.router.tier3.llm_threshold, 0.71);
-        assert_eq!(config.router.tier3.timeout_ms, 650);
+        assert_eq!(config.router.tier3.timeout_ms, Some(650));
         assert_eq!(
             config.router.tier4.endpoint.as_deref(),
             Some("http://127.0.0.1:50051")
         );
-        assert_eq!(config.router.tier4.jev_threshold, 0.92);
-        assert_eq!(config.router.tier4.llm_threshold, 0.72);
-        assert_eq!(config.router.tier4.timeout_ms, 750);
+        assert_eq!(config.router.tier4.timeout_ms, Some(750));
     }
 
     #[test]
     fn rejects_blank_configured_scorer_endpoint() {
-        assert!(parse("[router.tier3]\nenabled = true\nendpoint = \"   \"\n").is_err());
+        assert!(parse(
+            "[router.tier3]\nenabled = true\nendpoint = \"   \"\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_zero_configured_timeout() {
+        assert!(parse(
+            "[router.tier4]\nenabled = true\ntimeout_ms = 0\n"
+        )
+        .is_err());
     }
 
     #[test]

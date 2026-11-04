@@ -13,9 +13,9 @@ pub struct RouterConfig {
     #[serde(default)]
     pub tier2: TierConfig,
     #[serde(default)]
-    pub tier3: GrpcTierConfig,
+    pub tier3: TierConfig,
     #[serde(default)]
-    pub tier4: GrpcTierConfig,
+    pub tier4: TierConfig,
     #[serde(default)]
     pub tier5: TierConfig,
     #[serde(default)]
@@ -26,26 +26,10 @@ pub struct RouterConfig {
 pub struct TierConfig {
     #[serde(default)]
     pub enabled: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-pub struct GrpcTierConfig {
-    pub enabled: bool,
+    /// gRPC scorer endpoint for tiers backed by the shared scoring protocol.
+    #[serde(default)]
     pub endpoint: Option<String>,
-    pub jev_threshold: f32,
-    pub llm_threshold: f32,
-    pub timeout_ms: u64,
-}
-
-impl Default for GrpcTierConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            endpoint: None,
-            jev_threshold: 0.95,
-            llm_threshold: 0.70,
-            timeout_ms: 500,
-        }
-    }
+    /// Per-call timeout cap in milliseconds for gRPC scorer tiers.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
