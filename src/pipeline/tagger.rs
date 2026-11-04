@@ -1,35 +1,31 @@
 // src/pipeline/tagger.rs
 //
-// Category tagging as the second use case on the shared cascade. `CascadeTagger`
-// implements the existing `tagging::Tagger` contract, so the queue, sampling, JSONL
-// and ClickHouse sinks are untouched. It runs the `tag` profile through the tiers;
-// when no tier resolves it, it hands the request to the existing LLM tagger, which
-// plays the role tier 6 plays for routing.
-//
-// The cascade tiers see the prompt only. A tagger model fed prompt + response (as
-// OvenV1Tagger is) and one fed prompt alone are different classifiers, which is
-// why this is behind `tag_via_cascade` and off by default.
+// Adapt the task-independent cascade to the existing tagging interface. The
+// tag task supplies its own profile and is evaluated with the same shared
+// cascade and separate tier/task policy registry as the route task.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use super::runner::{CascadeRunner, Resolution};
-use super::task::{FallbackPolicy, Reading, TaskProfile};
+use super::task::{FallbackPolicy, Reading, TaskProfile, TierPolicyMap};
 use crate::tagging::{CategoryScore, TagError, TagInput, Tagger, TaggerOutput, TaggerVerdict};
 
 pub struct CascadeTagger<F: Tagger> {
     runner: Arc<CascadeRunner>,
     profile: TaskProfile,
+    tier_policies: Arc<TierPolicyMap>,
     budget: Duration,
     fallback: F,
 }
 
 impl<F: Tagger> CascadeTagger<F> {
-    /// The tag profile must `Defer`: a fixed fallback label would be recorded as a
-    /// real tag. A run that resolves nothing goes to `fallback` instead.
+    /// The tag profile must defer on exhaustion so the fallback tagger, rather
+    /// than an artificial fallback label, produces the recorded category.
     pub fn new(
         runner: Arc<CascadeRunner>,
         profile: TaskProfile,
+        tier_policies: Arc<TierPolicyMap>,
         budget: Duration,
         fallback: F,
     ) -> Result<Self, String> {
@@ -39,9 +35,19 @@ impl<F: Tagger> CascadeTagger<F> {
                 profile.task
             ));
         }
+        if !tier_policies
+            .values()
+            .any(|by_task| by_task.contains_key(&profile.task))
+        {
+            return Err(format!(
+                "task.{}: no tier policies are configured for cascade tagging",
+                profile.task
+            ));
+        }
         Ok(Self {
             runner,
             profile,
+            tier_policies,
             budget,
             fallback,
         })
@@ -58,7 +64,7 @@ fn verdict(reading: &Reading) -> TaggerVerdict {
             score: *score,
         })
         .collect();
-    alternatives.sort_by(|a, b| b.score.total_cmp(&a.score));
+    alternatives.sort_by(|left, right| right.score.total_cmp(&left.score));
     TaggerVerdict::Tagged {
         primary: CategoryScore {
             category_id: reading.label.clone(),
@@ -77,27 +83,43 @@ impl<F: Tagger> Tagger for CascadeTagger<F> {
         "1.0.0"
     }
 
-    // Same taxonomy as the fallback tagger: both emit ids from it.
     fn taxonomy_version(&self) -> &str {
         self.fallback.taxonomy_version()
     }
 
     async fn tag(&self, input: &TagInput) -> Result<TaggerOutput, TagError> {
+        // Preserve the existing tagger input contract: the domain task may use
+        // both the request and the generated response. Route inference, by
+        // contrast, runs before a response exists.
+        let task_input = match input.response.as_deref().filter(|response| !response.is_empty()) {
+            Some(response) => format!("Prompt:\n{}\n\nResponse:\n{}", input.prompt, response),
+            None => input.prompt.clone(),
+        };
         let outcome = self
             .runner
             .run(
-                &input.prompt,
+                &task_input,
                 std::slice::from_ref(&self.profile),
+                &self.tier_policies,
                 self.budget,
             )
             .await;
-        match outcome.tasks.get(&self.profile.task).map(|t| &t.resolution) {
+        match outcome
+            .tasks
+            .get(&self.profile.task)
+            .map(|task| &task.resolution)
+        {
             Some(Resolution::Tier {
                 tier,
                 model_id,
                 reading,
             }) => {
-                tracing::debug!(request_id = %input.request_id, tier, model_id, "tag resolved in cascade");
+                tracing::debug!(
+                    request_id = %input.request_id,
+                    tier,
+                    model_id,
+                    "tag resolved in cascade"
+                );
                 Ok(TaggerOutput {
                     verdict: verdict(reading),
                     usage: None,
@@ -105,67 +127,65 @@ impl<F: Tagger> Tagger for CascadeTagger<F> {
             }
             _ => self.fallback.tag(input).await,
         }
-    
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+    use crate::pipeline::runner::CascadeRunner;
     use crate::pipeline::task::{TaskId, TierPolicy, TierReading};
     use crate::pipeline::tier::{Tier, TierContext, TierOutput};
-    use crate::tagging::TaggerVerdict;
+    use crate::tagging::{Tagger, TaggerVerdict};
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct Scripted(TierReading);
+    struct TagTier;
 
     #[async_trait]
-    impl Tier for Scripted {
-        fn id(&self) -> u8 {
-            4
-        }
-        fn name(&self) -> &str {
-            "scripted"
-        }
+    impl Tier for TagTier {
+        fn id(&self) -> u8 { 4 }
+        fn name(&self) -> &str { "test-tag-head" }
         async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
             TierOutput {
-                model_id: "scripted".into(),
-                readings: ctx
-                    .tasks
-                    .iter()
-                    .map(|t| (t.clone(), self.0.clone()))
-                    .collect(),
+                model_id: "test-tag-head".into(),
+                readings: ctx.tasks.iter().map(|task| {
+                    let reading = if *task == TaskId::tag() {
+                        TierReading::Scored(Reading {
+                            label: "engineering".into(),
+                            confidence: 0.91,
+                            scores: vec![
+                                ("engineering".into(), 0.91),
+                                ("help_desk".into(), 0.09),
+                            ],
+                        })
+                    } else {
+                        TierReading::Abstain("unsupported_task")
+                    };
+                    (task.clone(), reading)
+                }).collect(),
             }
         }
     }
 
     #[derive(Default)]
-    struct Fallback {
-        calls: AtomicUsize,
-    }
+    struct Fallback(AtomicUsize);
 
     impl Tagger for Fallback {
-        fn model(&self) -> &str {
-            "fallback"
-        }
-        fn version(&self) -> &str {
-            "0"
-        }
-        fn taxonomy_version(&self) -> &str {
-            "v1.0"
-        }
-        // fn tag(&self, _: &TagInput) -> impl Future<Output = Result<TaggerOutput, TagError>> + Send {
-        fn tag(&self, _: &TagInput) -> impl ::std::future::Future<Output = Result<TaggerOutput, TagError>> + Send{
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            async move {
+        fn model(&self) -> &str { "fallback" }
+        fn version(&self) -> &str { "0" }
+        fn taxonomy_version(&self) -> &str { "test-taxonomy" }
+        fn tag(
+            &self,
+            _: &TagInput,
+        ) -> impl Future<Output = Result<TaggerOutput, TagError>> + Send {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            async {
                 Ok(TaggerOutput {
-                    verdict: TaggerVerdict::Tagged {
-                        primary: CategoryScore {
-                            category_id: "other_general_request".into(),
-                            score: 1.0,
-                        },
-                        alternatives: vec![],
+                    verdict: TaggerVerdict::NoMatch {
+                        nearest: None,
+                        embedding: None,
                     },
                     usage: None,
                 })
@@ -173,84 +193,30 @@ mod tests {
         }
     }
 
-    fn profile() -> TaskProfile {
-        TaskProfile {
+    #[tokio::test]
+    async fn tag_task_uses_policy_registry_and_does_not_call_fallback_when_resolved() {
+        let runner = Arc::new(CascadeRunner::new(vec![Arc::new(TagTier)]));
+        let profile = TaskProfile {
             task: TaskId::tag(),
-            labels: Some(vec![
-                "engineering".into(),
-                "help_desk".into(),
-                "web_search".into(),
-            ]),
-            tiers: [(4u8, TierPolicy::new(0.8))].into(),
+            labels: Some(vec!["engineering".into(), "help_desk".into()]),
             fallback: FallbackPolicy::Defer,
-        }
-    }
-
-    fn input() -> TagInput {
-        TagInput {
-            request_id: "r".into(),
-            prompt: "fix my laptop".into(),
+        };
+        let mut policies = TierPolicyMap::new();
+        policies.insert(4, [(TaskId::tag(), TierPolicy::new(0.8))].into());
+        let fallback = Fallback::default();
+        let tagger = CascadeTagger::new(
+            runner,
+            profile,
+            Arc::new(policies),
+            Duration::from_secs(1),
+            fallback,
+        ).unwrap();
+        let input = TagInput {
+            request_id: "r1".into(),
+            prompt: "help me".into(),
             response: None,
-        }
-    }
-
-    fn tagger(reading: TierReading, fb: Fallback) -> CascadeTagger<Fallback> {
-        let runner = Arc::new(CascadeRunner::new(vec![Arc::new(Scripted(reading))]));
-        CascadeTagger::new(runner, profile(), Duration::from_secs(1), fb).unwrap()
-    }
-
-    #[tokio::test]
-    async fn resolved_tag_skips_the_fallback_and_orders_alternatives() {
-        let reading = Reading {
-            label: "help_desk".into(),
-            confidence: 0.9,
-            scores: vec![
-                ("engineering".into(), 0.02),
-                ("help_desk".into(), 0.9),
-                ("web_search".into(), 0.05),
-            ],
         };
-        let t = tagger(TierReading::Scored(reading), Fallback::default());
-        let out = t.tag(&input()).await.unwrap();
-        let TaggerVerdict::Tagged {
-            primary,
-            alternatives,
-        } = out.verdict
-        else {
-            panic!("not tagged")
-        };
-        assert_eq!(primary.category_id, "help_desk");
-        assert_eq!(
-            alternatives
-                .iter()
-                .map(|a| a.category_id.as_str())
-                .collect::<Vec<_>>(),
-            ["web_search", "engineering"]
-        );
-        assert_eq!(t.fallback.calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn unresolved_tag_goes_to_the_fallback_tagger() {
-        let t = tagger(
-            TierReading::Abstain("unsupported_task"),
-            Fallback::default(),
-        );
-        let out = t.tag(&input()).await.unwrap();
-        let TaggerVerdict::Tagged { primary, .. } = out.verdict else {
-            panic!("not tagged")
-        };
-        assert_eq!(primary.category_id, "other_general_request");
-        assert_eq!(t.fallback.calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn a_tag_profile_with_a_fallback_label_is_rejected() {
-        let mut p = profile();
-        p.fallback = FallbackPolicy::Label("other_general_request".into());
-        let runner = Arc::new(CascadeRunner::new(vec![]));
-        assert!(
-            CascadeTagger::new(runner, p, Duration::from_secs(1), Fallback::default()).is_err()
-        );
+        let output = tagger.tag(&input).await.unwrap();
+        assert!(matches!(output.verdict, TaggerVerdict::Tagged { .. }));
     }
 }

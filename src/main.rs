@@ -1,7 +1,6 @@
 // src/main.rs
 
 mod config;
-pub mod normalize;
 mod pipeline;
 mod router;
 mod tagging;
@@ -11,13 +10,12 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use crate::tagging::{ClickHouseRawTable, OvenV1Tagger, TagConfig};
 use pipeline::tagger::CascadeTagger;
-use pipeline::tier::{Tier, Tier3Tier};
+use pipeline::tier::{Tier, Tier1Tier, Tier2Tier, GrpcScoringTier};
 use pipeline::{CascadeRunner, TaskId};
 use router::dispatch::DownstreamDispatcher;
-// use router::service;
-use crate::router::service;
+use router::service;
 use router::tier1_runner::{Tier1Automaton, Tier1Engine};
-use router::tier2_runner::{Tier2Runner, DEFAULT_CONFIDENCE_THRESHOLD};
+use router::tier2_runner::Tier2Runner;
 use router::tier3_runner::Tier3Runner;
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -46,6 +44,52 @@ fn default_fasttext_model_path() -> String {
 
 fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
+}
+
+fn configured_endpoint(
+    name: &str,
+    legacy_names: &[&str],
+    configured: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    for candidate in std::iter::once(name).chain(legacy_names.iter().copied()) {
+        if let Ok(value) = std::env::var(candidate) {
+            return Ok(value);
+        }
+    }
+    configured
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "missing endpoint: set {name} or configure the tier endpoint in config/router.toml"
+                ),
+            )
+            .into()
+        })
+}
+
+fn configured_timeout(
+    name: &str,
+    configured_ms: Option<u64>,
+) -> Result<Duration, Box<dyn std::error::Error>> {
+    let millis = match std::env::var(name) {
+        Ok(value) => value.parse::<u64>()?,
+        Err(std::env::VarError::NotPresent) => configured_ms.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "missing timeout: set {name} or configure timeout_ms in config/router.toml"
+                ),
+            )
+        })?,
+        Err(error) => return Err(error.into()),
+    };
+    if millis == 0 {
+        return Err(format!("{name} must be greater than zero").into());
+    }
+    Ok(Duration::from_millis(millis))
 }
 
 /// Reads KEY=VALUE pairs from a dotenv-style file such as the `.auth` file devo writes.
@@ -128,9 +172,8 @@ fn clickhouse_url_with_auth(
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("failed to install SIGTERM handler");
+        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
         tokio::select! {
             result = tokio::signal::ctrl_c() => {
                 if let Err(error) = result {
@@ -161,11 +204,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing_subscriber::registry()
         .with(filter)
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_target(false)
-                .compact(),
-        )
+        .with(tracing_subscriber::fmt::layer().with_target(false).compact())
         .init();
 
     tracing::info!("Cascade Router initialized successfully");
@@ -184,15 +223,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     tracing::debug!(verbose, "startup verbosity configured");
 
+    let pipeline_config =
+        pipeline::config::load_or_default(env_or("TASKS_CONFIG", "config/tasks.toml"))?;
+    let route_profile = pipeline_config
+        .profile(&TaskId::route())
+        .ok_or("tasks.toml: missing [task.route] definition")?;
+    if !pipeline_config.has_policy(&TaskId::route()) {
+        return Err("tasks.toml: route task has no [tier_policy.tierN.route] entries".into());
+    }
+    let tier_policies = Arc::new(pipeline_config.tier_policies.clone());
+    if pipeline_config.settings.tag_via_cascade {
+        let tag_task = TaskId::tag();
+        let has_executable_tag_head = pipeline_config
+            .tier_policies
+            .iter()
+            .any(|(tier_id, by_task)| {
+                if !by_task.contains_key(&tag_task)
+                    || !pipeline_config.settings.joint_tiers.contains(tier_id)
+                {
+                    return false;
+                }
+                match tier_id {
+                    3 => config.router.tier3.enabled,
+                    4 => config.router.tier4.enabled,
+                    _ => false,
+                }
+            });
+        if !has_executable_tag_head {
+            return Err(
+                "tasks.toml: cascade tagging requires a tag policy on an enabled Tier 3 or Tier 4 sidecar listed in pipeline.joint_tiers".into(),
+            );
+        }
+    }
+
+    // ---- Build execution-tier implementations -----------------------------
     let tier1_path = env_or("TIER1_CONFIG", "config/tier1.toml");
     let tier1 = if config.router.tier1.enabled {
-        Some(Tier1Engine::new(Tier1Automaton::from_toml_file(
+        Some(Arc::new(Tier1Engine::new(Tier1Automaton::from_toml_file(
             &tier1_path,
-        )?)?)
+        )?)?))
     } else {
         tracing::info!("tier 1 disabled by configuration");
         None
     };
+
     let model_path = if config.router.tier2.enabled {
         Some(std::env::var("FASTTEXT_MODEL").unwrap_or_else(|_| default_fasttext_model_path()))
     } else {
@@ -211,8 +285,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let tier2 = model_path
         .as_deref()
-        .map(|path| Tier2Runner::new(path, DEFAULT_CONFIDENCE_THRESHOLD))
+        .map(|path| Tier2Runner::new(path).map(Arc::new))
         .transpose()?;
+
     let hashes = telemetry::Hashes {
         tier1_toml: if tier1.is_some() {
             sha256_file(&tier1_path)?
@@ -224,56 +299,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => "disabled".into(),
         },
     };
-    let pipeline_config =
-        pipeline::config::load_or_default(env_or("TASKS_CONFIG", "config/tasks.toml"))?;
-    let modernbert = if config.router.tier3.enabled {
-        Some(Tier3Runner::new(
-            env_or(
-                "MODERNBERT_ENDPOINT",
-                config
-                    .router
-                    .tier3
-                    .endpoint
-                    .as_deref()
-                    .unwrap_or("http://[::1]:50052"),
-            ),
-            config.router.tier3.jev_threshold,
-            config.router.tier3.llm_threshold,
-            Duration::from_millis(config.router.tier3.timeout_ms),
-        )?)
+
+    // Tier 3 and Tier 4 are separate cascade positions backed by the same gRPC
+    // scorer implementation. The sidecar/model is selected by endpoint; neither
+    // the task definitions nor the cascade runner are model-specific.
+    let tier3_scorer = if config.router.tier3.enabled {
+        let endpoint = configured_endpoint(
+            "TIER3_SCORER_ENDPOINT",
+            &["MODERNBERT_ENDPOINT"],
+            config.router.tier3.endpoint.as_deref(),
+        )?;
+        let timeout = configured_timeout(
+            "TIER3_MAX_CALL_MS",
+            config.router.tier3.timeout_ms,
+        )?;
+        Some(Tier3Runner::new(endpoint, timeout)?)
     } else {
         tracing::info!("tier 3 disabled by configuration");
         None
     };
-    // Tier 4 is a cascade position, not a model identity. Use a distinct
-    // variable so it cannot collide with the existing downstream TIER4_ENDPOINT.
-    let tier4_endpoint = std::env::var("TIER4_GRPC_ENDPOINT")
-        .or_else(|_| std::env::var("TIER4_HARRIER_ENDPOINT"))
-        .or_else(|_| std::env::var("TIER3_ENDPOINT"))
-        .unwrap_or_else(|_| {
-            config
-                .router
-                .tier4
-                .endpoint
-                .as_deref()
-                .unwrap_or("http://[::1]:50051")
-                .to_string()
-        });
-    let tier4 = if config.router.tier4.enabled {
-        Some(Tier3Runner::new(
-            tier4_endpoint,
-            config.router.tier4.jev_threshold,
-            config.router.tier4.llm_threshold,
-            Duration::from_millis(config.router.tier4.timeout_ms),
-        )?)
+
+    let tier4_scorer = if config.router.tier4.enabled {
+        let endpoint = configured_endpoint(
+            "TIER4_SCORER_ENDPOINT",
+            &["TIER4_HARRIER_ENDPOINT", "TIER3_ENDPOINT"],
+            config.router.tier4.endpoint.as_deref(),
+        )?;
+        let timeout = configured_timeout(
+            "TIER4_MAX_CALL_MS",
+            config.router.tier4.timeout_ms,
+        )?;
+        Some(Tier3Runner::new(endpoint, timeout)?)
     } else {
         tracing::info!("tier 4 disabled by configuration");
         None
     };
 
-    // Handles for the tagging cascade; the originals move into the router below.
-    let tag_tier3 = modernbert.clone();
-    let tag_tier4 = tier4.clone();
+    // ---- Construct the single task-independent cascade --------------------
+    let joint_tiers = &pipeline_config.settings.joint_tiers;
+    let mut tiers: Vec<Arc<dyn Tier>> = Vec::new();
+    if let Some(engine) = tier1 {
+        tiers.push(Arc::new(Tier1Tier::new(engine)));
+    }
+    if let Some(runner) = tier2 {
+        tiers.push(Arc::new(Tier2Tier::new(runner)));
+    }
+    if let Some(runner) = tier3_scorer {
+        tiers.push(Arc::new(GrpcScoringTier::new(
+            3,
+            "tier3-grpc",
+            runner,
+            joint_tiers.contains(&3),
+        )));
+    }
+    if let Some(runner) = tier4_scorer {
+        tiers.push(Arc::new(GrpcScoringTier::new(
+            4,
+            "tier4-grpc",
+            runner,
+            joint_tiers.contains(&4),
+        )));
+    }
+    let cascade = Arc::new(CascadeRunner::new(tiers));
 
     let downstream_timeout =
         Duration::from_millis(env_or("DOWNSTREAM_TIMEOUT_MS", "120000").parse()?);
@@ -307,7 +394,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         clickhouse_password_set = clickhouse_password.is_some(),
         "resolved ClickHouse credentials"
     );
-    let (capture_tx, mut capture_rx) = tokio::sync::mpsc::channel::<telemetry::RouteRecord>(1024);
+
+    let (capture_tx, mut capture_rx) =
+        tokio::sync::mpsc::channel::<telemetry::RouteRecord>(1024);
     let capture_task = tokio::spawn(async move {
         tokio::fs::create_dir_all("logs").await?;
         let mut file = OpenOptions::new()
@@ -360,62 +449,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_age: Duration::from_secs(60),
         sample_prob: env_or("TAG_SAMPLE_PROB", "1.0").parse()?,
     };
+
     let (tag_queue, tag_handle) = if pipeline_config.settings.tag_via_cascade {
-        // Tagging as the second use case on the shared tiers (tiers 3 and 4 are the
-        // only ones that can carry a tagging head).
-        let profile = pipeline_config
-            .profile(&TaskId::tag())
-            .ok_or("tasks.toml: tag_via_cascade = true but there is no [task.tag] profile")?;
-        let joint = &pipeline_config.settings.joint_tiers;
-        let mut tiers: Vec<Arc<dyn Tier>> = Vec::new();
-        if let Some(runner) = tag_tier3.clone() {
-            tiers.push(Arc::new(Tier3Tier::new(
-                3,
-                "modernbert",
-                runner,
-                joint.contains(&3),
-            )));
-        }
-        if let Some(runner) = tag_tier4.clone() {
-            tiers.push(Arc::new(Tier3Tier::new(
-                4,
-                "tier4",
-                runner,
-                joint.contains(&4),
-            )));
-        }
-        let available: Vec<u8> = tiers.iter().map(|tier| tier.id()).collect();
-        if let Some(missing) = profile.tiers.keys().find(|tier| !available.contains(tier)) {
-            return Err(format!(
-                "tasks.toml: task.tag lists tier{missing}, which is disabled or cannot serve tagging"
-            )
-            .into());
+        let profile = pipeline_config.profile(&TaskId::tag()).ok_or(
+            "tasks.toml: tag_via_cascade = true but there is no [task.tag] profile",
+        )?;
+        if !pipeline_config.has_policy(&TaskId::tag()) {
+            return Err(
+                "tasks.toml: tag_via_cascade = true but no [tier_policy.tierN.tag] policy is configured"
+                    .into(),
+            );
         }
         let tagger = Arc::new(CascadeTagger::new(
-            Arc::new(CascadeRunner::new(tiers)),
+            cascade.clone(),
             profile,
+            tier_policies.clone(),
             Duration::from_millis(pipeline_config.settings.tag_budget_ms),
             ollama_tagger,
         )?);
-        tracing::info!("task tagging runs through the shared cascade tiers");
+        tracing::info!("task tagging runs through the shared task-independent cascade");
         tagging::spawn(tagger, tag_config)
     } else {
         tagging::spawn(Arc::new(ollama_tagger), tag_config)
     };
 
-    let app = service::app(
-        service::RouterTiers {
-            tier1,
-            tier2,
-            tier3: modernbert,
-            tier4,
-        },
+    let app = service::app(service::AppDependencies {
+        cascade,
+        route_profile,
+        tier_policies,
         dispatcher,
         hashes,
-        capture_tx.clone(),
-        tag_queue.clone(),
-        Duration::from_millis(env_or("ROUTER_BUDGET_MS", "600").parse()?),
-    );
+        capture_tx: capture_tx.clone(),
+        tag_queue: tag_queue.clone(),
+        budget: Duration::from_millis(env_or("ROUTER_BUDGET_MS", "600").parse()?),
+    });
     let bind_address = env_or("ROUTER_BIND", "127.0.0.1:8080");
     let listener = tokio::net::TcpListener::bind(&bind_address).await?;
     tracing::info!(address = %listener.local_addr()?, "gateway listening");

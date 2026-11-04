@@ -7,15 +7,11 @@ enabled = true
 [router.tier3]
 enabled = true
 endpoint = "http://[::1]:50052"
-jev_threshold = 0.95
-llm_threshold = 0.70
 timeout_ms = 500
 
 [router.tier4]
 enabled = true
 endpoint = "http://[::1]:50051"
-jev_threshold = 0.95
-llm_threshold = 0.70
 timeout_ms = 500
 
 [router.tier5]
