@@ -14,7 +14,8 @@ use pipeline::tagger::CascadeTagger;
 use pipeline::tier::{Tier, Tier3Tier};
 use pipeline::{CascadeRunner, TaskId};
 use router::dispatch::DownstreamDispatcher;
-use router::service;
+// use router::service;
+use crate::router::service;
 use router::tier1_runner::{Tier1Automaton, Tier1Engine};
 use router::tier2_runner::{Tier2Runner, DEFAULT_CONFIDENCE_THRESHOLD};
 use router::tier3_runner::Tier3Runner;
@@ -403,18 +404,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let app = service::app(
-    service::RouterTiers {
-        tier1: tier1,
-        tier2: tier2,
-        tier3: modernbert,
-        tier4: tier4,
-    },
-    dispatcher,
-    hashes,
-    capture_tx.clone(),
-    tag_queue.clone(),
-    Duration::from_millis(env_or("ROUTER_BUDGET_MS", "600").parse()?),
-);
+        service::RouterTiers {
+            tier1,
+            tier2,
+            tier3: modernbert,
+            tier4,
+        },
+        dispatcher,
+        hashes,
+        capture_tx.clone(),
+        tag_queue.clone(),
+        Duration::from_millis(env_or("ROUTER_BUDGET_MS", "600").parse()?),
+    );
     let bind_address = env_or("ROUTER_BIND", "127.0.0.1:8080");
     let listener = tokio::net::TcpListener::bind(&bind_address).await?;
     tracing::info!(address = %listener.local_addr()?, "gateway listening");
