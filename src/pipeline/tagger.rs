@@ -10,7 +10,6 @@
 // OvenV1Tagger is) and one fed prompt alone are different classifiers, which is
 // why this is behind `tag_via_cascade` and off by default.
 
-use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -156,9 +155,10 @@ mod tests {
         fn taxonomy_version(&self) -> &str {
             "v1.0"
         }
-        fn tag(&self, _: &TagInput) -> impl Future<Output = Result<TaggerOutput, TagError>> + Send {
+        // fn tag(&self, _: &TagInput) -> impl Future<Output = Result<TaggerOutput, TagError>> + Send {
+        fn tag(&self, _: &TagInput) -> impl ::std::future::Future<Output = Result<TaggerOutput, TagError>> + Send{
             self.calls.fetch_add(1, Ordering::SeqCst);
-            async {
+            async move {
                 Ok(TaggerOutput {
                     verdict: TaggerVerdict::Tagged {
                         primary: CategoryScore {
