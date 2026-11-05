@@ -94,7 +94,8 @@ impl TaskRunStore {
         let Some(entry) = entries.get(run_id) else {
             return Ok(TaskRunLookup::Missing);
         };
-        Ok(match entry.result.borrow().clone() {
+        let result = entry.result.borrow().clone();
+        Ok(match result {
             None => TaskRunLookup::Pending,
             Some(Ok(outcome)) => TaskRunLookup::Complete(outcome),
             Some(Err(error)) => TaskRunLookup::Failed(error),
