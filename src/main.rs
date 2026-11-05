@@ -482,6 +482,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = service::app(service::AppDependencies {
         cascade,
+        task_profiles: pipeline_config.profiles(),
         route_profile,
         tier_policies,
         dispatcher,

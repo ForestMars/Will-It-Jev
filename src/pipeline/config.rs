@@ -94,6 +94,11 @@ impl PipelineConfig {
         self.profiles.get(task).cloned()
     }
 
+    /// All configured task contracts, returned in stable task-ID order.
+    pub fn profiles(&self) -> Vec<TaskProfile> {
+        self.profiles.values().cloned().collect()
+    }
+
     pub fn has_policy(&self, task: &TaskId) -> bool {
         self.tier_policies
             .values()

@@ -33,6 +33,8 @@ use super::{cascade::Backend, dispatch::DownstreamDispatcher};
 
 pub struct AppDependencies {
     pub cascade: Arc<CascadeRunner>,
+    /// All configured task contracts, used by the generic task execution API.
+    pub task_profiles: Vec<TaskProfile>,
     pub route_profile: TaskProfile,
     pub tier_policies: Arc<TierPolicyMap>,
     pub dispatcher: DownstreamDispatcher,
@@ -81,6 +83,12 @@ struct ChatMessage {
 }
 
 pub fn app(dependencies: AppDependencies) -> Router {
+    let task_api = super::task_api::router(
+        Arc::clone(&dependencies.cascade),
+        dependencies.task_profiles,
+        Arc::clone(&dependencies.tier_policies),
+        dependencies.budget,
+    );
     let state = AppState {
         cascade: dependencies.cascade,
         route_profile: dependencies.route_profile,
@@ -102,6 +110,7 @@ pub fn app(dependencies: AppDependencies) -> Router {
         .route("/v1/completions", post(completion))
         .route("/v1/chat/completions", post(completion))
         .route("/v1/decisions", post(completion))
+        .nest("/v1/tasks", task_api)
         .with_state(state)
 }
 
