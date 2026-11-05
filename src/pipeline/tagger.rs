@@ -4,128 +4,133 @@
 // tag task supplies its own profile and is evaluated with the same shared
 // cascade and separate tier/task policy registry as the route task.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use super::runner::{CascadeRunner, Resolution};
-use super::task::{FallbackPolicy, Reading, TaskProfile, TierPolicyMap};
-use crate::tagging::{CategoryScore, TagError, TagInput, Tagger, TaggerOutput, TaggerVerdict};
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+
+use super::runner::{Resolution, RunOutcome};
+use super::task::{Reading, TaskId};
+use crate::tagging::{CategoryScore, TaskDecisionMetadata, TagError, TagInput, Tagger, TaggerOutput, TaggerVerdict};
+
+struct JointEntry {
+    receiver: oneshot::Receiver<Result<RunOutcome, ()>>,
+    expires_at: Instant,
+}
+
+/// Request-ID keyed handoff from the route handler to asynchronous tag persistence.
+/// The store carries an outcome from the existing cascade; it never starts inference.
+#[derive(Clone, Default)]
+pub struct JointTagStore {
+    entries: Arc<Mutex<HashMap<String, JointEntry>>>,
+}
+
+impl JointTagStore {
+    pub fn register(&self, request_id: String, done: JoinHandle<RunOutcome>, ttl: Duration) {
+        let (sender, receiver) = oneshot::channel();
+        let entry = JointEntry { receiver, expires_at: Instant::now() + ttl };
+        {
+            let mut entries = self.entries.lock().expect("joint tag store mutex poisoned");
+            entries.retain(|_, value| value.expires_at > Instant::now());
+            entries.insert(request_id, entry);
+        }
+        tokio::spawn(async move {
+            let result = done.await.map_err(|_| ());
+            let _ = sender.send(result);
+        });
+    }
+
+    /// Ok(None) means this request was not included in a joint cascade and may
+    /// use the legacy tagger. Timeout means it was included but has not finished;
+    /// in that case a second inference must not be launched.
+    pub async fn take(&self, request_id: &str, timeout: Duration) -> Result<Option<RunOutcome>, TagError> {
+        let entry = {
+            let mut entries = self.entries.lock()
+                .map_err(|_| TagError::Failed("joint tag store mutex poisoned".into()))?;
+            entries.retain(|_, value| value.expires_at > Instant::now());
+            entries.remove(request_id)
+        };
+        let Some(entry) = entry else { return Ok(None) };
+        match tokio::time::timeout(timeout, entry.receiver).await {
+            Err(_) => Err(TagError::Timeout),
+            Ok(Err(_)) | Ok(Ok(Err(()))) => {
+                Err(TagError::Failed("joint cascade task terminated before tag persistence".into()))
+            }
+            Ok(Ok(Ok(outcome))) => Ok(Some(outcome)),
+        }
+    }
+}
 
 pub struct CascadeTagger<F: Tagger> {
-    runner: Arc<CascadeRunner>,
-    profile: TaskProfile,
-    tier_policies: Arc<TierPolicyMap>,
+    store: JointTagStore,
     budget: Duration,
+    taxonomy_version: String,
+    output_kind: String,
     fallback: F,
 }
 
 impl<F: Tagger> CascadeTagger<F> {
-    /// The tag profile must defer on exhaustion so the fallback tagger, rather
-    /// than an artificial fallback label, produces the recorded category.
     pub fn new(
-        runner: Arc<CascadeRunner>,
-        profile: TaskProfile,
-        tier_policies: Arc<TierPolicyMap>,
+        store: JointTagStore,
         budget: Duration,
+        taxonomy_version: impl Into<String>,
+        output_kind: impl Into<String>,
         fallback: F,
-    ) -> Result<Self, String> {
-        if profile.fallback != FallbackPolicy::Defer {
-            return Err(format!(
-                "task.{}: a tagging profile must use fallback = \"defer\"",
-                profile.task
-            ));
-        }
-        if !tier_policies
-            .values()
-            .any(|by_task| by_task.contains_key(&profile.task))
-        {
-            return Err(format!(
-                "task.{}: no tier policies are configured for cascade tagging",
-                profile.task
-            ));
-        }
-        Ok(Self {
-            runner,
-            profile,
-            tier_policies,
+    ) -> Self {
+        Self {
+            store,
             budget,
+            taxonomy_version: taxonomy_version.into(),
+            output_kind: output_kind.into(),
             fallback,
-        })
+        }
     }
 }
 
 fn verdict(reading: &Reading) -> TaggerVerdict {
-    let mut alternatives: Vec<CategoryScore> = reading
-        .scores
-        .iter()
-        .filter(|(label, _)| *label != reading.label)
-        .map(|(label, score)| CategoryScore {
-            category_id: label.clone(),
-            score: *score,
-        })
+    let mut alternatives: Vec<CategoryScore> = reading.scores.iter()
+        .filter(|(label, _)| label.as_str() != reading.label.as_str())
+        .map(|(label, score)| CategoryScore { category_id: label.clone(), score: *score })
         .collect();
     alternatives.sort_by(|left, right| right.score.total_cmp(&left.score));
     TaggerVerdict::Tagged {
-        primary: CategoryScore {
-            category_id: reading.label.clone(),
-            score: reading.confidence,
-        },
+        primary: CategoryScore { category_id: reading.label.clone(), score: reading.confidence },
         alternatives,
     }
 }
 
 impl<F: Tagger> Tagger for CascadeTagger<F> {
-    fn model(&self) -> &str {
-        "oven-cascade-tagger-v1"
-    }
-
-    fn version(&self) -> &str {
-        "1.0.0"
-    }
-
-    fn taxonomy_version(&self) -> &str {
-        self.fallback.taxonomy_version()
-    }
+    fn model(&self) -> &str { "oven-joint-cascade-tagger-v1" }
+    fn version(&self) -> &str { "1.0.0" }
+    fn taxonomy_version(&self) -> &str { &self.taxonomy_version }
 
     async fn tag(&self, input: &TagInput) -> Result<TaggerOutput, TagError> {
-        // Preserve the existing tagger input contract: the domain task may use
-        // both the request and the generated response. Route inference, by
-        // contrast, runs before a response exists.
-        let task_input = match input.response.as_deref().filter(|response| !response.is_empty()) {
-            Some(response) => format!("Prompt:\n{}\n\nResponse:\n{}", input.prompt, response),
-            None => input.prompt.clone(),
+        let Some(outcome) = self.store.take(&input.request_id, self.budget).await? else {
+            return self.fallback.tag(input).await;
         };
-        let outcome = self
-            .runner
-            .run(
-                &task_input,
-                std::slice::from_ref(&self.profile),
-                &self.tier_policies,
-                self.budget,
-            )
-            .await;
-        match outcome
-            .tasks
-            .get(&self.profile.task)
-            .map(|task| &task.resolution)
-        {
-            Some(Resolution::Tier {
-                tier,
-                model_id,
-                reading,
-            }) => {
-                tracing::debug!(
-                    request_id = %input.request_id,
-                    tier,
-                    model_id,
-                    "tag resolved in cascade"
-                );
+        match outcome.tasks.get(&TaskId::tag()).map(|task| &task.resolution) {
+            Some(Resolution::Tier { tier, model_id, reading }) => {
+                tracing::debug!(request_id = %input.request_id, tier, model_id,
+                    "tag decision reused from request cascade");
                 Ok(TaggerOutput {
                     verdict: verdict(reading),
                     usage: None,
+                    decision: Some(TaskDecisionMetadata {
+                        task_id: TaskId::tag().as_str().to_string(),
+                        output_kind: self.output_kind.clone(),
+                        resolving_tier: Some(*tier),
+                        model_id: Some(model_id.clone()),
+                        scores: reading.scores.iter().map(|(category_id, score)| {
+                            CategoryScore { category_id: category_id.clone(), score: *score }
+                        }).collect(),
+                    }),
                 })
             }
-            _ => self.fallback.tag(input).await,
+            _ => Err(TagError::Failed(
+                "tag task was included in the joint cascade but did not resolve".into()
+            )),
         }
     }
 }
@@ -134,89 +139,63 @@ impl<F: Tagger> Tagger for CascadeTagger<F> {
 mod tests {
     use super::*;
     use std::future::Future;
-    use crate::pipeline::runner::CascadeRunner;
-    use crate::pipeline::task::{TaskId, TierPolicy, TierReading};
-    use crate::pipeline::tier::{Tier, TierContext, TierOutput};
+    use crate::pipeline::runner::{RunOutcome, TaskOutcome};
+    use crate::pipeline::task::TaskId;
+    use crate::pipeline::runner::Resolution;
     use crate::tagging::{Tagger, TaggerVerdict};
-    use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct TagTier;
-
-    #[async_trait]
-    impl Tier for TagTier {
-        fn id(&self) -> u8 { 4 }
-        fn name(&self) -> &str { "test-tag-head" }
-        async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
-            TierOutput {
-                model_id: "test-tag-head".into(),
-                readings: ctx.tasks.iter().map(|task| {
-                    let reading = if *task == TaskId::tag() {
-                        TierReading::Scored(Reading {
-                            label: "engineering".into(),
-                            confidence: 0.91,
-                            scores: vec![
-                                ("engineering".into(), 0.91),
-                                ("help_desk".into(), 0.09),
-                            ],
-                        })
-                    } else {
-                        TierReading::Abstain("unsupported_task")
-                    };
-                    (task.clone(), reading)
-                }).collect(),
-            }
-        }
-    }
 
     #[derive(Default)]
     struct Fallback(AtomicUsize);
-
     impl Tagger for Fallback {
         fn model(&self) -> &str { "fallback" }
         fn version(&self) -> &str { "0" }
         fn taxonomy_version(&self) -> &str { "test-taxonomy" }
-        fn tag(
-            &self,
-            _: &TagInput,
-        ) -> impl Future<Output = Result<TaggerOutput, TagError>> + Send {
+        fn tag(&self, _: &TagInput) -> impl Future<Output = Result<TaggerOutput, TagError>> + Send {
             self.0.fetch_add(1, Ordering::SeqCst);
-            async {
-                Ok(TaggerOutput {
-                    verdict: TaggerVerdict::NoMatch {
-                        nearest: None,
-                        embedding: None,
-                    },
-                    usage: None,
-                })
-            }
+            async { Ok(TaggerOutput {
+                verdict: TaggerVerdict::NoMatch { nearest: None, embedding: None },
+                usage: None,
+                decision: None,
+            }) }
         }
     }
 
     #[tokio::test]
-    async fn tag_task_uses_policy_registry_and_does_not_call_fallback_when_resolved() {
-        let runner = Arc::new(CascadeRunner::new(vec![Arc::new(TagTier)]));
-        let profile = TaskProfile {
-            task: TaskId::tag(),
-            labels: Some(vec!["engineering".into(), "help_desk".into()]),
-            fallback: FallbackPolicy::Defer,
+    async fn missing_joint_entry_uses_legacy_fallback() {
+        let tagger = CascadeTagger::new(JointTagStore::default(), Duration::from_secs(1), "1.1.0", "multiclass", Fallback::default());
+        let input = TagInput { request_id: "not-joint".into(), prompt: "help".into(), response: None };
+        let result = tagger.tag(&input).await.unwrap();
+        assert!(matches!(result.verdict, TaggerVerdict::NoMatch { .. }));
+    }
+
+    #[tokio::test]
+    async fn requested_joint_tag_is_reused_by_request_id() {
+        let store = JointTagStore::default();
+        let outcome = RunOutcome {
+            tasks: [(
+                TaskId::tag(),
+                TaskOutcome {
+                    resolution: Resolution::Tier {
+                        tier: 3,
+                        model_id: "shared-encoder".into(),
+                        reading: Reading {
+                            label: "help_desk".into(),
+                            confidence: 0.91,
+                            scores: vec![("help_desk".into(), 0.91), ("engineering".into(), 0.09)],
+                        },
+                    },
+                    trace: Vec::new(),
+                },
+            )].into(),
+            tier_calls: Vec::new(),
         };
-        let mut policies = TierPolicyMap::new();
-        policies.insert(4, [(TaskId::tag(), TierPolicy::new(0.8))].into());
-        let fallback = Fallback::default();
-        let tagger = CascadeTagger::new(
-            runner,
-            profile,
-            Arc::new(policies),
-            Duration::from_secs(1),
-            fallback,
-        ).unwrap();
-        let input = TagInput {
-            request_id: "r1".into(),
-            prompt: "help me".into(),
-            response: None,
-        };
-        let output = tagger.tag(&input).await.unwrap();
-        assert!(matches!(output.verdict, TaggerVerdict::Tagged { .. }));
+        let done = tokio::spawn(async move { outcome });
+        store.register("joint-1".into(), done, Duration::from_secs(1));
+        let tagger = CascadeTagger::new(store, Duration::from_secs(1), "1.1.0", "multiclass", Fallback::default());
+        let input = TagInput { request_id: "joint-1".into(), prompt: "help".into(), response: None };
+        let result = tagger.tag(&input).await.unwrap();
+        assert!(matches!(result.verdict,
+            TaggerVerdict::Tagged { primary, .. } if primary.category_id == "help_desk"));
     }
 }

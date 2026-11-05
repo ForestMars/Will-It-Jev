@@ -3,6 +3,7 @@ from concurrent import futures
 from pathlib import Path
 
 import grpc
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "sidecars" / "common"))
 
@@ -32,13 +33,13 @@ class Joint:
     def score_tasks(self, prompt, tasks):
         self.calls += 1
         readings = {
-            "route": ("needs_llm", 0.8, [("jev_capable", 0.2), ("needs_llm", 0.8)]),
-            "tag": ("help_desk", 0.7, [("help_desk", 0.7), ("engineering", 0.3)]),
+            "route": ("needs_llm", 0.8, [("jev_capable", 0.2), ("needs_llm", 0.8)], "binary"),
+            "tag": ("help_desk", 0.7, [("help_desk", 0.7), ("engineering", 0.3)], "multiclass"),
         }
         return {t: readings[t] for t in tasks if t in readings}
 
 
-def call(model, tasks):
+def call(model, tasks, task_specs=()):
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
     tier3_pb2_grpc.add_Tier3ScorerServicer_to_server(
         Tier3Servicer(model, Identity(), "m"), server
@@ -48,7 +49,7 @@ def call(model, tasks):
     try:
         with grpc.insecure_channel(f"127.0.0.1:{port}") as channel:
             stub = tier3_pb2_grpc.Tier3ScorerStub(channel)
-            return stub.ScoreTasks(tier3_pb2.ScoreTasksRequest(prompt="x", tasks=tasks))
+            return stub.ScoreTasks(tier3_pb2.ScoreTasksRequest(prompt="x", tasks=tasks, task_specs=task_specs))
     finally:
         server.stop(0)
 
@@ -60,6 +61,8 @@ def test_joint_model_serves_both_tasks_with_one_call():
     by_task = {r.task: r for r in resp.results}
     assert by_task["route"].label == "needs_llm"
     assert by_task["tag"].label == "help_desk"
+    assert by_task["route"].output_kind == tier3_pb2.BINARY
+    assert by_task["tag"].output_kind == tier3_pb2.MULTICLASS
     assert [(s.label, round(s.score, 2)) for s in by_task["tag"].scores] == [
         ("help_desk", 0.7),
         ("engineering", 0.3),
@@ -77,3 +80,52 @@ def test_route_only_model_answers_route_and_rejects_the_rest():
     resp = call(RouteOnly(), ["route", "tag"])
     assert [(r.task, r.label) for r in resp.results] == [("route", "jev_capable")]
     assert list(resp.unsupported) == ["tag"]
+
+
+class NeedsLLM:
+    def score(self, prompt):
+        return 0.2
+
+
+def test_needs_llm_confidence_is_probability_of_selected_class():
+    servicer = Tier3Servicer(NeedsLLM(), Identity(), "test")
+    response = servicer.Score(tier3_pb2.ScoreRequest(prompt="x"), context=None)
+
+    assert response.label == "needs_llm"
+    assert response.confidence == pytest.approx(0.8)
+
+
+def test_route_only_legacy_model_declares_binary_output_kind():
+    response = call(RouteOnly(), ["route", "tag"])
+    assert response.results[0].output_kind == tier3_pb2.BINARY
+
+
+def test_task_specs_reject_a_head_with_the_wrong_output_kind():
+    spec = tier3_pb2.TaskSpec(
+        task="tag",
+        output_kind=tier3_pb2.MULTILABEL,
+        labels=[
+            tier3_pb2.TaskLabel(id="help_desk", name="Help desk"),
+            tier3_pb2.TaskLabel(id="engineering", name="Engineering"),
+        ],
+        taxonomy_version="1.1.0",
+    )
+    response = call(Joint(), ["tag"], [spec])
+
+    assert list(response.results) == []
+    assert list(response.unsupported) == ["tag"]
+
+
+def test_task_specs_reject_a_stale_label_space():
+    spec = tier3_pb2.TaskSpec(
+        task="tag",
+        output_kind=tier3_pb2.MULTICLASS,
+        labels=[
+            tier3_pb2.TaskLabel(id="new_label", name="New label"),
+        ],
+        taxonomy_version="2.0.0",
+    )
+    response = call(Joint(), ["tag"], [spec])
+
+    assert list(response.results) == []
+    assert list(response.unsupported) == ["tag"]

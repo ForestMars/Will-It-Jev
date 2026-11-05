@@ -9,13 +9,16 @@ use std::{error::Error, fs, path::Path};
 
 use serde::Deserialize;
 
-use super::task::{FallbackPolicy, TaskId, TaskProfile, TierPolicy, TierPolicyMap};
+use super::task::{FallbackPolicy, OutputKind, TaskId, TaskLabelMetadata, TaskProfile, TierPolicy, TierPolicyMap};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineSettings {
     #[serde(default)]
     pub tag_via_cascade: bool,
+    /// Include sampled tagging as a best-effort task in the route request's cascade.
+    #[serde(default)]
+    pub tag_in_request: bool,
     #[serde(default = "default_tag_budget_ms")]
     pub tag_budget_ms: u64,
     /// Execution tiers whose sidecars implement the joint ScoreTasks RPC.
@@ -31,6 +34,7 @@ impl Default for PipelineSettings {
     fn default() -> Self {
         Self {
             tag_via_cascade: false,
+            tag_in_request: false,
             tag_budget_ms: default_tag_budget_ms(),
             joint_tiers: Vec::new(),
         }
@@ -41,8 +45,30 @@ impl Default for PipelineSettings {
 #[serde(deny_unknown_fields)]
 struct RawProfile {
     labels: Option<Vec<String>>,
+    #[serde(default)]
+    output_kind: OutputKind,
+    taxonomy: Option<String>,
     fallback: Option<String>,
     fallback_label: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTaxonomy {
+    version: String,
+    categories: Vec<RawCategory>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCategory {
+    name: String,
+    #[serde(default)]
+    desc: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    classifier_criterion: String,
+    #[serde(default)]
+    group_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -96,14 +122,41 @@ pub fn load_or_default(path: impl AsRef<Path>) -> Result<PipelineConfig, Box<dyn
     if !path.exists() {
         return parse("");
     }
-    parse(&fs::read_to_string(path)?)
+    let contents = fs::read_to_string(path)?;
+    parse_with_base(&contents, path.parent().unwrap_or_else(|| Path::new(".")))
 }
 
 pub fn parse(contents: &str) -> Result<PipelineConfig, Box<dyn Error>> {
+    parse_with_base(contents, Path::new("."))
+}
+
+fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dyn Error>> {
     let raw: RawFile = toml::from_str(contents)?;
     let mut profiles = BTreeMap::new();
 
     for (name, profile) in raw.task {
+        // Taxonomy labels and descriptions are canonical source data. Inline
+        // labels remain supported for small non-taxonomy tasks such as route.
+        let (labels, label_metadata, taxonomy_version) = if let Some(taxonomy_path) = &profile.taxonomy {
+            let taxonomy_file = base.join(taxonomy_path);
+            let taxonomy: RawTaxonomy = serde_json::from_str(&fs::read_to_string(&taxonomy_file)?)
+                .map_err(|error| format!("task.{name}: failed to load {}: {error}", taxonomy_file.display()))?;
+            let mut labels = Vec::with_capacity(taxonomy.categories.len());
+            let mut metadata = Vec::with_capacity(taxonomy.categories.len());
+            for category in taxonomy.categories {
+                labels.push(category.name.clone());
+                metadata.push(TaskLabelMetadata {
+                    id: category.name,
+                    name: category.desc,
+                    description: category.description,
+                    classifier_criterion: category.classifier_criterion,
+                    group_id: category.group_id,
+                });
+            }
+            (Some(labels), metadata, Some(taxonomy.version))
+        } else {
+            (profile.labels.clone(), Vec::new(), None)
+        };
         let fallback = match (profile.fallback.as_deref(), profile.fallback_label) {
             (None | Some("defer"), None) => FallbackPolicy::Defer,
             (None, Some(label)) => FallbackPolicy::Label(label),
@@ -120,13 +173,13 @@ pub fn parse(contents: &str) -> Result<PipelineConfig, Box<dyn Error>> {
                 .into())
             }
         };
-        if let Some(labels) = &profile.labels {
+        if let Some(labels) = &labels {
             let unique: std::collections::BTreeSet<_> = labels.iter().collect();
             if unique.len() != labels.len() || labels.iter().any(|label| label.trim().is_empty()) {
                 return Err(format!("task.{name}: labels must be non-empty and unique").into());
             }
         }
-        if let (Some(labels), FallbackPolicy::Label(label)) = (&profile.labels, &fallback) {
+        if let (Some(labels), FallbackPolicy::Label(label)) = (&labels, &fallback) {
             if !labels.contains(label) {
                 return Err(format!("task.{name}: fallback label {label:?} is not in labels").into());
             }
@@ -136,7 +189,10 @@ pub fn parse(contents: &str) -> Result<PipelineConfig, Box<dyn Error>> {
             task.clone(),
             TaskProfile {
                 task,
-                labels: profile.labels,
+                output_kind: profile.output_kind,
+                labels,
+                label_metadata,
+                taxonomy_version,
                 fallback,
             },
         );
@@ -194,6 +250,7 @@ mod tests {
     fn empty_config_does_not_invent_tasks_or_tier_policies() {
         let cfg = parse("").unwrap();
         assert!(!cfg.settings.tag_via_cascade);
+        assert!(!cfg.settings.tag_in_request);
         assert!(cfg.profile(&TaskId::tag()).is_none());
         assert!(cfg.profile(&TaskId::route()).is_none());
         assert!(!cfg.has_policy(&TaskId::route()));
@@ -227,6 +284,20 @@ mod tests {
             cfg.tier_policies[&4][&TaskId::tag()].label_min_confidence["engineering"],
             0.9
         );
+    }
+
+    #[test]
+    fn taxonomy_supplies_label_metadata_and_version() {
+        let cfg = parse_with_base(
+            "[task.tag]\ntaxonomy = \"../taskonomies/help_desk.json\"\noutput_kind = \"multiclass\"\nfallback = \"defer\"",
+            Path::new("config"),
+        ).unwrap();
+        let tag = cfg.profile(&TaskId::tag()).unwrap();
+        assert_eq!(tag.output_kind, OutputKind::Multiclass);
+        assert_eq!(tag.labels.as_ref().unwrap().len(), 20);
+        assert_eq!(tag.taxonomy_version.as_deref(), Some("1.1.0"));
+        assert_eq!(tag.label_metadata[0].id, "app_access_req");
+        assert!(!tag.label_metadata[0].classifier_criterion.is_empty());
     }
 
     #[test]

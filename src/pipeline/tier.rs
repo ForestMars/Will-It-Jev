@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use super::task::{Reading, TaskId, TierReading, LABEL_JEV, LABEL_LLM};
+use super::task::{OutputKind, Reading, TaskId, TaskProfile, TierReading, LABEL_JEV, LABEL_LLM};
 use crate::router::tier1_runner::Tier1Engine;
 use crate::router::tier2_runner::{Tier2Outcome, Tier2Route, Tier2Runner};
 use crate::router::tier3_runner::{TasksError, Tier3Runner};
@@ -19,6 +19,8 @@ pub struct TierContext<'a> {
     pub prompt: &'a str,
     /// Tasks still open that this tier is eligible to answer.
     pub tasks: &'a [TaskId],
+    /// Task contracts are passed to tiers so heads can validate requested output shapes.
+    pub task_profiles: &'a [TaskProfile],
     /// Time left on the run's global deadline.
     pub budget: Duration,
 }
@@ -50,8 +52,23 @@ pub trait Tier: Send + Sync {
     /// Position in the execution cascade; it is not a task identifier.
     fn id(&self) -> u8;
     fn name(&self) -> &str;
-    /// A tier without a head for a requested task abstains for that task.
+    /// A tier without a compatible head reports the task as unsupported.
     async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput;
+}
+
+fn unsupported_all(ctx: &TierContext<'_>, model_id: &str) -> TierOutput {
+    TierOutput {
+        model_id: model_id.to_string(),
+        readings: ctx.tasks.iter()
+            .map(|task| (task.clone(), TierReading::Unsupported))
+            .collect(),
+    }
+}
+
+/// A tier-local scorer for any non-route task. Resolution remains entirely in
+/// TaskProfile and is therefore independent of this implementation.
+pub trait TaskScorer: Send + Sync {
+    fn score(&self, prompt: &str, profile: &TaskProfile) -> TierReading;
 }
 
 fn route_only(ctx: &TierContext<'_>, model_id: &str, route: TierReading) -> TierOutput {
@@ -63,7 +80,7 @@ fn route_only(ctx: &TierContext<'_>, model_id: &str, route: TierReading) -> Tier
             let reading = if *task == route_id {
                 route.clone()
             } else {
-                TierReading::Abstain("unsupported_task")
+                TierReading::Unsupported
             };
             (task.clone(), reading)
         })
@@ -76,11 +93,17 @@ fn route_only(ctx: &TierContext<'_>, model_id: &str, route: TierReading) -> Tier
 
 pub struct Tier1Tier {
     engine: Arc<Tier1Engine>,
+    task_scorers: BTreeMap<TaskId, Arc<dyn TaskScorer>>,
 }
 
 impl Tier1Tier {
     pub fn new(engine: Arc<Tier1Engine>) -> Self {
-        Self { engine }
+        Self { engine, task_scorers: BTreeMap::new() }
+    }
+
+    pub fn with_task_scorer(mut self, task: TaskId, scorer: Arc<dyn TaskScorer>) -> Self {
+        self.task_scorers.insert(task, scorer);
+        self
     }
 }
 
@@ -95,36 +118,52 @@ impl Tier for Tier1Tier {
     }
 
     async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
-        let result = self.engine.classify(ctx.prompt);
-        let p_jev = if result.confidence.is_finite() {
-            result.confidence.clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let (label, confidence) = if p_jev >= 0.5 {
-            (LABEL_JEV, p_jev)
-        } else {
-            (LABEL_LLM, 1.0 - p_jev)
-        };
-        let reading = TierReading::Scored(Reading {
-            label: label.to_string(),
-            confidence,
-            scores: vec![
-                (LABEL_JEV.to_string(), p_jev),
-                (LABEL_LLM.to_string(), 1.0 - p_jev),
-            ],
-        });
-        route_only(ctx, "heuristic", reading)
+        let mut readings = BTreeMap::new();
+        if ctx.tasks.contains(&TaskId::route()) {
+            let result = self.engine.classify(ctx.prompt);
+            let p_jev = if result.confidence.is_finite() {
+                result.confidence.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let (label, confidence) = if p_jev >= 0.5 {
+                (LABEL_JEV, p_jev)
+            } else {
+                (LABEL_LLM, 1.0 - p_jev)
+            };
+            readings.insert(TaskId::route(), TierReading::Scored(Reading {
+                label: label.to_string(),
+                confidence,
+                scores: vec![
+                    (LABEL_JEV.to_string(), p_jev),
+                    (LABEL_LLM.to_string(), 1.0 - p_jev),
+                ],
+            }));
+        }
+        for task in ctx.tasks.iter().filter(|task| task.as_str() != TaskId::route().as_str()) {
+            let reading = self.task_scorers.get(task)
+                .and_then(|scorer| ctx.task_profiles.iter().find(|profile| profile.task.as_str() == task.as_str())
+                    .map(|profile| scorer.score(ctx.prompt, profile)))
+                .unwrap_or(TierReading::Unsupported);
+            readings.insert(task.clone(), reading);
+        }
+        TierOutput { model_id: self.name().to_string(), readings }
     }
 }
 
 pub struct Tier2Tier {
     runner: Arc<Tier2Runner>,
+    task_scorers: BTreeMap<TaskId, Arc<dyn TaskScorer>>,
 }
 
 impl Tier2Tier {
     pub fn new(runner: Arc<Tier2Runner>) -> Self {
-        Self { runner }
+        Self { runner, task_scorers: BTreeMap::new() }
+    }
+
+    pub fn with_task_scorer(mut self, task: TaskId, scorer: Arc<dyn TaskScorer>) -> Self {
+        self.task_scorers.insert(task, scorer);
+        self
     }
 }
 
@@ -162,8 +201,19 @@ impl Tier for Tier2Tier {
     }
 
     async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
-        let outcome = self.runner.evaluate(ctx.prompt);
-        route_only(ctx, "fasttext", tier2_reading(&outcome))
+        let mut readings = BTreeMap::new();
+        if ctx.tasks.contains(&TaskId::route()) {
+            let outcome = self.runner.evaluate(ctx.prompt);
+            readings.insert(TaskId::route(), tier2_reading(&outcome));
+        }
+        for task in ctx.tasks.iter().filter(|task| task.as_str() != TaskId::route().as_str()) {
+            let reading = self.task_scorers.get(task)
+                .and_then(|scorer| ctx.task_profiles.iter().find(|profile| profile.task.as_str() == task.as_str())
+                    .map(|profile| scorer.score(ctx.prompt, profile)))
+                .unwrap_or(TierReading::Unsupported);
+            readings.insert(task.clone(), reading);
+        }
+        TierOutput { model_id: self.name().to_string(), readings }
     }
 }
 
@@ -219,14 +269,13 @@ impl Tier for GrpcScoringTier {
             && !self.joint_unimplemented.load(Ordering::Relaxed);
 
         if use_joint {
-            let task_ids: Vec<String> = ctx
-                .tasks
-                .iter()
-                .map(|task| task.as_str().to_string())
+            let requested_profiles: Vec<TaskProfile> = ctx.tasks.iter()
+                .filter_map(|task| ctx.task_profiles.iter()
+                    .find(|profile| profile.task.as_str() == task.as_str()).cloned())
                 .collect();
             match self
                 .runner
-                .score_tasks(ctx.prompt, &task_ids, ctx.budget)
+                .score_tasks(ctx.prompt, &requested_profiles, ctx.budget)
                 .await
             {
                 Ok(response) => {
@@ -239,6 +288,21 @@ impl Tier for GrpcScoringTier {
                                 .iter()
                                 .find(|result| result.task == task.as_str())
                                 .map(|result| {
+                                    let expected = ctx.task_profiles.iter()
+                                        .find(|profile| profile.task.as_str() == task.as_str())
+                                        .map(|profile| match profile.output_kind {
+                                            OutputKind::Binary => 1,
+                                            OutputKind::Multiclass => 2,
+                                            OutputKind::Multilabel => 3,
+                                            OutputKind::Ordinal => 4,
+                                        });
+                                    // Zero is the proto3 default and remains
+                                    // accepted for legacy sidecars that omit kinds.
+                                    let kind_matches = expected
+                                        .map_or(true, |kind| result.output_kind == 0 || result.output_kind == kind);
+                                    if !kind_matches {
+                                        return TierReading::Unsupported;
+                                    }
                                     TierReading::Scored(Reading {
                                         label: result.label.clone(),
                                         confidence: result.confidence,
@@ -249,7 +313,7 @@ impl Tier for GrpcScoringTier {
                                             .collect(),
                                     })
                                 })
-                                .unwrap_or(TierReading::Abstain("unsupported_task"));
+                                .unwrap_or(TierReading::Unsupported);
                             (task.clone(), reading)
                         })
                         .collect();
@@ -271,7 +335,7 @@ impl Tier for GrpcScoringTier {
         if ctx.tasks.contains(&route_id) {
             self.route_via_score(ctx).await
         } else {
-            TierOutput::abstain_all(self.name, ctx.tasks, "unsupported_task")
+            unsupported_all(ctx, self.name)
         }
     }
 }
@@ -328,6 +392,7 @@ mod tests {
                         label: LABEL_JEV.into(),
                         confidence: 0.97,
                         scores: Vec::new(),
+                        output_kind: 1,
                     }),
                     "tag" => Some(TaskScore {
                         task,
@@ -337,6 +402,7 @@ mod tests {
                             LabelScore { label: "engineering".into(), score: 0.85 },
                             LabelScore { label: "help_desk".into(), score: 0.10 },
                         ],
+                        output_kind: 2,
                     }),
                     _ => None,
                 })
@@ -371,8 +437,26 @@ mod tests {
         let scorer = Tier3Runner::new(endpoint(sidecar).await, Duration::from_secs(2)).unwrap();
         let tier = GrpcScoringTier::new(4, "alternate-sidecar", scorer, true);
         let tasks = [TaskId::route(), TaskId::tag()];
+        let profiles = [
+            TaskProfile {
+                task: TaskId::route(),
+                output_kind: OutputKind::Binary,
+                labels: None,
+                label_metadata: Vec::new(),
+                taxonomy_version: None,
+                fallback: super::super::task::FallbackPolicy::Defer,
+            },
+            TaskProfile {
+                task: TaskId::tag(),
+                output_kind: OutputKind::Multiclass,
+                labels: None,
+                label_metadata: Vec::new(),
+                taxonomy_version: None,
+                fallback: super::super::task::FallbackPolicy::Defer,
+            },
+        ];
         let output = tier
-            .evaluate(&TierContext { prompt: "test", tasks: &tasks, budget: Duration::from_secs(2) })
+            .evaluate(&TierContext { prompt: "test", tasks: &tasks, task_profiles: &profiles, budget: Duration::from_secs(2) })
             .await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(matches!(output.readings[&TaskId::route()], TierReading::Scored(_)));

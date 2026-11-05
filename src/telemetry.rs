@@ -23,6 +23,10 @@ pub struct RouteRecord {
     pub timestamp: DateTime<Utc>,
     pub prompt_raw: String,
     pub hashes: Hashes,
+    /// Per-task decisions observed in this run; may include deferred tasks when
+    /// the route handler returns before best-effort work has completed.
+    #[serde(default)]
+    pub tasks: Vec<TaskDecisionRecord>,
     pub tier1_outcome: Tier1Outcome,
     pub tier2_outcome: Option<Tier2Outcome>,
     pub tier3_outcome: Option<Tier3Outcome>,
@@ -48,6 +52,32 @@ pub struct RouteRecord {
     pub failure_reason: Option<String>,
     #[serde(default)]
     pub sampling: Sampling,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskDecisionRecord {
+    pub task_id: String,
+    pub output_kind: String,
+    pub status: String,
+    /// Sum of tier-call wall time for calls that included this task.
+    #[serde(default)]
+    pub latency_ms: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolving_tier: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+    #[serde(default)]
+    pub scores: Vec<TaskLabelScore>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskLabelScore {
+    pub label: String,
+    pub score: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

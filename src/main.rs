@@ -9,7 +9,7 @@ mod telemetry;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use crate::tagging::{ClickHouseRawTable, OvenV1Tagger, TagConfig};
-use pipeline::tagger::CascadeTagger;
+use pipeline::tagger::{CascadeTagger, JointTagStore};
 use pipeline::tier::{Tier, Tier1Tier, Tier2Tier, GrpcScoringTier};
 use pipeline::{CascadeRunner, TaskId};
 use router::dispatch::DownstreamDispatcher;
@@ -232,29 +232,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("tasks.toml: route task has no [tier_policy.tierN.route] entries".into());
     }
     let tier_policies = Arc::new(pipeline_config.tier_policies.clone());
-    if pipeline_config.settings.tag_via_cascade {
-        let tag_task = TaskId::tag();
-        let has_executable_tag_head = pipeline_config
-            .tier_policies
-            .iter()
-            .any(|(tier_id, by_task)| {
-                if !by_task.contains_key(&tag_task)
-                    || !pipeline_config.settings.joint_tiers.contains(tier_id)
-                {
-                    return false;
-                }
-                match tier_id {
+    // tag_via_cascade is retained as a compatibility alias. Both settings
+    // now mean that sampled tag tasks join the route request's single cascade.
+    let tag_in_request = pipeline_config.settings.tag_in_request
+        || pipeline_config.settings.tag_via_cascade;
+    let tag_profile = if tag_in_request {
+        let profile = pipeline_config.profile(&TaskId::tag()).ok_or(
+            "tasks.toml: tag_in_request = true but there is no [task.tag] profile",
+        )?;
+        if !pipeline_config.has_policy(&TaskId::tag()) {
+            return Err("tasks.toml: tag_in_request = true but no [tier_policy.tierN.tag] policy is configured".into());
+        }
+        let has_executable_tag_head = pipeline_config.tier_policies.iter().any(|(tier_id, by_task)| {
+            by_task.contains_key(&TaskId::tag())
+                && pipeline_config.settings.joint_tiers.contains(tier_id)
+                && match tier_id {
                     3 => config.router.tier3.enabled,
                     4 => config.router.tier4.enabled,
                     _ => false,
                 }
-            });
+        });
         if !has_executable_tag_head {
-            return Err(
-                "tasks.toml: cascade tagging requires a tag policy on an enabled Tier 3 or Tier 4 sidecar listed in pipeline.joint_tiers".into(),
-            );
+            return Err("tasks.toml: joint tagging requires a tag policy on an enabled Tier 3 or Tier 4 sidecar listed in pipeline.joint_tiers".into());
         }
-    }
+        Some(profile)
+    } else {
+        None
+    };
 
     // ---- Build execution-tier implementations -----------------------------
     let tier1_path = env_or("TIER1_CONFIG", "config/tier1.toml");
@@ -440,6 +444,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env_or("TAGGER_OLLAMA_URL", "http://127.0.0.1:11434"),
         env_or("TAGGER_MODEL", "qwen3:1.7b"),
     );
+    let tag_sample_prob: f32 = env_or("TAG_SAMPLE_PROB", "1.0").parse()?;
+    if !tag_sample_prob.is_finite() || !(0.0..=1.0).contains(&tag_sample_prob) {
+        return Err("TAG_SAMPLE_PROB must be between 0 and 1".into());
+    }
+    let tag_budget = Duration::from_millis(pipeline_config.settings.tag_budget_ms);
+    let joint_tags = JointTagStore::default();
     let tag_config = TagConfig {
         base_path: PathBuf::from("logs/task_tags.jsonl"),
         clickhouse_url: Some(tag_clickhouse_url),
@@ -447,27 +457,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         concurrency: 4,
         call_timeout: Duration::from_secs(5),
         max_age: Duration::from_secs(60),
-        sample_prob: env_or("TAG_SAMPLE_PROB", "1.0").parse()?,
+        sample_prob: tag_sample_prob,
     };
 
-    let (tag_queue, tag_handle) = if pipeline_config.settings.tag_via_cascade {
-        let profile = pipeline_config.profile(&TaskId::tag()).ok_or(
-            "tasks.toml: tag_via_cascade = true but there is no [task.tag] profile",
-        )?;
-        if !pipeline_config.has_policy(&TaskId::tag()) {
-            return Err(
-                "tasks.toml: tag_via_cascade = true but no [tier_policy.tierN.tag] policy is configured"
-                    .into(),
-            );
-        }
+    let (tag_queue, tag_handle) = if tag_in_request {
+        let taxonomy_version = tag_profile.as_ref()
+            .and_then(|profile| profile.taxonomy_version.clone())
+            .unwrap_or_else(|| "unknown".into());
+        let output_kind = tag_profile.as_ref()
+            .map(|profile| profile.output_kind.as_str())
+            .unwrap_or("multiclass");
         let tagger = Arc::new(CascadeTagger::new(
-            cascade.clone(),
-            profile,
-            tier_policies.clone(),
-            Duration::from_millis(pipeline_config.settings.tag_budget_ms),
+            joint_tags.clone(),
+            tag_budget,
+            taxonomy_version,
+            output_kind,
             ollama_tagger,
-        )?);
-        tracing::info!("task tagging runs through the shared task-independent cascade");
+        ));
+        tracing::info!("sampled task tagging joins the route request's single cascade");
         tagging::spawn(tagger, tag_config)
     } else {
         tagging::spawn(Arc::new(ollama_tagger), tag_config)
@@ -481,6 +488,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         hashes,
         capture_tx: capture_tx.clone(),
         tag_queue: tag_queue.clone(),
+        tag_profile,
+        joint_tags,
+        tag_in_request,
+        tag_sample_prob,
+        joint_tag_ttl: downstream_timeout + tag_budget + Duration::from_secs(90),
         budget: Duration::from_millis(env_or("ROUTER_BUDGET_MS", "600").parse()?),
     });
     let bind_address = env_or("ROUTER_BIND", "127.0.0.1:8080");

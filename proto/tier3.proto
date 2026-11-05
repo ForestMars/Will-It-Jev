@@ -20,11 +20,28 @@ message ScoreResponse {
   string model_id = 4;
 }
 
+message TaskLabel {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+  string classifier_criterion = 4;
+  string group_id = 5;
+}
+
+message TaskSpec {
+  string task = 1;
+  OutputKind output_kind = 2;
+  repeated TaskLabel labels = 3;
+  string taxonomy_version = 4;
+}
+
 message ScoreTasksRequest {
   string prompt = 1;
-  // Task ids, e.g. "route", "tag". The sidecar answers each task it has a
-  // head for and lists the rest in `unsupported`.
+  // Retained for compatibility with clients that send only task identifiers.
   repeated string tasks = 2;
+  // Typed task contracts from the Rust cascade. Sidecars validate their local
+  // heads against these labels and output shapes before returning readings.
+  repeated TaskSpec task_specs = 3;
 }
 
 message LabelScore {
@@ -32,11 +49,20 @@ message LabelScore {
   float score = 2;
 }
 
+enum OutputKind {
+  OUTPUT_KIND_UNSPECIFIED = 0;
+  BINARY = 1;
+  MULTICLASS = 2;
+  MULTILABEL = 3;
+  ORDINAL = 4;
+}
+
 message TaskScore {
   string task = 1;
-  string label = 2;        // top label for this task
-  float confidence = 3;    // calibrated confidence of `label`
-  repeated LabelScore scores = 4;  // optional full distribution
+  string label = 2;        // top label for single-label heads; representative label for multilabel
+  float confidence = 3;    // calibrated confidence of the selected label
+  repeated LabelScore scores = 4;  // class distribution or independent multilabel probabilities
+  OutputKind output_kind = 5;
 }
 
 message ScoreTasksResponse {
