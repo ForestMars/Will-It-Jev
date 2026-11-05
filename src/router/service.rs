@@ -110,8 +110,8 @@ pub fn app(dependencies: AppDependencies) -> Router {
         .route("/v1/completions", post(completion))
         .route("/v1/chat/completions", post(completion))
         .route("/v1/decisions", post(completion))
-        .nest("/v1/tasks", task_api)
         .with_state(state)
+        .nest("/v1/tasks", task_api)
 }
 
 async fn completion(
