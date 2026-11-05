@@ -12,6 +12,40 @@ use serde::Deserialize;
 pub const LABEL_JEV: &str = "jev_capable";
 pub const LABEL_LLM: &str = "needs_llm";
 
+/// Shape of a task's model output. The task contract owns this; tiers merely
+/// supply a compatible reading.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputKind {
+    #[default]
+    Binary,
+    Multiclass,
+    Multilabel,
+    Ordinal,
+}
+
+impl OutputKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Binary => "binary",
+            Self::Multiclass => "multiclass",
+            Self::Multilabel => "multilabel",
+            Self::Ordinal => "ordinal",
+        }
+    }
+}
+
+/// Taxonomy-derived label metadata. IDs are stable classifier labels; the
+/// descriptive fields are available to model-head builders and observability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskLabelMetadata {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub classifier_criterion: String,
+    pub group_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
 #[serde(transparent)]
 pub struct TaskId(String);
@@ -62,6 +96,9 @@ impl Reading {
 pub enum TierReading {
     Scored(Reading),
     Abstain(&'static str),
+    /// The tier has no head for this task. This is distinct from a model
+    /// abstention and is retained in the trace for capability diagnostics.
+    Unsupported,
 }
 
 /// Resolution calibration for one task when it is evaluated by one tier.
@@ -121,7 +158,10 @@ pub enum FallbackPolicy {
 #[derive(Debug, Clone)]
 pub struct TaskProfile {
     pub task: TaskId,
+    pub output_kind: OutputKind,
     pub labels: Option<Vec<String>>,
+    pub label_metadata: Vec<TaskLabelMetadata>,
+    pub taxonomy_version: Option<String>,
     pub fallback: FallbackPolicy,
 }
 
@@ -142,6 +182,9 @@ impl TaskProfile {
             TierReading::Abstain(reason) => {
                 return pass(reason, None, 0.0);
             }
+            TierReading::Unsupported => {
+                return pass("unsupported_task", None, 0.0);
+            }
             TierReading::Scored(reading) => reading,
         };
 
@@ -153,12 +196,16 @@ impl TaskProfile {
         let guess = Some(reading.label.clone());
 
         if let Some(allowed) = &self.labels {
-            if !allowed.iter().any(|label| label == &reading.label) {
+            if !allowed.iter().any(|label| label == &reading.label)
+                || reading.scores.iter().any(|(label, _)| !allowed.iter().any(|known| known == label))
+            {
                 return pass("unknown_label", None, confidence);
             }
         }
 
-        if policy.never_resolve.contains(&reading.label) {
+        if self.output_kind != OutputKind::Multilabel
+            && policy.never_resolve.contains(&reading.label)
+        {
             return pass("below_threshold", guess, confidence);
         }
 
@@ -172,6 +219,27 @@ impl TaskProfile {
         } else {
             confidence >= bar
         };
+
+        if self.output_kind == OutputKind::Multilabel {
+            // A multilabel head emits independent per-label probabilities. A
+            // task resolves when at least one label clears its own bar; retain
+            // the complete vector so consumers can inspect every decision.
+            let selected = reading.scores.iter().filter(|(label, score)| {
+                let threshold = policy.label_min_confidence.get(label)
+                    .copied().unwrap_or(policy.min_confidence);
+                score.is_finite()
+                    && !policy.never_resolve.contains(label)
+                    && if policy.strict { *score > threshold } else { *score >= threshold }
+            }).max_by(|left, right| left.1.total_cmp(&right.1));
+            if let Some((label, score)) = selected {
+                return Decision::Resolve(Reading {
+                    label: label.clone(),
+                    confidence: score.clamp(0.0, 1.0),
+                    scores: reading.scores.clone(),
+                });
+            }
+            return pass("below_threshold", guess, confidence);
+        }
 
         if clears {
             Decision::Resolve(Reading {
@@ -202,10 +270,54 @@ mod tests {
     }
 
     #[test]
+    fn multilabel_resolution_applies_thresholds_independently() {
+        let profile = TaskProfile {
+            task: TaskId::new("risk_flags"),
+            output_kind: OutputKind::Multilabel,
+            labels: Some(vec!["security".into(), "privacy".into(), "other".into()]),
+            label_metadata: Vec::new(),
+            taxonomy_version: None,
+            fallback: FallbackPolicy::Defer,
+        };
+        let policy = TierPolicy::new(0.8).with_label("security", 0.95);
+        let reading = TierReading::Scored(Reading {
+            label: "security".into(),
+            confidence: 0.91,
+            scores: vec![
+                ("security".into(), 0.91),
+                ("privacy".into(), 0.84),
+                ("other".into(), 0.12),
+            ],
+        });
+        assert!(matches!(
+            profile.decide(&policy, &reading),
+            Decision::Resolve(Reading { label, confidence, .. })
+                if label == "privacy" && (confidence - 0.84).abs() < 1e-6
+        ));
+    }
+
+    #[test]
+    fn unsupported_task_is_not_an_ordinary_model_abstention() {
+        let profile = TaskProfile {
+            task: TaskId::tag(),
+            output_kind: OutputKind::Multiclass,
+            labels: None,
+            label_metadata: Vec::new(),
+            taxonomy_version: None,
+            fallback: FallbackPolicy::Defer,
+        };
+        let decision = profile.decide(&TierPolicy::new(0.5), &TierReading::Unsupported);
+        assert!(matches!(decision, Decision::Pass { reason: "unsupported_task", .. }));
+    }
+
+    #[test]
     fn task_profile_contains_no_tier_calibration() {
         let profile = TaskProfile {
             task: TaskId::route(),
+            output_kind: OutputKind::Binary,
             labels: Some(vec![LABEL_JEV.into(), LABEL_LLM.into()]),
+            label_metadata: Vec::new(),
+            taxonomy_version: None,
             fallback: FallbackPolicy::Label(LABEL_LLM.into()),
         };
         assert_eq!(profile.task, TaskId::route());
@@ -217,7 +329,10 @@ mod tests {
     fn policy_is_supplied_independently_of_task_definition() {
         let profile = TaskProfile {
             task: TaskId::route(),
+            output_kind: OutputKind::Binary,
             labels: Some(vec![LABEL_JEV.into(), LABEL_LLM.into()]),
+            label_metadata: Vec::new(),
+            taxonomy_version: None,
             fallback: FallbackPolicy::Label(LABEL_LLM.into()),
         };
         let tier_one_policy = TierPolicy::new(0.78).strict().never(LABEL_LLM);
@@ -237,7 +352,10 @@ mod tests {
     fn rejects_unknown_labels_and_non_finite_confidence() {
         let profile = TaskProfile {
             task: TaskId::route(),
+            output_kind: OutputKind::Binary,
             labels: Some(vec![LABEL_JEV.into(), LABEL_LLM.into()]),
+            label_metadata: Vec::new(),
+            taxonomy_version: None,
             fallback: FallbackPolicy::Label(LABEL_LLM.into()),
         };
         let policy = TierPolicy::new(0.5);

@@ -122,12 +122,25 @@ pub struct TagRecord {
     pub taxonomy_version: String,
     pub tagger_model: String,
     pub tagger_version: String,
+    /// The task whose decision is represented by this record.
+    #[serde(default = "default_task_id")]
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolving_tier: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decision_scores: Vec<CategoryScore>,
     pub latency_ms: f64,
     pub queue_wait_ms: f64,
     pub result: TagResult,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tagger_usage: Option<TokenUsage>,
 }
+
+fn default_task_id() -> String { "tag".to_string() }
 
 // ---------------------------------------------------------------------------
 // Tagger contract
@@ -146,9 +159,20 @@ pub enum TagError {
     Failed(String),
 }
 
+/// Provenance for a decision computed by the cascade rather than a legacy tagger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskDecisionMetadata {
+    pub task_id: String,
+    pub output_kind: String,
+    pub resolving_tier: Option<u8>,
+    pub model_id: Option<String>,
+    pub scores: Vec<CategoryScore>,
+}
+
 pub struct TaggerOutput {
     pub verdict: TaggerVerdict,
     pub usage: Option<TokenUsage>,
+    pub decision: Option<TaskDecisionMetadata>,
 }
 
 pub trait Tagger: Send + Sync + 'static {
@@ -298,6 +322,7 @@ impl Tagger for OvenV1Tagger {
                     output_tokens: 0,
                     estimated: true,
                 }),
+                decision: None,
             })
         }
     }
@@ -392,11 +417,12 @@ async fn process<T: Tagger>(tagger: &T, cfg: &TagConfig, job: TagJob) -> TagReco
     let timestamp = Utc::now();
     let started = Instant::now();
 
-    let (result, tagger_usage) = if !is_sampled(&job.input.request_id, cfg.sample_prob) {
+    let (result, tagger_usage, task_decision) = if !is_sampled(&job.input.request_id, cfg.sample_prob) {
         (
             TagResult::Untagged {
                 reason: UntaggedReason::SampledOut,
             },
+            None,
             None,
         )
     } else if queue_wait > cfg.max_age {
@@ -404,6 +430,7 @@ async fn process<T: Tagger>(tagger: &T, cfg: &TagConfig, job: TagJob) -> TagReco
             TagResult::Untagged {
                 reason: UntaggedReason::Dropped,
             },
+            None,
             None,
         )
     } else {
@@ -413,6 +440,7 @@ async fn process<T: Tagger>(tagger: &T, cfg: &TagConfig, job: TagJob) -> TagReco
                     reason: UntaggedReason::Timeout,
                 },
                 None,
+                None,
             ),
             Ok(Err(TagError::Failed(error))) => {
                 warn!(request_id = %job.input.request_id, error = %error, "task tagger failed");
@@ -421,9 +449,10 @@ async fn process<T: Tagger>(tagger: &T, cfg: &TagConfig, job: TagJob) -> TagReco
                         reason: UntaggedReason::Error,
                     },
                     None,
+                    None,
                 )
             }
-            Ok(Ok(output)) => (output.verdict.into(), output.usage),
+            Ok(Ok(output)) => (output.verdict.into(), output.usage, output.decision),
         }
     };
 
@@ -433,6 +462,11 @@ async fn process<T: Tagger>(tagger: &T, cfg: &TagConfig, job: TagJob) -> TagReco
         taxonomy_version: tagger.taxonomy_version().to_string(),
         tagger_model: tagger.model().to_string(),
         tagger_version: tagger.version().to_string(),
+        task_id: task_decision.as_ref().map(|decision| decision.task_id.clone()).unwrap_or_else(default_task_id),
+        output_kind: task_decision.as_ref().map(|decision| decision.output_kind.clone()),
+        resolving_tier: task_decision.as_ref().and_then(|decision| decision.resolving_tier),
+        decision_model_id: task_decision.as_ref().and_then(|decision| decision.model_id.clone()),
+        decision_scores: task_decision.as_ref().map(|decision| decision.scores.clone()).unwrap_or_default(),
         latency_ms: started.elapsed().as_secs_f64() * 1000.0,
         queue_wait_ms: queue_wait.as_secs_f64() * 1000.0,
         result,
@@ -636,6 +670,7 @@ mod tests {
                         output_tokens: 2,
                         estimated: false,
                     }),
+                    decision: None,
                 })
             }
         }
@@ -832,6 +867,14 @@ mod tests {
             taxonomy_version: "v1.0".into(),
             tagger_model: "oven-domain-tagger-v1".into(),
             tagger_version: "1.0.0".into(),
+            task_id: "tag".into(),
+            output_kind: Some("multiclass".into()),
+            resolving_tier: Some(3),
+            decision_model_id: Some("shared-encoder".into()),
+            decision_scores: vec![
+                CategoryScore { category_id: "engineering".into(), score: 0.91 },
+                CategoryScore { category_id: "help_desk".into(), score: 0.09 },
+            ],
             latency_ms: 12.5,
             queue_wait_ms: 1.2,
             result: TagResult::Tagged {

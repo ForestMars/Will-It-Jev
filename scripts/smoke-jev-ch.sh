@@ -121,7 +121,8 @@ SELECT toString(request_id) AS request_id, toString(timestamp) AS timestamp,
        router_classification_latency_us,
        downstream_invocation_latency_ms,
        request_latency_primary_ms, request_latency_failover_ms,
-       is_failover, failure_reason, total_latency_us, sample_prob
+       is_failover, failure_reason, total_latency_us, sample_prob,
+       tasks_json
 FROM ${ROUTE_TABLE}
 WHERE position(prompt_raw, '${SMOKE_KEY}') > 0
 ORDER BY timestamp DESC
@@ -168,11 +169,30 @@ jq -r '
 ' <<<"$ROUTE_JSON"
 
 # ---------------------------------------------------------------------------
-# task_tags: SELECT * because its columns have not been verified
+# task_tags: query the task decision provenance columns explicitly
 # ---------------------------------------------------------------------------
 section "TASK TAGGING"
 
-TAG_SQL="SELECT * FROM ${TAG_TABLE} WHERE request_id = toUUID('${REQUEST_ID}') LIMIT 1 FORMAT Vertical"
+TAG_SQL="
+SELECT
+    toString(request_id) AS request_id,
+    task_id,
+    output_kind,
+    resolving_tier,
+    decision_model_id,
+    decision_scores_json,
+    taxonomy_version,
+    tagger_model,
+    latency_ms,
+    queue_wait_ms,
+    tag_status,
+    primary_category,
+    primary_score
+FROM ${TAG_TABLE}
+WHERE request_id = toUUID('${REQUEST_ID}')
+LIMIT 1
+FORMAT Vertical
+"
 
 TAG_OUT=""
 printf '[INFO] Polling task_tags (up to %ss) ' "$TAG_WAIT_SECONDS"

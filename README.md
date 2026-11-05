@@ -495,3 +495,33 @@ profile resolves it.
 * Joint execution: the additive `ScoreTasks` RPC scores several tasks from one shared
   encoding. A sidecar that answers UNIMPLEMENTED is served route-only via `Score`.
   No shipped sidecar implements it yet.
+
+### Generic task execution API
+
+The gateway also exposes a task-generic inference endpoint, separate from the
+route-driven completion endpoints:
+
+~~~http
+POST /v1/tasks
+Content-Type: application/json
+
+{
+  "prompt": "Evaluate the support request.",
+  "tasks": ["customer_intent", "urgency", "fraud_risk"],
+  "required_tasks": ["customer_intent"]
+}
+~~~
+
+Every ID in `tasks` must have a corresponding `[task.<id>]` profile in
+`config/tasks.toml`. The `required_tasks` field may name any non-empty subset
+of the selected tasks; when omitted, all selected tasks are required. The
+required subset is returned as soon as it resolves, while the remaining tasks
+continue in the same cascade run. The response contains a `run_id` and the
+IDs still pending.
+
+Poll `GET /v1/tasks/{run_id}` for the final outcome. It returns HTTP 202 while
+the cascade is running and HTTP 200 with every selected task result when the
+run completes. Results include the resolving tier, model ID, label,
+confidence, score distribution, and per-tier trace. This endpoint performs
+task inference only; it does not invoke the route endpoint's Jev/LLM downstream
+dispatcher.

@@ -3,6 +3,7 @@
 pub mod cascade;
 pub mod dispatch;
 pub mod service;
+pub mod task_api;
 pub mod tier1_runner;
 pub mod tier2_runner;
 pub mod tier3_runner;

@@ -1,4 +1,4 @@
-grpcio>=1.60
+grpcio>=1.84.0
 numpy>=1.26
 onnxruntime>=1.17
 tokenizers>=0.15

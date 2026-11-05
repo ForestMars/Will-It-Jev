@@ -6,6 +6,7 @@
 # The normal OvenV1Tagger remains the default tagger. Enable only after a sidecar
 # has a trained `tag` head and matching tier policies are configured below.
 tag_via_cascade = false
+tag_in_request = false
 # Must remain below TagConfig.call_timeout (5 seconds).
 tag_budget_ms = 4000
 # Local scorer tiers whose sidecars support the joint ScoreTasks RPC.
@@ -16,15 +17,8 @@ labels = ["jev_capable", "needs_llm"]
 fallback_label = "needs_llm"
 
 [task.tag]
-labels = [
-    "engineering",
-    "company_knowledge_base",
-    "help_desk",
-    "customer_support",
-    "web_search",
-    "other_company_task",
-    "other_general_request",
-]
+output_kind = "multiclass"
+taxonomy = "../taskonomies/help_desk.json"
 fallback = "defer"
 
 # Route resolution calibration. Tier 1 and Tier 2 remain route-only scorers;
@@ -46,8 +40,8 @@ label_min_confidence = { jev_capable = 0.95, needs_llm = 0.70 }
 min_confidence = 0.95
 label_min_confidence = { jev_capable = 0.95, needs_llm = 0.70 }
 
-# Tagging policies are intentionally not enabled by default. Once the selected
-# sidecar has a `tag` output head, add tuned policy entries such as:
+# Enable after one configured joint sidecar has a trained tag head.
+# Tagging is best-effort and shares the route request's cascade run.
 #
 # [tier_policy.tier3.tag]
 # min_confidence = 0.85
@@ -55,5 +49,4 @@ label_min_confidence = { jev_capable = 0.95, needs_llm = 0.70 }
 # [tier_policy.tier4.tag]
 # min_confidence = 0.85
 #
-# Then set pipeline.tag_via_cascade = true and include the corresponding tier
-# numbers in pipeline.joint_tiers. Calibration must be measured on tagging data.
+# Set pipeline.tag_in_request = true and include the relevant tier in joint_tiers.

@@ -9,9 +9,11 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tonic::transport::Channel;
 
+use crate::pipeline::task::{OutputKind, TaskProfile};
+
 use super::tier3_proto::{
     tier3_scorer_client::Tier3ScorerClient, ScoreRequest, ScoreTasksRequest,
-    ScoreTasksResponse,
+    ScoreTasksResponse, TaskLabel, TaskSpec,
 };
 
 #[derive(Clone)]
@@ -67,7 +69,7 @@ impl Tier3Runner {
     pub async fn score_tasks(
         &self,
         prompt: &str,
-        tasks: &[String],
+        profiles: &[TaskProfile],
         budget: Duration,
     ) -> Result<ScoreTasksResponse, TasksError> {
         if budget.is_zero() {
@@ -75,9 +77,44 @@ impl Tier3Runner {
         }
         let deadline = budget.min(self.max_call);
         let mut client = self.client.clone();
+        let tasks = profiles.iter().map(|profile| profile.task.as_str().to_string()).collect();
+        let task_specs = profiles.iter().map(|profile| {
+            let labels = profile.labels.as_deref().unwrap_or_default().iter().map(|label| {
+                if let Some(metadata) = profile.label_metadata.iter().find(|item| item.id.as_str() == label.as_str()) {
+                    TaskLabel {
+                        id: metadata.id.clone(),
+                        name: metadata.name.clone(),
+                        description: metadata.description.clone(),
+                        classifier_criterion: metadata.classifier_criterion.clone(),
+                        group_id: metadata.group_id.clone().unwrap_or_default(),
+                    }
+                } else {
+                    TaskLabel {
+                        id: label.clone(),
+                        name: label.clone(),
+                        description: String::new(),
+                        classifier_criterion: String::new(),
+                        group_id: String::new(),
+                    }
+                }
+            }).collect();
+            let output_kind = match profile.output_kind {
+                OutputKind::Binary => 1,
+                OutputKind::Multiclass => 2,
+                OutputKind::Multilabel => 3,
+                OutputKind::Ordinal => 4,
+            };
+            TaskSpec {
+                task: profile.task.as_str().to_string(),
+                output_kind,
+                labels,
+                taxonomy_version: profile.taxonomy_version.clone().unwrap_or_default(),
+            }
+        }).collect();
         let request = ScoreTasksRequest {
             prompt: prompt.to_string(),
-            tasks: tasks.to_vec(),
+            tasks,
+            task_specs,
         };
         match timeout(deadline, client.score_tasks(request)).await {
             Err(_) => Err(TasksError::Fault("timeout")),

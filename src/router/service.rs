@@ -1,5 +1,6 @@
 // src/router/service.rs
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,25 +19,33 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::pipeline::runner::{CascadeRunner, Resolution, RunOutcome, TierTrace};
+use crate::pipeline::tagger::JointTagStore;
 use crate::pipeline::task::{
     Decision, Reading, TaskId, TaskProfile, TierPolicyMap, TierReading, LABEL_JEV, LABEL_LLM,
 };
-use crate::tagging::{TagInput, TagQueue};
+use crate::tagging::{is_sampled, TagInput, TagQueue};
 use crate::telemetry::{
     FinalRouting, Hashes, RouteRecord, Sampling, Tier1Outcome as Tier1Record,
-    Tier2Outcome as Tier2Record, Tier3Outcome as Tier3Record, Tier4Outcome as Tier4Record,
+    TaskDecisionRecord, TaskLabelScore, Tier2Outcome as Tier2Record, Tier3Outcome as Tier3Record, Tier4Outcome as Tier4Record,
 };
 
 use super::{cascade::Backend, dispatch::DownstreamDispatcher};
 
 pub struct AppDependencies {
     pub cascade: Arc<CascadeRunner>,
+    /// All configured task contracts, used by the generic task execution API.
+    pub task_profiles: Vec<TaskProfile>,
     pub route_profile: TaskProfile,
     pub tier_policies: Arc<TierPolicyMap>,
     pub dispatcher: DownstreamDispatcher,
     pub hashes: Hashes,
     pub capture_tx: mpsc::Sender<RouteRecord>,
     pub tag_queue: TagQueue,
+    pub tag_profile: Option<TaskProfile>,
+    pub joint_tags: JointTagStore,
+    pub tag_in_request: bool,
+    pub tag_sample_prob: f32,
+    pub joint_tag_ttl: Duration,
     pub budget: Duration,
 }
 
@@ -49,6 +58,11 @@ pub struct AppState {
     hashes: Arc<Hashes>,
     capture_tx: mpsc::Sender<RouteRecord>,
     tag_queue: TagQueue,
+    tag_profile: Option<TaskProfile>,
+    joint_tags: JointTagStore,
+    tag_in_request: bool,
+    tag_sample_prob: f32,
+    joint_tag_ttl: Duration,
     budget: Duration,
 }
 
@@ -69,6 +83,12 @@ struct ChatMessage {
 }
 
 pub fn app(dependencies: AppDependencies) -> Router {
+    let task_api = super::task_api::router(
+        Arc::clone(&dependencies.cascade),
+        dependencies.task_profiles,
+        Arc::clone(&dependencies.tier_policies),
+        dependencies.budget,
+    );
     let state = AppState {
         cascade: dependencies.cascade,
         route_profile: dependencies.route_profile,
@@ -77,6 +97,11 @@ pub fn app(dependencies: AppDependencies) -> Router {
         hashes: Arc::new(dependencies.hashes),
         capture_tx: dependencies.capture_tx,
         tag_queue: dependencies.tag_queue,
+        tag_profile: dependencies.tag_profile,
+        joint_tags: dependencies.joint_tags,
+        tag_in_request: dependencies.tag_in_request,
+        tag_sample_prob: dependencies.tag_sample_prob,
+        joint_tag_ttl: dependencies.joint_tag_ttl,
         budget: dependencies.budget,
     };
 
@@ -86,6 +111,7 @@ pub fn app(dependencies: AppDependencies) -> Router {
         .route("/v1/chat/completions", post(completion))
         .route("/v1/decisions", post(completion))
         .with_state(state)
+        .nest("/v1/tasks", task_api)
 }
 
 async fn completion(
@@ -174,16 +200,43 @@ async fn completion(
         "completion request accepted"
     );
 
+    // Mint the correlation ID before any inference. The identical ID controls
+    // deterministic sampling and joins route/task records in ClickHouse.
+    let request_id = Uuid::new_v4().to_string();
     let route_started = Instant::now();
-    let outcome = state
-        .cascade
-        .run(
+    let include_joint_tag = state.tag_in_request
+        && state.tag_profile.is_some()
+        && is_sampled(&request_id, state.tag_sample_prob);
+    let request_profiles = if include_joint_tag {
+        vec![
+            state.route_profile.clone(),
+            state.tag_profile.clone().expect("checked above"),
+        ]
+    } else {
+        vec![state.route_profile.clone()]
+    };
+
+    let outcome = if include_joint_tag {
+        let split = Arc::clone(&state.cascade).run_split(
+            route_input.clone(),
+            request_profiles.clone(),
+            BTreeSet::from([TaskId::route()]),
+            Arc::clone(&state.tier_policies),
+            state.budget,
+        );
+        state.joint_tags.register(request_id.clone(), split.done, state.joint_tag_ttl);
+        split.required.await.unwrap_or_else(|error| {
+            warn!(request_id = %request_id, error = %error, "required cascade result channel closed");
+            RunOutcome { tasks: Default::default(), tier_calls: Vec::new() }
+        })
+    } else {
+        state.cascade.run(
             &route_input,
-            std::slice::from_ref(&state.route_profile),
+            &request_profiles,
             &state.tier_policies,
             state.budget,
-        )
-        .await;
+        ).await
+    };
     for call in &outcome.tier_calls {
         tracing::debug!(
             tier = call.tier,
@@ -193,7 +246,7 @@ async fn completion(
         );
     }
     let (backend, mut record) =
-        route_record(&route_input, &state.hashes, &outcome, route_started);
+        route_record(request_id, &route_input, &state.hashes, &request_profiles, &outcome, route_started);
 
     tracing::info!(
         request_id = %record.request_id,
@@ -286,12 +339,13 @@ async fn completion(
 }
 
 fn route_record(
+    request_id: String,
     prompt: &str,
     hashes: &Hashes,
+    profiles: &[TaskProfile],
     outcome: &RunOutcome,
     started: Instant,
 ) -> (Backend, RouteRecord) {
-    let request_id = Uuid::new_v4().to_string();
     let route_outcome = outcome.tasks.get(&TaskId::route());
     let (backend, decision_tier) = match route_outcome.map(|task| &task.resolution) {
         Some(Resolution::Tier { tier, reading, .. }) => {
@@ -321,12 +375,61 @@ fn route_record(
     let tier3_outcome = trace_for_tier(trace, 3).map(tier3_record);
     let tier4_outcome = trace_for_tier(trace, 4).map(tier3_record);
     let latency_us = started.elapsed().as_micros();
+    let task_decisions = outcome.tasks.iter().map(|(task_id, task_outcome)| {
+        let output_kind = profiles.iter()
+            .find(|profile| profile.task.as_str() == task_id.as_str())
+            .map(|profile| profile.output_kind.as_str())
+            .unwrap_or("unknown");
+        let latency_ms = outcome.tier_calls.iter()
+            .filter(|call| call.tasks.iter().any(|task| task.as_str() == task_id.as_str()))
+            .map(|call| call.took.as_secs_f64() * 1000.0)
+            .sum();
+        match &task_outcome.resolution {
+            Resolution::Tier { tier, model_id, reading } => TaskDecisionRecord {
+                task_id: task_id.as_str().to_string(),
+                output_kind: output_kind.to_string(),
+                status: "resolved".into(),
+                latency_ms,
+                resolving_tier: Some(*tier),
+                model_id: Some(model_id.clone()),
+                label: Some(reading.label.clone()),
+                confidence: Some(reading.confidence),
+                scores: reading.scores.iter().map(|(label, score)| TaskLabelScore {
+                    label: label.clone(),
+                    score: *score,
+                }).collect(),
+            },
+            Resolution::Fallback { label } => TaskDecisionRecord {
+                task_id: task_id.as_str().to_string(),
+                output_kind: output_kind.to_string(),
+                status: "fallback".into(),
+                latency_ms,
+                resolving_tier: None,
+                model_id: None,
+                label: Some(label.clone()),
+                confidence: None,
+                scores: Vec::new(),
+            },
+            Resolution::Deferred => TaskDecisionRecord {
+                task_id: task_id.as_str().to_string(),
+                output_kind: output_kind.to_string(),
+                status: "deferred".into(),
+                latency_ms,
+                resolving_tier: None,
+                model_id: None,
+                label: None,
+                confidence: None,
+                scores: Vec::new(),
+            },
+        }
+    }).collect();
 
     let record = RouteRecord {
         request_id,
         timestamp: Utc::now(),
         prompt_raw: prompt.to_string(),
         hashes: hashes.clone(),
+        tasks: task_decisions,
         tier1_outcome,
         tier2_outcome,
         tier3_outcome,
@@ -388,7 +491,7 @@ fn tier1_record(trace: &TierTrace) -> Tier1Record {
             .find(|(label, _)| label == LABEL_JEV)
             .map(|(_, score)| *score)
             .unwrap_or(reading.confidence),
-        TierReading::Abstain(_) => 0.0,
+        TierReading::Abstain(_) | TierReading::Unsupported => 0.0,
     };
     Tier1Record {
         confidence,
@@ -412,7 +515,7 @@ fn tier2_record(trace: &TierTrace) -> Tier2Record {
                 .unwrap_or(0.0);
             (p_jev, p_llm, scores.iter().map(|(_, score)| *score).collect())
         }
-        TierReading::Abstain(_) => (0.0, 0.0, Vec::new()),
+        TierReading::Abstain(_) | TierReading::Unsupported => (0.0, 0.0, Vec::new()),
     };
     Tier2Record {
         p_jev,
