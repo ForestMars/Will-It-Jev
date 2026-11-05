@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0btier3.proto\x12\x05tier3\"\x1e\n\x0cScoreRequest\x12\x0e\n\x06prompt\x18\x01 \x01(\t\"W\n\rScoreResponse\x12\x11\n\traw_score\x18\x01 \x01(\x02\x12\x12\n\nconfidence\x18\x02 \x01(\x02\x12\r\n\x05label\x18\x03 \x01(\t\x12\x10\n\x08model_id\x18\x04 \x01(\t2A\n\x0bTier3Scorer\x12\x32\n\x05Score\x12\x13.tier3.ScoreRequest\x1a\x14.tier3.ScoreResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0btier3.proto\x12\x05tier3\"\x1e\n\x0cScoreRequest\x12\x0e\n\x06prompt\x18\x01 \x01(\t\"W\n\rScoreResponse\x12\x11\n\traw_score\x18\x01 \x01(\x02\x12\x12\n\nconfidence\x18\x02 \x01(\x02\x12\r\n\x05label\x18\x03 \x01(\t\x12\x10\n\x08model_id\x18\x04 \x01(\t\"2\n\x11ScoreTasksRequest\x12\x0e\n\x06prompt\x18\x01 \x01(\t\x12\r\n\x05tasks\x18\x02 \x03(\t\"*\n\nLabelScore\x12\r\n\x05label\x18\x01 \x01(\t\x12\r\n\x05score\x18\x02 \x01(\x02\"_\n\tTaskScore\x12\x0c\n\x04task\x18\x01 \x01(\t\x12\r\n\x05label\x18\x02 \x01(\t\x12\x12\n\nconfidence\x18\x03 \x01(\x02\x12!\n\x06scores\x18\x04 \x03(\x0b\x32\x11.tier3.LabelScore\"^\n\x12ScoreTasksResponse\x12\x10\n\x08model_id\x18\x01 \x01(\t\x12!\n\x07results\x18\x02 \x03(\x0b\x32\x10.tier3.TaskScore\x12\x13\n\x0bunsupported\x18\x03 \x03(\t2\x84\x01\n\x0bTier3Scorer\x12\x32\n\x05Score\x12\x13.tier3.ScoreRequest\x1a\x14.tier3.ScoreResponse\x12\x41\n\nScoreTasks\x12\x18.tier3.ScoreTasksRequest\x1a\x19.tier3.ScoreTasksResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -35,6 +35,14 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_SCOREREQUEST']._serialized_end=52
   _globals['_SCORERESPONSE']._serialized_start=54
   _globals['_SCORERESPONSE']._serialized_end=141
-  _globals['_TIER2SCORER']._serialized_start=143
-  _globals['_TIER2SCORER']._serialized_end=208
+  _globals['_SCORETASKSREQUEST']._serialized_start=143
+  _globals['_SCORETASKSREQUEST']._serialized_end=193
+  _globals['_LABELSCORE']._serialized_start=195
+  _globals['_LABELSCORE']._serialized_end=237
+  _globals['_TASKSCORE']._serialized_start=239
+  _globals['_TASKSCORE']._serialized_end=334
+  _globals['_SCORETASKSRESPONSE']._serialized_start=336
+  _globals['_SCORETASKSRESPONSE']._serialized_end=430
+  _globals['_TIER3SCORER']._serialized_start=433
+  _globals['_TIER3SCORER']._serialized_end=565
 # @@protoc_insertion_point(module_scope)

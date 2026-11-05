@@ -1,14 +1,19 @@
 {
-  "schema_version": "1.0.0",
+  "schema_version": "1.1.0",
   "taxonomy_id": "help_desk",
   "name": "Internal IT Support",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Task categories for classifying internal company IT support requests by the task pursued in the current conversation branch.",
   "classification_unit": "current_branch_task",
+  "classifier_criterion_guidance": [
+    "Use each category's classifier_criterion as its concise discriminating rule when constructing a closed-set classifier choice.",
+    "The description is the fuller human-readable category definition; examples are illustrative, not exhaustive. Classifier prompts should use classifier_criterion as the choice value.",
+    "Prefer the most specific defensible category. Distinguish categories by the task being pursued, not by incidental words in the request."
+  ],
   "classification_guidance": [
     "Classify the task pursued by the current turn using the current turn and relevant branch context.",
     "If the user switches to a different task, assign the category for the new task rather than carrying forward the previous branch category.",
-    "Choose one category that best represents the task. Use other_unclear_multi_intent only when no category is a defensible fit, the request is unclear, or unrelated tasks cannot be separated.",
+    "Choose one category that best represents the task. Use other only when no category is a defensible fit, the request is unclear, or unrelated tasks cannot be separated.",
     "Task category is independent of Jev eligibility. Do not infer jev_eligible from the category alone."
   ],
   "groups": [
@@ -44,6 +49,7 @@
       "desc": "Application access request",
       "group_id": "iad",
       "description": "Request to gain access to an application, system, repository, or service.",
+      "classifier_criterion": "Obtain initial or additional access to an application, system, repository, or service; use group_role_perms when changing an existing role, group membership, or privilege.",
       "examples": [
         "I need access to Salesforce.",
         "Can you add me to GitHub?"
@@ -55,6 +61,7 @@
       "desc": "Permissions, roles, and groups",
       "group_id": "iad",
       "description": "Change an existing user's role, group membership, privilege, or permission level.",
+      "classifier_criterion": "Change an existing user's role, group membership, privilege, or permission level, including adding or removing a user from a group.",
       "examples": [
         "Add me to the finance-admin group.",
         "Change my role to project editor."
@@ -66,6 +73,7 @@
       "desc": "Password reset or account unlock",
       "group_id": "iad",
       "description": "Reset credentials or unlock an account that is locked out.",
+      "classifier_criterion": "Reset or change a password, recover forgotten credentials, or unlock an account that is locked or inaccessible because of an account lockout.",
       "examples": [
         "I forgot my password.",
         "Please unlock my account."
@@ -77,6 +85,7 @@
       "desc": "MFA, SSO, and authentication",
       "group_id": "iad",
       "description": "Multi-factor authentication enrollment or recovery, single sign-on, or authentication failures not primarily a password reset or unlock.",
+      "classifier_criterion": "Resolve MFA enrollment or recovery, SSO, identity-provider, or authentication-flow problems that are not primarily a password reset or account unlock.",
       "examples": [
         "I lost my MFA device.",
         "Single sign-on keeps failing."
@@ -88,6 +97,7 @@
       "desc": "Application troubleshooting",
       "group_id": "apps",
       "description": "Diagnose or resolve an application error, outage, malfunction, or broken feature.",
+      "classifier_criterion": "Diagnose or repair an existing application malfunction, error, outage, or broken feature; use software installation/configuration for setup and how_to for instructions only.",
       "examples": [
         "The expense app crashes when I submit a report.",
         "The CRM returns an error when I save."
@@ -99,6 +109,7 @@
       "desc": "Software installation, configuration, or licensing",
       "group_id": "apps",
       "description": "Install, configure, update, or obtain a license for software.",
+      "classifier_criterion": "Install, configure, update, or obtain or renew a software license; this is a setup or entitlement task rather than troubleshooting a malfunctioning application.",
       "examples": [
         "Can you install Docker Desktop?",
         "I need a license for Adobe Acrobat."
@@ -110,6 +121,7 @@
       "desc": "Email and calendar",
       "group_id": "apps",
       "description": "Email delivery, mailbox settings, calendar behavior, or calendar delegation and sharing.",
+      "classifier_criterion": "Resolve email or mailbox delivery/settings issues, or calendar behavior, delegation, scheduling, or calendar sharing; use collab_msgs for chat and meeting-platform functions.",
       "examples": [
         "My emails are not arriving.",
         "Give my assistant access to my calendar."
@@ -121,6 +133,7 @@
       "desc": "Collaboration and messaging",
       "group_id": "apps",
       "description": "Messaging, channels, meetings, chat, or collaboration-platform issues.",
+      "classifier_criterion": "Handle chat or messaging, collaboration channels, or meeting-platform problems such as audio/video; exclude email and calendar requests.",
       "examples": [
         "Add me to the incident-response Slack channel.",
         "Teams calls have no audio."
@@ -132,6 +145,7 @@
       "desc": "File storage and sharing",
       "group_id": "apps",
       "description": "Shared drives, cloud storage, document permissions, and file-sharing behavior.",
+      "classifier_criterion": "Resolve shared-drive or cloud-file storage, document access/permissions, synchronization, or file-sharing problems; use app_access_req for access to a non-file application or service.",
       "examples": [
         "I cannot open the shared folder.",
         "How do I share this file externally?"
@@ -143,6 +157,7 @@
       "desc": "Employee onboarding",
       "group_id": "employee_lifecycle",
       "description": "Provision accounts, applications, equipment, or access for an incoming employee or contractor.",
+      "classifier_criterion": "Provision accounts, application access, equipment, and initial IT setup for an incoming employee or contractor.",
       "examples": [
         "A new engineer starts Monday; provision their accounts.",
         "Set up a laptop and access for our new hire."
@@ -154,6 +169,7 @@
       "desc": "Employee offboarding",
       "group_id": "employee_lifecycle",
       "description": "Deprovision access, disable accounts, recover equipment, or perform IT tasks for a departing employee or contractor.",
+      "classifier_criterion": "Deprovision accounts or access, revoke credentials, recover equipment, or complete IT tasks because an employee or contractor is departing.",
       "examples": [
         "Disable an employee's accounts after their last day.",
         "Revoke the departing contractor's access."
@@ -165,6 +181,7 @@
       "desc": "Device provisioning",
       "group_id": "employee_lifecycle",
       "description": "Request, prepare, replace, or reassign an endpoint or other company device.",
+      "classifier_criterion": "Request, prepare, issue, replace, or reassign a company endpoint or device; use hardware_peripheral for faults with a peripheral already in use.",
       "examples": [
         "I need a new laptop.",
         "Please replace my damaged company phone."
@@ -176,6 +193,7 @@
       "desc": "Endpoint, operating system, and device management",
       "group_id": "employee_lifecycle",
       "description": "Endpoint operating-system problems, device enrollment, management policies, or compliance state.",
+      "classifier_criterion": "Resolve endpoint operating-system or configuration problems, device enrollment, MDM policies, or endpoint compliance state; exclude physical hardware faults.",
       "examples": [
         "My laptop will not install the required OS update.",
         "My device is not appearing in MDM."
@@ -187,6 +205,7 @@
       "desc": "Hardware and peripherals",
       "group_id": "employee_lifecycle",
       "description": "Physical device faults or requests involving monitors, docks, printers, keyboards, and other peripherals.",
+      "classifier_criterion": "Diagnose a physical fault involving a monitor, dock, printer, keyboard, or other computer peripheral; use dev_prov when the request is to issue, replace, or reassign a device.",
       "examples": [
         "My monitor flickers.",
         "The office printer is jammed."
@@ -198,6 +217,7 @@
       "desc": "Network, VPN, and connectivity",
       "group_id": "infra_sec",
       "description": "Network access, Wi-Fi, VPN, DNS, connectivity, or related infrastructure reachability issues.",
+      "classifier_criterion": "Diagnose network reachability, Wi-Fi, VPN connectivity, DNS, or other connectivity problems between a device and a network or service.",
       "examples": [
         "I cannot connect to the corporate VPN.",
         "The internal site is unreachable on office Wi-Fi."
@@ -209,6 +229,7 @@
       "desc": "Security, secrets, and badge access",
       "group_id": "infra_sec",
       "description": "Security incident or control requests, credential or secret rotation, and physical badge access.",
+      "classifier_criterion": "Handle a security incident or security-control request, rotate secrets or API credentials, or resolve physical building-badge access; exclude ordinary password resets and MFA recovery.",
       "examples": [
         "Rotate the API key for this service.",
         "My building badge no longer works."
@@ -220,6 +241,7 @@
       "desc": "Data, backup, and recovery",
       "group_id": "infra_sec",
       "description": "Restore deleted or corrupted data, recover files, or resolve backup and restoration issues.",
+      "classifier_criterion": "Recover deleted or corrupted data, restore files or systems from backup, or investigate backup and data-restoration failures.",
       "examples": [
         "I accidentally deleted a shared folder; can it be restored?",
         "Last night's backup failed."
@@ -231,6 +253,7 @@
       "desc": "How-to and knowledge request",
       "group_id": "service_desk",
       "description": "A request for instructions or information about how to use an IT service, tool, or standard process, without asking for a state change or fault repair.",
+      "classifier_criterion": "Provide instructions, explanation, or a pointer to documentation for using an IT service or standard process when no system change or fault repair is requested.",
       "examples": [
         "How do I configure my email signature?",
         "Where can I find the VPN setup guide?"
@@ -242,6 +265,7 @@
       "desc": "Ticket status or follow-up",
       "group_id": "service_desk",
       "description": "Ask for status, ownership, an ETA, or follow-up on an existing support ticket or request.",
+      "classifier_criterion": "Ask for the status, assigned owner, expected completion time, or follow-up on an existing support ticket or request.",
       "examples": [
         "What is the status of ticket INC12345?",
         "Has anyone picked up my access request?"
@@ -253,6 +277,7 @@
       "desc": "Other, unclear, or unresolved multi-intent",
       "group_id": "fallback",
       "description": "Use only when the request does not fit another category, lacks enough information to identify a task, or combines unrelated tasks that cannot reasonably be assigned a single primary category.",
+      "classifier_criterion": "Use only when the request is too unclear to identify a task, no other category fits, or multiple unrelated tasks cannot reasonably be reduced to one primary task.",
       "examples": [
         "Can someone help me with something?",
         "I need a laptop fixed and a payroll question answered."
