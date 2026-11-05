@@ -97,10 +97,12 @@ pub struct Tier1Tier {
 }
 
 impl Tier1Tier {
+    #[allow(dead_code)]
     pub fn new(engine: Arc<Tier1Engine>) -> Self {
         Self { engine, task_scorers: BTreeMap::new() }
     }
 
+    #[allow(dead_code)]
     pub fn with_task_scorer(mut self, task: TaskId, scorer: Arc<dyn TaskScorer>) -> Self {
         self.task_scorers.insert(task, scorer);
         self
@@ -157,10 +159,12 @@ pub struct Tier2Tier {
 }
 
 impl Tier2Tier {
+    #[allow(dead_code)]
     pub fn new(runner: Arc<Tier2Runner>) -> Self {
         Self { runner, task_scorers: BTreeMap::new() }
     }
 
+    #[allow(dead_code)]
     pub fn with_task_scorer(mut self, task: TaskId, scorer: Arc<dyn TaskScorer>) -> Self {
         self.task_scorers.insert(task, scorer);
         self
@@ -299,7 +303,8 @@ impl Tier for GrpcScoringTier {
                                     // Zero is the proto3 default and remains
                                     // accepted for legacy sidecars that omit kinds.
                                     let kind_matches = expected
-                                        .map_or(true, |kind| result.output_kind == 0 || result.output_kind == kind);
+                                        // .map_or(true, |kind| result.output_kind == 0 || result.output_kind == kind);
+                                        .is_none_or(|kind| result.output_kind == 0 || result.output_kind == kind);
                                     if !kind_matches {
                                         return TierReading::Unsupported;
                                     }
