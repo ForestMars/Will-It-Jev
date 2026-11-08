@@ -59,7 +59,27 @@ Each tier returns one of two outcomes:
 
 Tier 6 is the terminal generative tier. Provider availability determines whether a response can be returned.
 
-Disabled tiers are skipped without cost. Tiers are always evaluated in numeric order, and a tier is never re-entered once passed.
+Disabled tiers are skipped without cost, and a tier is never re-entered once passed. Tiers run in the order of the `[[tier]]` entries in `config/tasks.toml`; that order, not any number in a tier's name, is the execution order.
+
+### Tier registry
+
+Every cascade tier has a stable **name** (`rules`, `fasttext`, `modernbert`, `harrier`) and a **position** in the registry. Policies (`[tier_policy.<name>.<task>]`), traces, resolutions, API responses and telemetry refer to tiers by name. Position only decides when a tier runs.
+
+```toml
+[[tier]]
+name = "fasttext"
+kind = "fasttext"       # rules | fasttext | grpc
+legacy_ordinal = 2      # optional: keeps tier2 config keys and numbered telemetry columns
+
+[[tier]]
+name = "triage"         # a new tier is a config entry, not a code change
+kind = "grpc"
+endpoint = "http://127.0.0.1:50061"
+timeout_ms = 150
+joint = true            # sidecar implements ScoreTasks
+```
+
+Inserting that second entry between two existing tiers runs it between them; `tierN` policy keys continue to resolve for tiers that declare a `legacy_ordinal`. A config with no `[[tier]]` entries gets the original four tiers in their original order. Telemetry identifies tiers by name. `tier_outcomes` on the route record lists every tier that ran for the route task, by name, with its position, model, status, decision and scores, in execution order, including tiers that have no legacy ordinal. `decided_by_tier_name`, `resolving_tier_name` and `final_routing.tier_name` name the deciding and serving tiers. The numbered fields (`tier1_outcome` to `tier4_outcome`, `cascade_decision_tier`, `final_routing.tier`) are kept for existing consumers and describe only tiers with legacy ordinals 1 to 4. In ClickHouse the same data is in `tier_outcomes_json`, `decided_by_tier_name` and `final_tier_name`. Tiers 5 and 6 are downstream execution backends, not cascade tiers, and are unchanged.
 
 ---
 
@@ -138,7 +158,8 @@ src/
     mod.rs            Low-overhead tracing and telemetry initialization
   pipeline/           Task-agnostic cascade engine (see "Multi-task cascade" below)
     task.rs           TaskId, raw readings, TaskProfile (per-task bars, labels, fallback)
-    tier.rs           Tier trait + adapters for tiers 1-4 (joint ScoreTasks for sidecars)
+    registry.rs       TierId (name), TierRegistry (ordered), TierDirectory (name/position/legacy ordinal)
+    tier.rs           Tier trait + RulesTier, FastTextTier, GrpcScoringTier (joint ScoreTasks for sidecars)
     runner.rs         CascadeRunner: one pass over the union of open tasks
     config.rs         config/tasks.toml loader
     tagger.rs         CascadeTagger: category tagging on the shared tiers

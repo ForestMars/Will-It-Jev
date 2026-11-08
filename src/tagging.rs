@@ -130,6 +130,8 @@ pub struct TagRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolving_tier: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolving_tier_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_model_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub decision_scores: Vec<CategoryScore>,
@@ -165,6 +167,7 @@ pub struct TaskDecisionMetadata {
     pub task_id: String,
     pub output_kind: String,
     pub resolving_tier: Option<u8>,
+    pub resolving_tier_name: Option<String>,
     pub model_id: Option<String>,
     pub scores: Vec<CategoryScore>,
 }
@@ -465,6 +468,7 @@ async fn process<T: Tagger>(tagger: &T, cfg: &TagConfig, job: TagJob) -> TagReco
         task_id: task_decision.as_ref().map(|decision| decision.task_id.clone()).unwrap_or_else(default_task_id),
         output_kind: task_decision.as_ref().map(|decision| decision.output_kind.clone()),
         resolving_tier: task_decision.as_ref().and_then(|decision| decision.resolving_tier),
+        resolving_tier_name: task_decision.as_ref().and_then(|decision| decision.resolving_tier_name.clone()),
         decision_model_id: task_decision.as_ref().and_then(|decision| decision.model_id.clone()),
         decision_scores: task_decision.as_ref().map(|decision| decision.scores.clone()).unwrap_or_default(),
         latency_ms: started.elapsed().as_secs_f64() * 1000.0,
@@ -870,6 +874,7 @@ mod tests {
             task_id: "tag".into(),
             output_kind: Some("multiclass".into()),
             resolving_tier: Some(3),
+            resolving_tier_name: Some("modernbert".into()),
             decision_model_id: Some("shared-encoder".into()),
             decision_scores: vec![
                 CategoryScore { category_id: "engineering".into(), score: 0.91 },

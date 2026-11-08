@@ -12,6 +12,12 @@ pub struct DownstreamDispatcher {
     llm: Option<LlmRunner>,
 }
 
+/// Downstream execution backends are named by what they run. The numbers 5 and 6
+/// are legacy labels for them, not cascade tiers.
+pub const fn downstream_tier_name(tier: u8) -> &'static str {
+    if tier == 5 { "jev" } else { "llm" }
+}
+
 pub struct DispatchOutcome {
     pub payload: Value,
     pub tier: u8,
