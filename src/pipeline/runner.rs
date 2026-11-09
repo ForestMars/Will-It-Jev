@@ -64,7 +64,10 @@ pub struct RunOutcome {
 }
 
 pub struct CascadeRunner {
-    tiers: Vec<TierInstance>,
+    /// Ordered IDs only. Position is the index in this vector.
+    sequence: Vec<TierInstanceId>,
+    /// Stable-ID lookup for configured instances.
+    instances: BTreeMap<TierInstanceId, TierInstance>,
     directory: Arc<TierDirectory>,
 }
 
@@ -78,7 +81,8 @@ impl CascadeRunner {
     /// Instances execute in the order in which they appear in the registry.
     pub fn new(registry: TierRegistry) -> Self {
         let directory = Arc::new(registry.directory());
-        Self { tiers: registry.into_instances(), directory }
+        let (sequence, instances) = registry.into_ordered();
+        Self { sequence, instances, directory }
     }
 
     pub fn directory(&self) -> Arc<TierDirectory> {
@@ -128,10 +132,12 @@ impl CascadeRunner {
         let mut traces: BTreeMap<TaskId, Vec<TierTrace>> = BTreeMap::new();
         let mut tier_calls = Vec::new();
 
-        for instance in &self.tiers {
+        for instance_id in &self.sequence {
             if active.is_empty() || start.elapsed() >= budget {
                 break;
             }
+            let instance = self.instances.get(instance_id)
+                .expect("every ID in the execution sequence has a registered instance");
 
             // Policies are bound to a configured instance, not its reusable
             // execution definition. Two grpc instances can therefore differ.
