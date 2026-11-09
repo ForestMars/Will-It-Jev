@@ -474,4 +474,49 @@ mod tests {
         assert!(resolved_at(&outcome.tasks[&TaskId::route()].resolution, "rules"));
         assert_eq!(calls.lock().unwrap().len(), 1);
     }
+
+    /// Two instances of one definition (same `kind()`), each its own tier.
+    #[tokio::test]
+    async fn instances_of_one_definition_run_in_sequence_with_separate_traces() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runner = CascadeRunner::new(TierRegistry::of(vec![
+            Arc::new(FakeTier::new("encoder-fast", vec![(TaskId::route(), scored(LABEL_JEV, 0.60))], &calls)),
+            Arc::new(FakeTier::new("encoder-accurate", vec![(TaskId::route(), scored(LABEL_JEV, 0.99))], &calls)),
+        ]));
+        let directory = runner.directory();
+        assert_eq!(
+            directory.kind(&tid("encoder-fast")),
+            directory.kind(&tid("encoder-accurate")),
+            "both instances share one definition"
+        );
+        let policies: TierPolicyMap = [
+            (tid("encoder-fast"), [(TaskId::route(), TierPolicy::new(0.90))].into()),
+            (tid("encoder-accurate"), [(TaskId::route(), TierPolicy::new(0.90))].into()),
+        ].into();
+
+        let outcome = runner.run("p", &[route_profile()], &policies, Duration::from_secs(1)).await;
+        let order: Vec<String> = calls.lock().unwrap().iter().map(|(name, _)| name.clone()).collect();
+        assert_eq!(order, ["encoder-fast", "encoder-accurate"]);
+        let trace = &outcome.tasks[&TaskId::route()].trace;
+        assert_eq!(trace.iter().map(|t| t.tier.as_str()).collect::<Vec<_>>(), ["encoder-fast", "encoder-accurate"]);
+        assert!(resolved_at(&outcome.tasks[&TaskId::route()].resolution, "encoder-accurate"));
+    }
+
+    /// A policy bound to one instance neither governs nor leaks to its sibling.
+    #[tokio::test]
+    async fn a_policy_for_one_instance_does_not_govern_its_sibling() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let runner = CascadeRunner::new(TierRegistry::of(vec![
+            Arc::new(FakeTier::new("encoder-a", vec![(TaskId::route(), scored(LABEL_JEV, 0.99))], &calls)),
+            Arc::new(FakeTier::new("encoder-b", vec![(TaskId::route(), scored(LABEL_JEV, 0.99))], &calls)),
+        ]));
+        // Only encoder-b is allowed to resolve route.
+        let policies: TierPolicyMap =
+            [(tid("encoder-b"), [(TaskId::route(), TierPolicy::new(0.90))].into())].into();
+
+        let outcome = runner.run("p", &[route_profile()], &policies, Duration::from_secs(1)).await;
+        let order: Vec<String> = calls.lock().unwrap().iter().map(|(name, _)| name.clone()).collect();
+        assert_eq!(order, ["encoder-b"], "encoder-a has no policy, so it is never asked");
+        assert!(resolved_at(&outcome.tasks[&TaskId::route()].resolution, "encoder-b"));
+    }
 }

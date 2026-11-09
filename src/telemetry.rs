@@ -69,8 +69,11 @@ pub struct RouteRecord {
 /// One tier's reading and decision for the route task.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TierOutcomeRecord {
-    /// Tier name.
+    /// Tier instance name.
     pub tier: String,
+    /// The definition the instance runs: `rules`, `fasttext` or `grpc`.
+    #[serde(default)]
+    pub kind: String,
     /// Zero-based execution position in the tier registry.
     pub position: usize,
     /// The 1..=4 number the original tiers carried, when this tier has one.

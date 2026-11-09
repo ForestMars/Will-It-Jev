@@ -325,14 +325,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let tier: Arc<dyn Tier> = match spec.kind {
             TierKind::Rules => {
-                let path = env_or("TIER1_CONFIG", "config/tier1.toml");
+                let path = spec
+                    .config
+                    .clone()
+                    .unwrap_or_else(|| env_or("TIER1_CONFIG", "config/tier1.toml"));
                 let engine = Arc::new(Tier1Engine::new(Tier1Automaton::from_toml_file(&path)?)?);
-                tier1_hash = sha256_file(&path)?;
+                // The record carries one rules hash: the first rules instance.
+                if tier1_hash == "disabled" {
+                    tier1_hash = sha256_file(&path)?;
+                }
                 Arc::new(RulesTier::new(spec.id.clone(), engine))
             }
             TierKind::Fasttext => {
-                let path = std::env::var("FASTTEXT_MODEL")
-                    .unwrap_or_else(|_| default_fasttext_model_path());
+                let path = spec.model.clone().unwrap_or_else(|| {
+                    std::env::var("FASTTEXT_MODEL").unwrap_or_else(|_| default_fasttext_model_path())
+                });
                 if path == "models/tier2.bin"
                     && !std::path::Path::new("models/tier2_small.bin").exists()
                 {
@@ -342,7 +349,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 let runner = Arc::new(Tier2Runner::new(&path)?);
-                tier2_hash = sha256_file(&path)?;
+                // The record carries one fastText hash: the first fastText instance.
+                if tier2_hash == "disabled" {
+                    tier2_hash = sha256_file(&path)?;
+                }
                 Arc::new(FastTextTier::new(spec.id.clone(), runner))
             }
             TierKind::Grpc => {

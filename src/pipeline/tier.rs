@@ -56,6 +56,12 @@ pub trait Tier: Send + Sync {
     fn id(&self) -> &TierId;
     /// Label recorded as `model_id` when the tier reports without a model of its own.
     fn name(&self) -> &str;
+    /// The definition this tier is an instance of: `rules`, `fasttext`, `grpc`.
+    /// Several tiers (instances) may share one kind. The kind says which code
+    /// executes the tier; the id says which configured instance it is.
+    fn kind(&self) -> &'static str {
+        "custom"
+    }
     /// A tier without a compatible head reports the task as unsupported.
     async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput;
 }
@@ -119,6 +125,10 @@ impl RulesTier {
 impl Tier for RulesTier {
     fn id(&self) -> &TierId {
         &self.id
+    }
+
+    fn kind(&self) -> &'static str {
+        "rules"
     }
 
     fn name(&self) -> &str {
@@ -208,6 +218,10 @@ impl Tier for FastTextTier {
         &self.id
     }
 
+    fn kind(&self) -> &'static str {
+        "fasttext"
+    }
+
     fn name(&self) -> &str {
         "fasttext"
     }
@@ -270,6 +284,10 @@ impl Tier for GrpcScoringTier {
 
     fn name(&self) -> &str {
         self.id.as_str()
+    }
+
+    fn kind(&self) -> &'static str {
+        "grpc"
     }
 
     async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {

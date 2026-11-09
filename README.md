@@ -65,6 +65,8 @@ Disabled tiers are skipped without cost, and a tier is never re-entered once pas
 
 Every cascade tier has a stable **name** (`rules`, `fasttext`, `modernbert`, `harrier`) and a **position** in the registry. Policies (`[tier_policy.<name>.<task>]`), traces, resolutions, API responses and telemetry refer to tiers by name. Position only decides when a tier runs.
 
+**Definition and instance.** A `[[tier]]` entry is an *instance*; its `kind` (`rules`, `fasttext`, `grpc`) is the *definition*, the code that executes it. Any number of instances can share a kind. Each instance has its own name, position, policies and settings, and policies bind to the instance name, so a policy for `encoder-fast` never applies to `encoder-accurate` even when both run the same code. `grpc` instances differ by `endpoint` (the sidecar owns the model). `fasttext` instances take their own `model` path, and `rules` instances their own `config` path; with a single instance of either kind these may be omitted and fall back to `FASTTEXT_MODEL` and `TIER1_CONFIG`. Telemetry records the triplet for every tier that ran: instance name (`tier`), definition (`kind`) and `model_id`.
+
 ```toml
 [[tier]]
 name = "fasttext"
