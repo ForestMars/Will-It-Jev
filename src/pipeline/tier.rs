@@ -22,6 +22,8 @@ pub struct TierContext<'a> {
     pub tasks: &'a [TaskId],
     /// Task contracts are passed to tiers so heads can validate requested output shapes.
     pub task_profiles: &'a [TaskProfile],
+    /// Model reference selected by this configured tier instance.
+    pub model_id: &'a str,
     /// Time left on the run's global deadline.
     pub budget: Duration,
 }

@@ -278,7 +278,8 @@ impl TierRegistry {
         for tier in tiers {
             let id = TierInstanceId::new(tier.id().as_str()).expect("test instance name must be valid");
             let tier_id = tier.id().clone();
-            registry.register(TierInstance::new(id, tier_id, tier.name(), tier).unwrap())
+            let model_id = tier.name().to_string();
+            registry.register(TierInstance::new(id, tier_id, model_id, tier).unwrap())
                 .expect("test instances must be distinct");
         }
         registry
