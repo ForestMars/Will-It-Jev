@@ -1,17 +1,11 @@
 // src/pipeline/registry.rs
 //
-// Tier identity and execution order are separate concerns.
-//
-// * `TierId` is a stable name ("rules", "fasttext", "modernbert", ...). Policies,
-//   traces, resolutions, and telemetry refer to tiers by name.
-// * `TierRegistry` is the ordered list of tiers. Execution order is the order
-//   in which tiers are registered, which `main` takes from the `[[tier]]`
-//   entries in `tasks.toml`. Nothing derives order from a number.
-// * `TierDirectory` is the read-only view of that registry that the rest of the
-//   router uses to look up a tier's position, and the optional legacy ordinal
-//   that keeps the numbered telemetry columns (`tier1_outcome` ..
-//   `tier4_outcome`, `decided_by_tier`) meaningful for the original four tiers.
+// Architecture definitions and configured instances are distinct.
+// Definitions identify reusable execution contracts. Instances select a
+// definition, model, and executor. The ordered instance ID vector is the
+// cascade sequence; positions are derived by enumeration only.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -20,200 +14,273 @@ use serde::Deserialize;
 
 use super::tier::Tier;
 
-/// Name recorded when a task takes its fallback instead of a tier's reading.
-/// Reserved: no tier may use it.
 pub const FALLBACK_TIER_NAME: &str = "fallback";
-
 const MAX_TIER_NAME_LEN: usize = 32;
+
+fn validate_name(name: String, kind: &str) -> Result<String, TierIdError> {
+    let mut chars = name.chars();
+    let valid = !name.is_empty()
+        && name.len() <= MAX_TIER_NAME_LEN
+        && chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+    if !valid {
+        return Err(TierIdError(format!(
+            "invalid {kind} name {name:?}: use 1 to {MAX_TIER_NAME_LEN} characters, starting with a lowercase letter, then lowercase letters, digits, '_' or '-'"
+        )));
+    }
+    if name == FALLBACK_TIER_NAME {
+        return Err(TierIdError(format!(
+            "{kind} name {FALLBACK_TIER_NAME:?} is reserved for task fallbacks"
+        )));
+    }
+    Ok(name)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
 #[serde(try_from = "String")]
 pub struct TierId(String);
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
+#[serde(try_from = "String")]
+pub struct TierInstanceId(String);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TierIdError(String);
 
 impl fmt::Display for TierIdError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.0) }
 }
-
 impl Error for TierIdError {}
 
 impl TierId {
-    /// A tier name is 1 to 32 characters: a lowercase ASCII letter followed by
-    /// lowercase letters, digits, `_` or `-`.
     pub fn new(name: impl Into<String>) -> Result<Self, TierIdError> {
-        let name = name.into();
-        let mut chars = name.chars();
-        let valid = !name.is_empty()
-            && name.len() <= MAX_TIER_NAME_LEN
-            && chars.next().is_some_and(|c| c.is_ascii_lowercase())
-            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
-        if !valid {
-            return Err(TierIdError(format!(
-                "invalid tier name {name:?}: use 1 to {MAX_TIER_NAME_LEN} characters, starting with a \
-                 lowercase letter, then lowercase letters, digits, '_' or '-'"
-            )));
-        }
-        if name == FALLBACK_TIER_NAME {
-            return Err(TierIdError(format!(
-                "tier name {FALLBACK_TIER_NAME:?} is reserved for task fallbacks"
-            )));
-        }
+        let name = validate_name(name.into(), "tier")?;
         if name.strip_prefix("tier").is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())) {
             return Err(TierIdError(format!(
-                "tier name {name:?} is reserved: `tierN` is the alias for legacy ordinal N"
+                "tier name {name:?} is reserved; numeric tier aliases are not supported"
             )));
         }
         Ok(Self(name))
     }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
+    pub fn as_str(&self) -> &str { &self.0 }
 }
-
+impl TierInstanceId {
+    pub fn new(name: impl Into<String>) -> Result<Self, TierIdError> {
+        let name = validate_name(name.into(), "tier instance")?;
+        if name.strip_prefix("tier").is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())) {
+            return Err(TierIdError(format!(
+                "tier instance name {name:?} is reserved; numeric tier aliases are not supported"
+            )));
+        }
+        Ok(Self(name))
+    }
+    pub fn as_str(&self) -> &str { &self.0 }
+}
 impl TryFrom<String> for TierId {
     type Error = TierIdError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::new(value)
-    }
+    fn try_from(value: String) -> Result<Self, Self::Error> { Self::new(value) }
 }
-
+impl TryFrom<String> for TierInstanceId {
+    type Error = TierIdError;
+    fn try_from(value: String) -> Result<Self, Self::Error> { Self::new(value) }
+}
 impl fmt::Display for TierId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.0) }
+}
+impl fmt::Display for TierInstanceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.0) }
 }
 
-/// Shorthand for tests, where names are literals.
 #[cfg(test)]
-pub fn tid(name: &str) -> TierId {
-    TierId::new(name).expect("test tier name must be valid")
+pub fn tid(name: &str) -> TierId { TierId::new(name).expect("test tier name must be valid") }
+#[cfg(test)]
+pub fn iid(name: &str) -> TierInstanceId {
+    TierInstanceId::new(name).expect("test instance name must be valid")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TierKind { Rules, Fasttext, Grpc }
+
+/// Immutable definition of the execution contract and its implementation kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TierDefinition {
+    pub id: TierId,
+    pub kind: TierKind,
+}
+impl TierDefinition {
+    pub fn new(id: TierId, kind: TierKind) -> Self { Self { id, kind } }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RegistryError {
-    DuplicateTier(TierId),
-    DuplicateOrdinal(u8),
+pub enum DefinitionRegistryError {
+    Duplicate(TierId),
+}
+impl fmt::Display for DefinitionRegistryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self { Self::Duplicate(id) => write!(f, "tier definition {id} is registered twice") }
+    }
+}
+impl Error for DefinitionRegistryError {}
+
+/// Catalog of reusable tier architecture definitions.
+#[derive(Debug, Clone, Default)]
+pub struct TierDefinitionRegistry {
+    definitions: BTreeMap<TierId, TierDefinition>,
+}
+impl TierDefinitionRegistry {
+    pub fn new() -> Self { Self::default() }
+    pub fn register(&mut self, definition: TierDefinition) -> Result<(), DefinitionRegistryError> {
+        let id = definition.id.clone();
+        if self.definitions.contains_key(&id) {
+            return Err(DefinitionRegistryError::Duplicate(id));
+        }
+        self.definitions.insert(id, definition);
+        Ok(())
+    }
+    pub fn get(&self, id: &TierId) -> Option<&TierDefinition> { self.definitions.get(id) }
+    pub fn contains(&self, id: &TierId) -> bool { self.definitions.contains_key(id) }
 }
 
-impl fmt::Display for RegistryError {
+/// One configured realization of a reusable tier definition.
+#[derive(Clone)]
+pub struct TierInstance {
+    pub id: TierInstanceId,
+    pub tier_id: TierId,
+    /// Configured model reference. The executor may report a resolved model ID
+    /// in TierOutput; both refer to this instance's selected model.
+    pub model_id: String,
+    pub(crate) executor: Arc<dyn Tier>,
+}
+impl TierInstance {
+    pub fn new(
+        id: TierInstanceId,
+        tier_id: TierId,
+        model_id: impl Into<String>,
+        executor: Arc<dyn Tier>,
+    ) -> Result<Self, InstanceError> {
+        if executor.id() != &tier_id {
+            return Err(InstanceError::DefinitionMismatch {
+                instance: id,
+                configured: tier_id,
+                executor: executor.id().clone(),
+            });
+        }
+        let model_id = model_id.into();
+        if model_id.trim().is_empty() {
+            return Err(InstanceError::EmptyModelId(id));
+        }
+        Ok(Self { id, tier_id, model_id, executor })
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstanceError {
+    Duplicate(TierInstanceId),
+    UnknownDefinition(TierId),
+    DefinitionMismatch { instance: TierInstanceId, configured: TierId, executor: TierId },
+    EmptyModelId(TierInstanceId),
+}
+impl fmt::Display for InstanceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::DuplicateTier(id) => write!(f, "tier {id:?} is registered twice"),
-            Self::DuplicateOrdinal(n) => write!(f, "legacy ordinal {n} is assigned to two tiers"),
+            Self::Duplicate(id) => write!(f, "tier instance {id} is registered twice"),
+            Self::UnknownDefinition(id) => write!(f, "tier instance references unknown definition {id}"),
+            Self::DefinitionMismatch { instance, configured, executor } =>
+                write!(f, "tier instance {instance} references definition {configured}, but its executor implements {executor}"),
+            Self::EmptyModelId(id) => write!(f, "tier instance {id} has an empty model_id"),
         }
     }
 }
-
-impl Error for RegistryError {}
+impl Error for InstanceError {}
 
 #[derive(Debug, Clone)]
 pub struct TierInfo {
-    pub id: TierId,
-    /// Zero-based execution position.
+    pub id: TierInstanceId,
+    pub tier_id: TierId,
+    /// Zero-based position in the configured execution vector.
     pub position: usize,
-    /// The 1..=4 number the original tiers carried, kept only so numbered
-    /// telemetry columns and `tierN` config keys continue to resolve.
-    pub legacy_ordinal: Option<u8>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct TierDirectory {
     infos: Vec<TierInfo>,
 }
-
 impl TierDirectory {
-    pub fn infos(&self) -> &[TierInfo] {
-        &self.infos
-    }
-
-    pub fn position(&self, id: &TierId) -> Option<usize> {
+    pub fn infos(&self) -> &[TierInfo] { &self.infos }
+    pub fn position(&self, id: &TierInstanceId) -> Option<usize> {
         self.infos.iter().find(|info| &info.id == id).map(|info| info.position)
     }
-
-    pub fn legacy_ordinal(&self, id: &TierId) -> Option<u8> {
-        self.infos
-            .iter()
-            .find(|info| &info.id == id)
-            .and_then(|info| info.legacy_ordinal)
+    pub fn id_at_position(&self, position: usize) -> Option<&TierInstanceId> {
+        self.infos.get(position).map(|info| &info.id)
     }
-
-    pub fn id_for_ordinal(&self, ordinal: u8) -> Option<&TierId> {
-        self.infos
-            .iter()
-            .find(|info| info.legacy_ordinal == Some(ordinal))
-            .map(|info| &info.id)
+    pub fn tier_id(&self, id: &TierInstanceId) -> Option<&TierId> {
+        self.infos.iter().find(|info| &info.id == id).map(|info| &info.tier_id)
+    }
+    /// Compatibility projection for the four historical numbered telemetry
+    /// columns. It is derived from vector position, never configured identity.
+    pub fn legacy_ordinal(&self, id: &TierInstanceId) -> Option<u8> {
+        self.position(id).and_then(|position| u8::try_from(position + 1).ok())
     }
 }
 
-/// Ordered collection of execution tiers.
+/// Ordered registry of configured tier instances. Definitions are catalogued
+/// separately; repeated instances may reference the same TierId.
 #[derive(Default)]
 pub struct TierRegistry {
-    entries: Vec<(Arc<dyn Tier>, Option<u8>)>,
+    definitions: TierDefinitionRegistry,
+    order: Vec<TierInstanceId>,
+    instances: BTreeMap<TierInstanceId, TierInstance>,
 }
-
 impl TierRegistry {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(definitions: TierDefinitionRegistry) -> Self {
+        Self { definitions, order: Vec::new(), instances: BTreeMap::new() }
     }
-
-    /// Appends a tier. It runs after every tier registered before it.
-    pub fn register(
-        &mut self,
-        tier: Arc<dyn Tier>,
-        legacy_ordinal: Option<u8>,
-    ) -> Result<(), RegistryError> {
-        if self.entries.iter().any(|(existing, _)| existing.id() == tier.id()) {
-            return Err(RegistryError::DuplicateTier(tier.id().clone()));
+    pub fn register(&mut self, instance: TierInstance) -> Result<(), InstanceError> {
+        if !self.definitions.contains(&instance.tier_id) {
+            return Err(InstanceError::UnknownDefinition(instance.tier_id));
         }
-        if let Some(ordinal) = legacy_ordinal {
-            if self.entries.iter().any(|(_, existing)| *existing == Some(ordinal)) {
-                return Err(RegistryError::DuplicateOrdinal(ordinal));
-            }
+        if self.instances.contains_key(&instance.id) {
+            return Err(InstanceError::Duplicate(instance.id));
         }
-        self.entries.push((tier, legacy_ordinal));
+        self.order.push(instance.id.clone());
+        self.instances.insert(instance.id.clone(), instance);
         Ok(())
     }
-
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
+    pub fn is_empty(&self) -> bool { self.order.is_empty() }
     pub fn directory(&self) -> TierDirectory {
         TierDirectory {
-            infos: self
-                .entries
-                .iter()
-                .enumerate()
-                .map(|(position, (tier, legacy_ordinal))| TierInfo {
-                    id: tier.id().clone(),
+            infos: self.order.iter().enumerate().filter_map(|(position, id)| {
+                self.instances.get(id).map(|instance| TierInfo {
+                    id: id.clone(),
+                    tier_id: instance.tier_id.clone(),
                     position,
-                    legacy_ordinal: *legacy_ordinal,
                 })
-                .collect(),
+            }).collect(),
         }
     }
-
-    pub(crate) fn into_tiers(self) -> Vec<Arc<dyn Tier>> {
-        self.entries.into_iter().map(|(tier, _)| tier).collect()
+    pub(crate) fn into_parts(self) -> (Vec<TierInstanceId>, BTreeMap<TierInstanceId, TierInstance>, TierDirectory) {
+        let directory = self.directory();
+        (self.order, self.instances, directory)
     }
-
-    /// Test helper: register tiers in the given order, no legacy ordinals.
+    /// Test helper: each executor gets a definition and a same-named instance.
     #[cfg(test)]
     pub fn of(tiers: Vec<Arc<dyn Tier>>) -> Self {
-        let mut registry = Self::new();
+        let mut definitions = TierDefinitionRegistry::new();
+        for tier in &tiers {
+            let kind = match tier.id().as_str() {
+                "rules" => TierKind::Rules,
+                "fasttext" => TierKind::Fasttext,
+                _ => TierKind::Grpc,
+            };
+            definitions.register(TierDefinition::new(tier.id().clone(), kind)).expect("test definitions must be distinct");
+        }
+        let mut registry = Self::new(definitions);
         for tier in tiers {
-            registry.register(tier, None).expect("test tiers must be distinct");
+            let id = TierInstanceId::new(tier.id().as_str()).expect("test instance name must be valid");
+            let tier_id = tier.id().clone();
+            let model_id = tier.name().to_string();
+            registry.register(TierInstance::new(id, tier_id, model_id, tier).unwrap())
+                .expect("test instances must be distinct");
         }
         registry
     }
@@ -226,7 +293,6 @@ mod tests {
     use async_trait::async_trait;
 
     struct Named(TierId);
-
     #[async_trait]
     impl Tier for Named {
         fn id(&self) -> &TierId { &self.0 }
@@ -235,61 +301,53 @@ mod tests {
             TierOutput::abstain_all("named", ctx.tasks, "test")
         }
     }
-
-    fn named(name: &str) -> Arc<dyn Tier> {
-        Arc::new(Named(tid(name)))
-    }
+    fn named(name: &str) -> Arc<dyn Tier> { Arc::new(Named(tid(name))) }
 
     #[test]
-    fn tier_names_are_validated() {
-        for ok in ["rules", "fasttext", "modernbert", "harrier", "oryn-2", "a", "triage_v2"] {
-            assert!(TierId::new(ok).is_ok(), "{ok} should be valid");
+    fn names_are_validated_separately_for_definitions_and_instances() {
+        for ok in ["rules", "fasttext", "grpc", "modernbert", "harrier", "oryn-2", "a"] {
+            assert!(TierId::new(ok).is_ok());
+            assert!(TierInstanceId::new(ok).is_ok());
         }
-        for bad in ["", "Rules", "2fast", "has space", "x.y", "fallback", "tier3", &"a".repeat(33)] {
-            assert!(TierId::new(bad).is_err(), "{bad:?} should be rejected");
+        for bad in ["", "Rules", "2fast", "has space", "x.y", "fallback", "tier3"] {
+            assert!(TierId::new(bad).is_err());
+            assert!(TierInstanceId::new(bad).is_err());
         }
     }
 
     #[test]
-    fn execution_order_is_registration_order_not_name_order() {
-        let mut registry = TierRegistry::new();
-        for name in ["zeta", "alpha", "mid"] {
-            registry.register(named(name), None).unwrap();
-        }
-        let order: Vec<_> = registry.directory().infos().iter().map(|i| i.id.to_string()).collect();
-        assert_eq!(order, ["zeta", "alpha", "mid"]);
-        assert_eq!(registry.directory().position(&tid("alpha")), Some(1));
-        let tiers = registry.into_tiers();
-        assert_eq!(tiers[0].id().as_str(), "zeta");
-    }
-
-    #[test]
-    fn duplicates_are_rejected() {
-        let mut registry = TierRegistry::new();
-        registry.register(named("rules"), Some(1)).unwrap();
-        assert_eq!(
-            registry.register(named("rules"), None),
-            Err(RegistryError::DuplicateTier(tid("rules")))
-        );
-        assert_eq!(
-            registry.register(named("other"), Some(1)),
-            Err(RegistryError::DuplicateOrdinal(1))
-        );
-        assert_eq!(registry.len(), 1);
-    }
-
-    #[test]
-    fn directory_maps_between_names_and_legacy_ordinals() {
-        let mut registry = TierRegistry::new();
-        registry.register(named("rules"), Some(1)).unwrap();
-        registry.register(named("triage"), None).unwrap();
-        registry.register(named("modernbert"), Some(3)).unwrap();
+    fn multiple_instances_can_share_one_definition_and_keep_vector_order() {
+        let grpc = tid("grpc");
+        let mut definitions = TierDefinitionRegistry::new();
+        definitions.register(TierDefinition::new(grpc.clone(), TierKind::Grpc)).unwrap();
+        let mut registry = TierRegistry::new(definitions);
+        let first = Arc::new(Named(grpc.clone())) as Arc<dyn Tier>;
+        let second = Arc::new(Named(grpc.clone())) as Arc<dyn Tier>;
+        registry.register(TierInstance::new(iid("zulu"), grpc.clone(), "model-a", first).unwrap()).unwrap();
+        registry.register(TierInstance::new(iid("alpha"), grpc.clone(), "model-b", second).unwrap()).unwrap();
         let directory = registry.directory();
-        assert_eq!(directory.legacy_ordinal(&tid("modernbert")), Some(3));
-        assert_eq!(directory.legacy_ordinal(&tid("triage")), None);
-        assert_eq!(directory.id_for_ordinal(3), Some(&tid("modernbert")));
-        assert_eq!(directory.id_for_ordinal(2), None);
-        assert_eq!(directory.position(&tid("modernbert")), Some(2));
-        assert_eq!(directory.position(&tid("missing")), None);
+        assert_eq!(directory.infos().iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["zulu", "alpha"]);
+        assert_eq!(directory.infos()[0].tier_id, grpc);
+        assert_eq!(directory.position(&iid("alpha")), Some(1));
+    }
+
+    #[test]
+    fn instances_reject_unknown_definitions_and_empty_models() {
+        let mut definitions = TierDefinitionRegistry::new();
+        definitions.register(TierDefinition::new(tid("rules"), TierKind::Rules)).unwrap();
+        let mut registry = TierRegistry::new(definitions.clone());
+        let error = registry.register(TierInstance::new(iid("missing"), tid("grpc"), "m", named("grpc")).unwrap()).unwrap_err();
+        assert_eq!(error, InstanceError::UnknownDefinition(tid("grpc")));
+        assert!(TierInstance::new(iid("bad"), tid("rules"), " ", named("rules")).is_err());
+    }
+
+    #[test]
+    fn instance_identity_is_independent_of_model_selection() {
+        let id = iid("encoder_a");
+        let original = TierInstance::new(id.clone(), tid("grpc"), "modernbert-base", named("grpc")).unwrap();
+        let substituted = TierInstance::new(id.clone(), tid("grpc"), "harrier-270m", named("grpc")).unwrap();
+        assert_eq!(original.id, substituted.id);
+        assert_eq!(original.tier_id, substituted.tier_id);
+        assert_ne!(original.model_id, substituted.model_id);
     }
 }

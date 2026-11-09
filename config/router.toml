@@ -1,18 +1,5 @@
-[router.tier1]
-enabled = true
-
-[router.tier2]
-enabled = true
-
-[router.tier3]
-enabled = true
-endpoint = "http://[::1]:50052"
-timeout_ms = 500
-
-[router.tier4]
-enabled = true
-endpoint = "http://[::1]:50051"
-timeout_ms = 500
+# Downstream execution settings only. Cascade tier instances and their
+# endpoints are configured in config/tasks.toml.
 
 [router.tier5]
 enabled = true

@@ -245,7 +245,9 @@ async fn completion(
     };
     for call in &outcome.tier_calls {
         tracing::debug!(
-            tier = %call.tier,
+            tier_instance_id = %call.tier_instance_id,
+            tier_id = %call.tier_id,
+            model_id = %call.model_id,
             task_count = call.tasks.len(),
             elapsed_ms = call.took.as_secs_f64() * 1000.0,
             "cascade tier completed"
@@ -352,13 +354,13 @@ fn route_record(
     started: Instant,
 ) -> (Backend, RouteRecord) {
     let route_outcome = outcome.tasks.get(&TaskId::route());
-    // The numeric value is the legacy ordinal (0 for a tier without one); the
-    // name is the identity. Fallback keeps its historical value of 6.
+    // The numeric value is the one-based position in the enabled instance
+    // vector; the name is the stable instance identity. Fallback keeps its historical value of 6.
     let (backend, decision_tier, decision_tier_name) = match route_outcome.map(|task| &task.resolution) {
-        Some(Resolution::Tier { tier, reading, .. }) => (
+        Some(Resolution::Tier { tier_instance_id, reading, .. }) => (
             backend_for_label(&reading.label),
-            tiers.legacy_ordinal(tier).unwrap_or(0),
-            tier.to_string(),
+            tiers.legacy_ordinal(tier_instance_id).unwrap_or(0),
+            tier_instance_id.to_string(),
         ),
         Some(Resolution::Fallback { label }) => {
             (backend_for_label(label), 6, FALLBACK_TIER_NAME.to_string())
@@ -369,7 +371,8 @@ fn route_record(
     let trace = route_outcome.map(|task| task.trace.as_slice()).unwrap_or(&[]);
     for entry in trace {
         tracing::debug!(
-            tier = %entry.tier,
+            tier_instance_id = %entry.tier_instance_id,
+            tier_id = %entry.tier_id,
             model_id = %entry.model_id,
             decision = ?entry.decision,
             "route task tier trace"
@@ -396,13 +399,15 @@ fn route_record(
             .map(|call| call.took.as_secs_f64() * 1000.0)
             .sum();
         match &task_outcome.resolution {
-            Resolution::Tier { tier, model_id, reading } => TaskDecisionRecord {
+            Resolution::Tier { tier_instance_id, tier_id, model_id, reading } => TaskDecisionRecord {
                 task_id: task_id.as_str().to_string(),
                 output_kind: output_kind.to_string(),
                 status: "resolved".into(),
                 latency_ms,
-                resolving_tier: tiers.legacy_ordinal(tier),
-                resolving_tier_name: Some(tier.to_string()),
+                resolving_tier: tiers.legacy_ordinal(tier_instance_id),
+                resolving_tier_name: Some(tier_instance_id.to_string()),
+                tier_instance_id: Some(tier_instance_id.to_string()),
+                tier_id: Some(tier_id.to_string()),
                 model_id: Some(model_id.clone()),
                 label: Some(reading.label.clone()),
                 confidence: Some(reading.confidence),
@@ -418,6 +423,8 @@ fn route_record(
                 latency_ms,
                 resolving_tier: None,
                 resolving_tier_name: None,
+                tier_instance_id: None,
+                tier_id: None,
                 model_id: None,
                 label: Some(label.clone()),
                 confidence: None,
@@ -430,6 +437,8 @@ fn route_record(
                 latency_ms,
                 resolving_tier: None,
                 resolving_tier_name: None,
+                tier_instance_id: None,
+                tier_id: None,
                 model_id: None,
                 label: None,
                 confidence: None,
@@ -482,9 +491,9 @@ fn backend_for_label(label: &str) -> Backend {
     }
 }
 
-/// Every tier that ran for the route task, by name, in execution order. This is
-/// the complete per-tier record; it covers tiers that have no legacy ordinal and
-/// so never appear in the numbered fields below.
+/// Every tier instance that ran for the route task, in execution order. This is
+/// the complete per-instance record; the numbered compatibility fields below
+/// project the first four positions.
 fn tier_outcome_records(trace: &[TierTrace], tiers: &TierDirectory) -> Vec<TierOutcomeRecord> {
     trace
         .iter()
@@ -504,9 +513,11 @@ fn tier_outcome_records(trace: &[TierTrace], tiers: &TierDirectory) -> Vec<TierO
                 TierReading::Unsupported => ("unsupported", None, None, Vec::new()),
             };
             TierOutcomeRecord {
-                tier: entry.tier.to_string(),
-                position: tiers.position(&entry.tier).unwrap_or_default(),
-                legacy_ordinal: tiers.legacy_ordinal(&entry.tier),
+                tier: entry.tier_instance_id.to_string(),
+                tier_instance_id: entry.tier_instance_id.to_string(),
+                tier_id: entry.tier_id.to_string(),
+                position: tiers.position(&entry.tier_instance_id).unwrap_or_default(),
+                legacy_ordinal: tiers.legacy_ordinal(&entry.tier_instance_id),
                 model_id: entry.model_id.clone(),
                 status: status.into(),
                 decided: matches!(&entry.decision, Decision::Resolve(_)),
@@ -519,16 +530,15 @@ fn tier_outcome_records(trace: &[TierTrace], tiers: &TierDirectory) -> Vec<TierO
         .collect()
 }
 
-/// The numbered telemetry fields (`tier1_outcome` .. `tier4_outcome`) describe
-/// the original four tiers. Find the trace entry of whichever registered tier
-/// carries that legacy ordinal.
+/// The numbered telemetry fields (`tier1_outcome` .. `tier4_outcome`) project
+/// the first four positions of the enabled instance vector.
 fn trace_for_ordinal<'a>(
     trace: &'a [TierTrace],
     tiers: &TierDirectory,
     ordinal: u8,
 ) -> Option<&'a TierTrace> {
-    let id = tiers.id_for_ordinal(ordinal)?;
-    trace.iter().find(|entry| &entry.tier == id)
+    let info = tiers.infos().get(usize::from(ordinal).checked_sub(1)?)?;
+    trace.iter().find(|entry| entry.tier_instance_id == info.id)
 }
 
 fn decision_reason(trace: &TierTrace) -> String {
@@ -661,7 +671,7 @@ mod tests {
 
     // ---- tier identity in the route record ---------------------------------
 
-    use crate::pipeline::registry::{tid, TierId, TierRegistry};
+    use crate::pipeline::registry::{iid, tid, TierDefinition, TierDefinitionRegistry, TierInstance, TierId, TierKind, TierRegistry};
     use crate::pipeline::runner::TaskOutcome;
     use crate::pipeline::task::{FallbackPolicy, OutputKind};
     use crate::pipeline::tier::{Tier, TierContext, TierOutput};
@@ -678,12 +688,15 @@ mod tests {
         }
     }
 
-    /// rules(1), triage(no ordinal), modernbert(3) in that execution order.
+    /// rules followed by two instances of the shared encoder definition.
     fn directory() -> TierDirectory {
-        let mut registry = TierRegistry::new();
-        for (name, ordinal) in [("rules", Some(1)), ("triage", None), ("modernbert", Some(3))] {
-            registry.register(Arc::new(NamedTier(tid(name))), ordinal).unwrap();
-        }
+        let mut definitions = TierDefinitionRegistry::new();
+        definitions.register(TierDefinition::new(tid("rules"), TierKind::Rules)).unwrap();
+        definitions.register(TierDefinition::new(tid("encoder"), TierKind::Grpc)).unwrap();
+        let mut registry = TierRegistry::new(definitions);
+        registry.register(TierInstance::new(iid("rules"), tid("rules"), "rules-v1", Arc::new(NamedTier(tid("rules")))).unwrap()).unwrap();
+        registry.register(TierInstance::new(iid("triage"), tid("encoder"), "triage-model", Arc::new(NamedTier(tid("encoder")))).unwrap()).unwrap();
+        registry.register(TierInstance::new(iid("modernbert"), tid("encoder"), "modernbert-base", Arc::new(NamedTier(tid("encoder")))).unwrap()).unwrap();
         registry.directory()
     }
 
@@ -699,7 +712,13 @@ mod tests {
     }
 
     fn trace(tier: &str, reading: TierReading, decision: Decision) -> TierTrace {
-        TierTrace { tier: tid(tier), model_id: format!("m-{tier}"), reading, decision }
+        TierTrace {
+            tier_instance_id: iid(tier),
+            tier_id: tid(if tier == "triage" || tier == "modernbert" { "encoder" } else { tier }),
+            model_id: format!("m-{tier}"),
+            reading,
+            decision,
+        }
     }
 
     fn pass() -> Decision {
@@ -727,7 +746,7 @@ mod tests {
     fn route_record_carries_legacy_ordinal_and_tier_name() {
         let reading = Reading::new(LABEL_JEV, 0.97);
         let record = record_for(
-            Resolution::Tier { tier: tid("modernbert"), model_id: "m".into(), reading: reading.clone() },
+            Resolution::Tier { tier_instance_id: iid("modernbert"), tier_id: tid("encoder"), model_id: "m".into(), reading: reading.clone() },
             vec![
                 trace("rules", TierReading::Abstain("conflict"), pass()),
                 trace("modernbert", TierReading::Scored(reading.clone()), Decision::Resolve(reading)),
@@ -746,18 +765,19 @@ mod tests {
     }
 
     #[test]
-    fn a_tier_without_a_legacy_ordinal_is_identified_by_name_only() {
+    fn an_instance_shares_architecture_identity_and_has_vector_position() {
         let reading = Reading::new(LABEL_JEV, 0.9);
         let record = record_for(
-            Resolution::Tier { tier: tid("triage"), model_id: "m".into(), reading: reading.clone() },
+            Resolution::Tier { tier_instance_id: iid("triage"), tier_id: tid("encoder"), model_id: "m".into(), reading: reading.clone() },
             vec![trace("triage", TierReading::Scored(reading.clone()), Decision::Resolve(reading))],
         );
         assert_eq!(record.decided_by_tier_name, "triage");
-        assert_eq!(record.cascade_decision_tier, 0);
-        assert_eq!(record.tasks[0].resolving_tier, None);
+        assert_eq!(record.cascade_decision_tier, 2);
+        assert_eq!(record.tasks[0].resolving_tier, Some(2));
+        assert_eq!(record.tasks[0].tier_instance_id.as_deref(), Some("triage"));
+        assert_eq!(record.tasks[0].tier_id.as_deref(), Some("encoder"));
         assert_eq!(record.tasks[0].resolving_tier_name.as_deref(), Some("triage"));
-        // No numbered field claims the triage trace.
-        assert!(record.tier3_outcome.is_none());
+        assert!(record.tier2_outcome.is_some());
         assert_eq!(record.tier1_outcome.reason, "disabled");
     }
 
@@ -788,7 +808,7 @@ mod tests {
     fn tier_outcomes_list_every_tier_by_name_in_execution_order() {
         let reading = Reading { label: LABEL_JEV.into(), confidence: 0.97, scores: vec![(LABEL_JEV.into(), 0.97), (LABEL_LLM.into(), 0.03)] };
         let record = record_for(
-            Resolution::Tier { tier: tid("modernbert"), model_id: "m".into(), reading: reading.clone() },
+            Resolution::Tier { tier_instance_id: iid("modernbert"), tier_id: tid("encoder"), model_id: "m".into(), reading: reading.clone() },
             vec![
                 trace("rules", TierReading::Abstain("conflict"), pass()),
                 trace("triage", TierReading::Unsupported, pass()),
@@ -805,7 +825,7 @@ mod tests {
         // A tier with no legacy ordinal is fully described here even though no
         // numbered field can hold it.
         let triage = &record.tier_outcomes[1];
-        assert_eq!((triage.position, triage.legacy_ordinal, triage.status.as_str()), (1, None, "unsupported"));
+        assert_eq!((triage.position, triage.legacy_ordinal, triage.status.as_str()), (1, Some(2), "unsupported"));
 
         let winner = &record.tier_outcomes[2];
         assert_eq!((winner.position, winner.legacy_ordinal, winner.decided), (2, Some(3), true));
@@ -817,13 +837,13 @@ mod tests {
     }
 
     #[test]
-    fn a_tier_without_a_legacy_ordinal_decides_visibly_in_tier_outcomes() {
+    fn instance_decision_is_visible_in_ordered_tier_outcomes() {
         let reading = Reading::new(LABEL_JEV, 0.9);
         let record = record_for(
-            Resolution::Tier { tier: tid("triage"), model_id: "m".into(), reading: reading.clone() },
+            Resolution::Tier { tier_instance_id: iid("triage"), tier_id: tid("encoder"), model_id: "m".into(), reading: reading.clone() },
             vec![trace("triage", TierReading::Scored(reading.clone()), Decision::Resolve(reading))],
         );
-        assert!(record.tier3_outcome.is_none());
+        assert!(record.tier2_outcome.is_some());
         assert_eq!(record.tier_outcomes.len(), 1);
         assert!(record.tier_outcomes[0].decided);
         assert_eq!(record.tier_outcomes[0].tier, "triage");
@@ -833,7 +853,7 @@ mod tests {
     fn final_routing_carries_a_tier_name_matching_its_number() {
         let reading = Reading::new(LABEL_JEV, 0.97);
         let decided = record_for(
-            Resolution::Tier { tier: tid("modernbert"), model_id: "m".into(), reading: reading.clone() },
+            Resolution::Tier { tier_instance_id: iid("modernbert"), tier_id: tid("encoder"), model_id: "m".into(), reading: reading.clone() },
             vec![trace("modernbert", TierReading::Scored(reading.clone()), Decision::Resolve(reading))],
         );
         assert_eq!((decided.final_routing.tier, decided.final_routing.tier_name.as_str()), (3, "modernbert"));

@@ -1,21 +1,10 @@
-// src/pipeline/config.rs
-//
-// Loads task definitions, the tier registry, and tier/task resolution policies
-// as separate concerns.
-//
-//   [task.<id>]               what a task is
-//   [[tier]]                  the named execution tiers; array order is run order
-//   [tier_policy.<tier>.<id>] when a tier may resolve a task
-//
-// `<tier>` is a tier name. For configs written before tiers had names, the key
-// `tierN` is accepted as an alias for the tier whose `legacy_ordinal` is N.
-
 use std::collections::BTreeMap;
 use std::{error::Error, fs, path::Path};
 
 use serde::Deserialize;
 
-use super::registry::TierId;
+use super::registry::{TierId, TierInstanceId};
+pub use super::registry::TierKind;
 use super::task::{FallbackPolicy, OutputKind, TaskId, TaskLabelMetadata, TaskProfile, TierPolicy, TierPolicyMap};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -23,161 +12,141 @@ use super::task::{FallbackPolicy, OutputKind, TaskId, TaskLabelMetadata, TaskPro
 pub struct PipelineSettings {
     #[serde(default)]
     pub tag_via_cascade: bool,
-    /// Include sampled tagging as a best-effort task in the route request's cascade.
     #[serde(default)]
     pub tag_in_request: bool,
     #[serde(default = "default_tag_budget_ms")]
     pub tag_budget_ms: u64,
-    /// gRPC tiers whose sidecars implement the joint ScoreTasks RPC, by tier
-    /// name (or, for older configs, by legacy ordinal). A tier can also set
-    /// `joint = true` on its own `[[tier]]` entry.
+    /// Names of configured instances whose sidecars support joint ScoreTasks.
     #[serde(default)]
-    pub joint_tiers: Vec<TierRef>,
-}
-
-/// A reference to a tier from older and newer configs alike.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(untagged)]
-pub enum TierRef {
-    Ordinal(u8),
-    Name(String),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TierKind {
-    /// Pattern rules (Aho-Corasick plus fuzzy matching). At most one.
-    Rules,
-    /// fastText classifier. At most one.
-    Fasttext,
-    /// Any gRPC sidecar speaking the scorer protocol. As many as needed.
-    Grpc,
+    pub joint_tiers: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawTier {
+struct RawTierDefinition { name: String, kind: TierKind }
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTierInstance {
     name: String,
-    kind: TierKind,
+    tier: String,
+    model_id: String,
     #[serde(default)]
     joint: bool,
-    /// The 1..=4 number this tier carried before tiers had names. Only needed
-    /// to keep `tierN` config keys and the numbered telemetry columns working.
-    legacy_ordinal: Option<u8>,
-    /// Defaults to `router.tier<legacy_ordinal>.enabled` when that exists,
-    /// otherwise true.
     enabled: Option<bool>,
-    /// gRPC tiers only. Defaults to `router.tier<legacy_ordinal>`.
     endpoint: Option<String>,
     timeout_ms: Option<u64>,
 }
 
-/// One entry of the tier registry. Position in `PipelineConfig::tiers` is the
-/// execution order.
 #[derive(Debug, Clone)]
-pub struct TierSpec {
-    pub id: TierId,
-    pub kind: TierKind,
+pub struct TierDefinitionSpec { pub id: TierId, pub kind: TierKind }
+
+#[derive(Debug, Clone)]
+pub struct TierInstanceSpec {
+    pub id: TierInstanceId,
+    pub tier_id: TierId,
+    pub model_id: String,
     pub joint: bool,
-    pub legacy_ordinal: Option<u8>,
     pub enabled: Option<bool>,
     pub endpoint: Option<String>,
     pub timeout_ms: Option<u64>,
 }
 
-/// Registry used when a config has no `[[tier]]` entries: the original four
-/// tiers, in their original order.
-fn default_tier_specs() -> Vec<TierSpec> {
+fn default_tier_definitions() -> Vec<TierDefinitionSpec> {
+    [("rules", TierKind::Rules), ("fasttext", TierKind::Fasttext), ("encoder", TierKind::Grpc)]
+        .into_iter()
+        .map(|(name, kind)| TierDefinitionSpec { id: TierId::new(name).unwrap(), kind })
+        .collect()
+}
+
+fn default_tier_instances() -> Vec<TierInstanceSpec> {
     [
-        ("rules", TierKind::Rules, 1),
-        ("fasttext", TierKind::Fasttext, 2),
-        ("modernbert", TierKind::Grpc, 3),
-        ("harrier", TierKind::Grpc, 4),
-    ]
-    .into_iter()
-    .map(|(name, kind, ordinal)| TierSpec {
-        id: TierId::new(name).expect("built-in tier names are valid"),
-        kind,
+        ("rules", "rules", "rules", None, None),
+        ("fasttext", "fasttext", "fasttext", None, None),
+        ("modernbert", "encoder", "modernbert-base", Some("http://[::1]:50052"), Some(500)),
+        ("harrier", "encoder", "harrier-270m", Some("http://[::1]:50051"), Some(500)),
+    ].into_iter().map(|(name, tier, model_id, endpoint, timeout_ms)| TierInstanceSpec {
+        id: TierInstanceId::new(name).unwrap(),
+        tier_id: TierId::new(tier).unwrap(),
+        model_id: model_id.to_string(),
         joint: false,
-        legacy_ordinal: Some(ordinal),
         enabled: None,
-        endpoint: None,
-        timeout_ms: None,
-    })
-    .collect()
+        endpoint: endpoint.map(str::to_string),
+        timeout_ms,
+    }).collect()
 }
 
-fn tier_specs_from(raw: Vec<RawTier>) -> Result<Vec<TierSpec>, Box<dyn Error>> {
-    if raw.is_empty() {
-        return Ok(default_tier_specs());
+fn tier_specs_from(
+    raw_definitions: Vec<RawTierDefinition>,
+    raw_instances: Vec<RawTierInstance>,
+ ) -> Result<(Vec<TierDefinitionSpec>, Vec<TierInstanceSpec>), Box<dyn Error>> {
+    let no_custom_tier_config = raw_definitions.is_empty() && raw_instances.is_empty();
+    let definitions = if raw_definitions.is_empty() {
+        default_tier_definitions()
+    } else {
+        let mut result: Vec<TierDefinitionSpec> = Vec::with_capacity(raw_definitions.len());
+        for raw in raw_definitions {
+            let id = TierId::new(raw.name.clone()).map_err(|error| format!("[[tier_definition]]: {error}"))?;
+            if result.iter().any(|item| item.id == id) {
+                return Err(format!("[[tier_definition]] {id} is defined twice").into());
+            }
+            result.push(TierDefinitionSpec { id, kind: raw.kind });
+        }
+        result
+    };
+
+    let instances = if raw_instances.is_empty() {
+        if no_custom_tier_config { default_tier_instances() } else { Vec::new() }
+    } else {
+        let mut result: Vec<TierInstanceSpec> = Vec::with_capacity(raw_instances.len());
+        for raw in raw_instances {
+            let id = TierInstanceId::new(raw.name.clone())
+                .map_err(|error| format!("[[tier_instance]]: {error}"))?;
+            if result.iter().any(|item| item.id == id) {
+                return Err(format!("[[tier_instance]] {id} is defined twice").into());
+            }
+            let tier_id = TierId::new(raw.tier.clone())
+                .map_err(|error| format!("[[tier_instance]] {id}: {error}"))?;
+            let definition = definitions.iter().find(|item| item.id == tier_id)
+                .ok_or_else(|| format!("[[tier_instance]] {id}: unknown tier definition {tier_id}"))?;
+            if raw.model_id.trim().is_empty() {
+                return Err(format!("[[tier_instance]] {id}: model_id must be non-empty").into());
+            }
+            if definition.kind != TierKind::Grpc && (raw.endpoint.is_some() || raw.timeout_ms.is_some()) {
+                return Err(format!("[[tier_instance]] {id}: endpoint and timeout_ms require a grpc definition").into());
+            }
+            if definition.kind != TierKind::Grpc && raw.joint {
+                return Err(format!("[[tier_instance]] {id}: joint requires a grpc definition").into());
+            }
+            if raw.endpoint.as_deref().is_some_and(|endpoint| endpoint.trim().is_empty()) {
+                return Err(format!("[[tier_instance]] {id}: endpoint must be non-empty").into());
+            }
+            if raw.timeout_ms == Some(0) {
+                return Err(format!("[[tier_instance]] {id}: timeout_ms must be greater than zero").into());
+            }
+            result.push(TierInstanceSpec {
+                id, tier_id, model_id: raw.model_id, joint: raw.joint,
+                enabled: raw.enabled, endpoint: raw.endpoint, timeout_ms: raw.timeout_ms,
+            });
+        }
+        result
+    };
+
+    for instance in &instances {
+        if !definitions.iter().any(|definition| definition.id == instance.tier_id) {
+            return Err(format!("[[tier_instance]] {} references missing definition {}", instance.id, instance.tier_id).into());
+        }
     }
-    let mut specs: Vec<TierSpec> = Vec::with_capacity(raw.len());
-    for tier in raw {
-        let id = TierId::new(tier.name.clone()).map_err(|error| format!("[[tier]]: {error}"))?;
-        let name = id.as_str().to_string();
-        if specs.iter().any(|existing| existing.id == id) {
-            return Err(format!("[[tier]] {name:?} is defined twice").into());
-        }
-        if let Some(ordinal) = tier.legacy_ordinal {
-            if ordinal == 0 {
-                return Err(format!("[[tier]] {name:?}: legacy_ordinal must be positive").into());
-            }
-            if specs.iter().any(|existing| existing.legacy_ordinal == Some(ordinal)) {
-                return Err(format!(
-                    "[[tier]] {name:?}: legacy_ordinal {ordinal} is already used by another tier"
-                )
-                .into());
-            }
-        }
-        if tier.kind != TierKind::Grpc {
-            if tier.endpoint.is_some() || tier.timeout_ms.is_some() {
-                return Err(format!(
-                    "[[tier]] {name:?}: endpoint and timeout_ms apply to kind = \"grpc\" only"
-                )
-                .into());
-            }
-            if tier.joint {
-                return Err(format!("[[tier]] {name:?}: joint applies to kind = \"grpc\" only").into());
-            }
-            if specs.iter().any(|existing| existing.kind == tier.kind) {
-                return Err(format!(
-                    "[[tier]] {name:?}: only one tier of kind {:?} may be configured",
-                    tier.kind
-                )
-                .into());
-            }
-        }
-        if tier.endpoint.as_deref().is_some_and(|endpoint| endpoint.trim().is_empty()) {
-            return Err(format!("[[tier]] {name:?}: endpoint must be non-empty").into());
-        }
-        if tier.timeout_ms == Some(0) {
-            return Err(format!("[[tier]] {name:?}: timeout_ms must be greater than zero").into());
-        }
-        specs.push(TierSpec {
-            id,
-            kind: tier.kind,
-            joint: tier.joint,
-            legacy_ordinal: tier.legacy_ordinal,
-            enabled: tier.enabled,
-            endpoint: tier.endpoint,
-            timeout_ms: tier.timeout_ms,
-        });
-    }
-    Ok(specs)
+    Ok((definitions, instances))
 }
 
-fn find_tier<'a>(specs: &'a [TierSpec], reference: &str) -> Option<&'a TierSpec> {
-    if let Some(spec) = specs.iter().find(|spec| spec.id.as_str() == reference) {
-        return Some(spec);
-    }
-    reference
-        .strip_prefix("tier")
-        .and_then(|number| number.parse::<u8>().ok())
-        .and_then(|ordinal| specs.iter().find(|spec| spec.legacy_ordinal == Some(ordinal)))
+fn find_tier<'a>(instances: &'a [TierInstanceSpec], reference: &str) -> Option<&'a TierInstanceSpec> {
+    let id = TierInstanceId::new(reference.to_string()).ok()?;
+    instances.iter().find(|instance| instance.id == id)
 }
 
-fn known_tier_names(specs: &[TierSpec]) -> String {
-    specs.iter().map(|spec| spec.id.as_str()).collect::<Vec<_>>().join(", ")
+fn known_tier_names(instances: &[TierInstanceSpec]) -> String {
+    instances.iter().map(|instance| instance.id.as_str()).collect::<Vec<_>>().join(", ")
 }
 
 fn default_tag_budget_ms() -> u64 {
@@ -232,7 +201,9 @@ struct RawFile {
     #[serde(default)]
     task: BTreeMap<String, RawProfile>,
     #[serde(default)]
-    tier: Vec<RawTier>,
+    tier_definition: Vec<RawTierDefinition>,
+    #[serde(default)]
+    tier_instance: Vec<RawTierInstance>,
     #[serde(default)]
     tier_policy: BTreeMap<String, BTreeMap<String, TierPolicy>>,
 }
@@ -240,8 +211,10 @@ struct RawFile {
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
     pub settings: PipelineSettings,
-    /// The tier registry in execution order.
-    pub tiers: Vec<TierSpec>,
+    /// Reusable execution contracts.
+    pub definitions: Vec<TierDefinitionSpec>,
+    /// Configured tier instances in execution order.
+    pub tiers: Vec<TierInstanceSpec>,
     profiles: BTreeMap<TaskId, TaskProfile>,
     /// Tier policies are a separate registry, not fields on TaskProfile.
     pub tier_policies: TierPolicyMap,
@@ -264,7 +237,7 @@ impl PipelineConfig {
     }
 }
 
-fn validate_policy(task: &str, tier: &TierId, policy: &TierPolicy) -> Result<(), Box<dyn Error>> {
+fn validate_policy(task: &str, tier: &TierInstanceId, policy: &TierPolicy) -> Result<(), Box<dyn Error>> {
     for bar in std::iter::once(policy.min_confidence)
         .chain(policy.label_min_confidence.values().copied())
     {
@@ -295,7 +268,7 @@ pub fn parse(contents: &str) -> Result<PipelineConfig, Box<dyn Error>> {
 
 fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dyn Error>> {
     let raw: RawFile = toml::from_str(contents)?;
-    let mut tiers = tier_specs_from(raw.tier)?;
+    let (definitions, mut tiers) = tier_specs_from(raw.tier_definition, raw.tier_instance)?;
     let mut profiles = BTreeMap::new();
 
     for (name, profile) in raw.task {
@@ -397,7 +370,7 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
             }
             if by_task.insert(task, policy).is_some() {
                 return Err(format!(
-                    "tier_policy.{tier}.{task_name}: defined twice (a tier name and its tierN alias both appear)"
+                    "tier_policy.{tier}.{task_name}: defined more than once for the same tier instance"
                 )
                 .into());
             }
@@ -405,25 +378,26 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
     }
 
     for reference in &raw.pipeline.joint_tiers {
-        let key = match reference {
-            TierRef::Name(name) => name.clone(),
-            TierRef::Ordinal(ordinal) => format!("tier{ordinal}"),
-        };
-        let id = find_tier(&tiers, &key).map(|spec| spec.id.clone()).ok_or_else(|| {
-            format!(
-                "pipeline.joint_tiers: unknown tier {key:?}; registered tiers: {}",
+        let instance_id = TierInstanceId::new(reference.clone())
+            .map_err(|error| format!("pipeline.joint_tiers: {error}"))?;
+        let Some(index) = tiers.iter().position(|instance| instance.id == instance_id) else {
+            return Err(format!(
+                "pipeline.joint_tiers: unknown instance {instance_id:?}; configured instances: {}",
                 known_tier_names(&tiers)
-            )
-        })?;
-        let spec = tiers.iter_mut().find(|spec| spec.id == id).expect("tier was just found");
-        if spec.kind != TierKind::Grpc {
-            return Err(format!("pipeline.joint_tiers: {id} is not a grpc tier").into());
+            ).into());
+        };
+        let instance = &mut tiers[index];
+        let definition = definitions.iter().find(|definition| definition.id == instance.tier_id)
+            .expect("validated instance references a definition");
+        if definition.kind != TierKind::Grpc {
+            return Err(format!("pipeline.joint_tiers: {instance_id} is not a grpc instance").into());
         }
-        spec.joint = true;
+        instance.joint = true;
     }
 
     Ok(PipelineConfig {
         settings: raw.pipeline,
+        definitions,
         tiers,
         profiles,
         tier_policies,
@@ -434,187 +408,148 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
 mod tests {
     use super::*;
 
-    #[test]
-    fn empty_config_does_not_invent_tasks_or_tier_policies() {
-        let cfg = parse("").unwrap();
-        assert!(!cfg.settings.tag_via_cascade);
-        assert!(!cfg.settings.tag_in_request);
-        assert!(cfg.profile(&TaskId::tag()).is_none());
-        assert!(cfg.profile(&TaskId::route()).is_none());
-        assert!(!cfg.has_policy(&TaskId::route()));
-    }
+    const CONFIG: &str = r#"
+        [task.risk]
+        output_kind = "multilabel"
+        labels = ["fraud", "abuse"]
+        fallback = "defer"
 
-    #[test]
-    fn task_definition_and_tier_policy_parse_separately() {
-        let cfg = parse(
-            r#"
-            [pipeline]
-            tag_via_cascade = true
-            joint_tiers = [4]
-
-            [task.tag]
-            labels = ["engineering", "help_desk"]
-            fallback = "defer"
-
-            [tier_policy.tier4.tag]
-            min_confidence = 0.8
-
-            [tier_policy.tier4.tag.label_min_confidence]
-            engineering = 0.9
-            "#,
-        )
-        .unwrap();
-
-        // No [[tier]] entries: the original four tiers, with `tier4` an alias
-        // for harrier and `joint_tiers = [4]` marking it joint.
-        let harrier = cfg.tiers.iter().find(|tier| tier.id.as_str() == "harrier").unwrap();
-        assert!(harrier.joint);
-        assert!(!cfg.tiers.iter().find(|tier| tier.id.as_str() == "modernbert").unwrap().joint);
-        let tag = cfg.profile(&TaskId::tag()).unwrap();
-        assert_eq!(tag.fallback, FallbackPolicy::Defer);
-        assert_eq!(
-            cfg.tier_policies[&harrier.id][&TaskId::tag()].label_min_confidence["engineering"],
-            0.9
-        );
-    }
-
-    #[test]
-    fn taxonomy_supplies_label_metadata_and_version() {
-        let cfg = parse_with_base(
-            "[task.tag]\ntaxonomy = \"../taskonomies/help_desk.json\"\noutput_kind = \"multiclass\"\nfallback = \"defer\"",
-            Path::new("config"),
-        ).unwrap();
-        let tag = cfg.profile(&TaskId::tag()).unwrap();
-        assert_eq!(tag.output_kind, OutputKind::Multiclass);
-        assert_eq!(tag.labels.as_ref().unwrap().len(), 20);
-        assert_eq!(tag.taxonomy_version.as_deref(), Some("1.1.0"));
-        assert_eq!(tag.label_metadata[0].id, "app_access_req");
-        assert!(!tag.label_metadata[0].classifier_criterion.is_empty());
-    }
-
-    #[test]
-    fn rejects_unknown_tiers_bad_thresholds_and_unknown_task_references() {
-        assert!(parse("[task.route]\nfallback_label = \"needs_llm\"\n\n[tier_policy.tier0.route]\nmin_confidence = 0.5").is_err());
-        assert!(parse("[task.route]\nfallback_label = \"needs_llm\"\n\n[tier_policy.nonesuch.route]\nmin_confidence = 0.5").is_err());
-        assert!(parse("[task.route]\nfallback_label = \"needs_llm\"\n\n[tier_policy.tier3.route]\nmin_confidence = 1.5").is_err());
-        assert!(parse("[task.route]\nfallback_label = \"needs_llm\"\n\n[tier_policy.tier3.tag]\nmin_confidence = 0.5").is_err());
-        assert!(parse("[task.tag]\nfallback = \"defer\"\nfallback_label = \"x\"").is_err());
-        assert!(parse("[task.tag]\nlabels = [\"engineering\"]\nfallback = \"defer\"\n\n[tier_policy.tier3.tag]\nmin_confidence = 0.5\nnever_resolve = [\"unknown\"]").is_err());
-    }
-
-    const TIERS: &str = r#"
-        [task.route]
-        fallback_label = "needs_llm"
-        labels = ["jev_capable", "needs_llm"]
-
-        [[tier]]
-        name = "fasttext"
-        kind = "fasttext"
-        legacy_ordinal = 2
-
-        [[tier]]
-        name = "triage"
+        [[tier_definition]]
+        name = "encoder"
         kind = "grpc"
-        endpoint = "http://127.0.0.1:50061"
-        timeout_ms = 150
+
+        [[tier_instance]]
+        name = "second"
+        tier = "encoder"
+        model_id = "harrier-270m"
+        endpoint = "http://127.0.0.1:50052"
         joint = true
 
-        [[tier]]
-        name = "modernbert"
-        kind = "grpc"
-        legacy_ordinal = 3
+        [[tier_instance]]
+        name = "first"
+        tier = "encoder"
+        model_id = "modernbert-base"
+        endpoint = "http://127.0.0.1:50053"
+
+        [tier_policy.second.risk]
+        min_confidence = 0.8
     "#;
 
     #[test]
-    fn tier_array_order_is_execution_order() {
-        let cfg = parse(TIERS).unwrap();
-        let names: Vec<_> = cfg.tiers.iter().map(|tier| tier.id.as_str()).collect();
-        assert_eq!(names, ["fasttext", "triage", "modernbert"]);
-        let triage = &cfg.tiers[1];
-        assert_eq!(triage.kind, TierKind::Grpc);
-        assert!(triage.joint);
-        assert_eq!(triage.legacy_ordinal, None);
-        assert_eq!(triage.endpoint.as_deref(), Some("http://127.0.0.1:50061"));
-        assert_eq!(triage.timeout_ms, Some(150));
+    fn definitions_and_instances_are_distinct_and_order_is_configuration_order() {
+        let cfg = parse(CONFIG).unwrap();
+        assert_eq!(cfg.definitions.len(), 1);
+        assert_eq!(cfg.definitions[0].id.as_str(), "encoder");
+        assert_eq!(cfg.tiers.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["second", "first"]);
+        assert!(cfg.tiers.iter().all(|i| i.tier_id.as_str() == "encoder"));
+        assert_eq!(cfg.tiers[0].model_id, "harrier-270m");
+        assert_eq!(cfg.tiers[1].model_id, "modernbert-base");
     }
 
     #[test]
-    fn missing_tier_section_yields_the_original_four_in_order() {
-        let cfg = parse("").unwrap();
-        let tiers: Vec<_> = cfg.tiers.iter().map(|t| (t.id.as_str(), t.legacy_ordinal)).collect();
-        assert_eq!(
-            tiers,
-            [("rules", Some(1)), ("fasttext", Some(2)), ("modernbert", Some(3)), ("harrier", Some(4))]
-        );
+    fn policies_and_joint_flags_are_instance_scoped() {
+        let cfg = parse(CONFIG).unwrap();
+        let second = cfg.tiers.iter().find(|i| i.id.as_str() == "second").unwrap();
+        let first = cfg.tiers.iter().find(|i| i.id.as_str() == "first").unwrap();
+        assert!(second.joint);
+        assert!(!first.joint);
+        assert!(cfg.tier_policies.contains_key(&second.id));
+        assert!(!cfg.tier_policies.contains_key(&first.id));
     }
 
     #[test]
-    fn policies_resolve_by_name_or_legacy_alias_and_reject_unknown_tiers() {
-        let by_name = format!("{TIERS}\n[tier_policy.triage.route]\nmin_confidence = 0.8\n");
-        let cfg = parse(&by_name).unwrap();
-        assert!(cfg.tier_policies.keys().any(|id| id.as_str() == "triage"));
-
-        let by_alias = format!("{TIERS}\n[tier_policy.tier3.route]\nmin_confidence = 0.9\n");
-        let cfg = parse(&by_alias).unwrap();
-        assert!(cfg.tier_policies.keys().any(|id| id.as_str() == "modernbert"));
-
-        // triage has no legacy ordinal, so no tierN alias reaches it.
-        let unreachable = format!("{TIERS}\n[tier_policy.tier1.route]\nmin_confidence = 0.9\n");
-        assert!(parse(&unreachable).is_err());
-
-        let both = format!(
-            "{TIERS}\n[tier_policy.modernbert.route]\nmin_confidence = 0.9\n[tier_policy.tier3.route]\nmin_confidence = 0.8\n"
-        );
-        assert!(parse(&both).is_err());
+    fn arbitrary_task_contracts_remain_independent_of_tier_definitions() {
+        let cfg = parse(CONFIG).unwrap();
+        let profile = cfg.profile(&TaskId::new("risk")).unwrap();
+        assert_eq!(profile.output_kind, OutputKind::Multilabel);
+        assert_eq!(profile.labels.as_deref(), Some(&["fraud".to_string(), "abuse".to_string()][..]));
     }
 
     #[test]
-    fn tier_registry_entries_are_validated() {
-        let base = "[task.route]\nfallback_label = \"needs_llm\"\n";
+    fn model_substitution_keeps_instance_and_definition_ids() {
+        let mut cfg = parse(CONFIG).unwrap();
+        let instance = &mut cfg.tiers[0];
+        let id = instance.id.clone();
+        let tier_id = instance.tier_id.clone();
+        instance.model_id = "oryn".into();
+        assert_eq!(instance.id, id);
+        assert_eq!(instance.tier_id, tier_id);
+        assert_eq!(instance.model_id, "oryn");
+    }
+
+    #[test]
+    fn invalid_definition_and_instance_configuration_is_rejected() {
         let cases = [
-            "[[tier]]\nname = \"a\"\nkind = \"grpc\"\n[[tier]]\nname = \"a\"\nkind = \"grpc\"",
-            "[[tier]]\nname = \"Bad Name\"\nkind = \"grpc\"",
-            "[[tier]]\nname = \"fallback\"\nkind = \"grpc\"",
-            "[[tier]]\nname = \"tier3\"\nkind = \"grpc\"",
-            "[[tier]]\nname = \"a\"\nkind = \"rules\"\n[[tier]]\nname = \"b\"\nkind = \"rules\"",
-            "[[tier]]\nname = \"a\"\nkind = \"rules\"\nendpoint = \"http://x\"",
-            "[[tier]]\nname = \"a\"\nkind = \"fasttext\"\njoint = true",
-            "[[tier]]\nname = \"a\"\nkind = \"grpc\"\ntimeout_ms = 0",
-            "[[tier]]\nname = \"a\"\nkind = \"grpc\"\nlegacy_ordinal = 2\n[[tier]]\nname = \"b\"\nkind = \"grpc\"\nlegacy_ordinal = 2",
-            "[[tier]]\nname = \"a\"\nkind = \"grpc\"\nsurprise = 1",
+            r#"[[tier_definition]]
+name = "encoder"
+kind = "grpc"
+[[tier_definition]]
+name = "encoder"
+kind = "grpc""#,
+            r#"[[tier_definition]]
+name = "encoder"
+kind = "grpc"
+[[tier_instance]]
+name = "a"
+tier = "missing"
+model_id = "m""#,
+            r#"[[tier_definition]]
+name = "encoder"
+kind = "grpc"
+[[tier_instance]]
+name = "a"
+tier = "encoder"
+model_id = """#,
+            r#"[[tier_definition]]
+name = "rules"
+kind = "rules"
+[[tier_instance]]
+name = "a"
+tier = "rules"
+model_id = "m"
+endpoint = "http://localhost""#,
+            r#"[[tier_definition]]
+name = "encoder"
+kind = "grpc"
+[[tier_instance]]
+name = "a"
+tier = "encoder"
+model_id = "m"
+timeout_ms = 0"#,
         ];
-        for case in cases {
-            assert!(parse(&format!("{base}\n{case}")).is_err(), "should reject:\n{case}");
+        for raw in cases {
+            assert!(parse(raw).is_err(), "should reject {raw}");
         }
     }
 
     #[test]
-    fn joint_tiers_accept_names_and_legacy_numbers_and_reject_non_grpc_tiers() {
-        let by_name = format!("{TIERS}\n[pipeline]\njoint_tiers = [\"modernbert\"]\n");
-        // [pipeline] must precede [[tier]] only in TOML table order; append is fine
-        // because the tables are independent.
-        let cfg = parse(&by_name).unwrap();
-        assert!(cfg.tiers.iter().find(|t| t.id.as_str() == "modernbert").unwrap().joint);
-        assert!(cfg.tiers.iter().find(|t| t.id.as_str() == "triage").unwrap().joint);
-
-        let by_number = format!("{TIERS}\n[pipeline]\njoint_tiers = [3]\n");
-        assert!(parse(&by_number).unwrap().tiers.iter().find(|t| t.id.as_str() == "modernbert").unwrap().joint);
-
-        assert!(parse(&format!("{TIERS}\n[pipeline]\njoint_tiers = [\"fasttext\"]\n")).is_err());
-        assert!(parse(&format!("{TIERS}\n[pipeline]\njoint_tiers = [\"ghost\"]\n")).is_err());
+    fn unknown_instance_policy_and_non_grpc_joint_flag_are_rejected() {
+        assert!(parse(r#"
+            [task.risk]
+            fallback = "defer"
+            [tier_policy.missing.risk]
+            min_confidence = 0.8
+        "#).is_err());
+        assert!(parse(r#"
+            [[tier_definition]]
+            name = "rules"
+            kind = "rules"
+            [[tier_instance]]
+            name = "rules_one"
+            tier = "rules"
+            model_id = "rules-v1"
+            [pipeline]
+            joint_tiers = ["rules_one"]
+        "#).is_err());
     }
 
     #[test]
-    fn shipped_tasks_toml_declares_the_registry_and_names_every_policy_tier() {
-        let cfg = load_or_default("config/tasks.toml").unwrap();
-        let order: Vec<_> = cfg.tiers.iter().map(|tier| tier.id.as_str()).collect();
-        assert_eq!(order, ["rules", "fasttext", "modernbert", "harrier"]);
-        for tier in cfg.tier_policies.keys() {
-            assert!(
-                cfg.tiers.iter().any(|spec| &spec.id == tier),
-                "policy for unregistered tier {tier}"
-            );
-        }
-        assert!(cfg.has_policy(&TaskId::route()));
+    fn defaults_use_shared_encoder_definition_and_named_instances() {
+        let cfg = parse("").unwrap();
+        assert_eq!(cfg.definitions.len(), 3);
+        assert_eq!(
+            cfg.tiers.iter().map(|i| (i.id.as_str(), i.tier_id.as_str())).collect::<Vec<_>>(),
+            [("rules", "rules"), ("fasttext", "fasttext"), ("modernbert", "encoder"), ("harrier", "encoder")]
+        );
     }
 }

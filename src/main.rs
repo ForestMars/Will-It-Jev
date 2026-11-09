@@ -10,8 +10,9 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use crate::tagging::{ClickHouseRawTable, OvenV1Tagger, TagConfig};
 use pipeline::tagger::{CascadeTagger, JointTagStore};
-use pipeline::config::{TierKind, TierSpec};
+use pipeline::config::{TierInstanceSpec, TierKind};
 use pipeline::tier::{FastTextTier, GrpcScoringTier, RulesTier, Tier};
+use pipeline::registry::{TierDefinition, TierDefinitionRegistry, TierInstance};
 use pipeline::{CascadeRunner, TaskId, TierRegistry};
 use router::dispatch::DownstreamDispatcher;
 use router::service;
@@ -47,62 +48,30 @@ fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
-/// A tier is enabled by its own `enabled`, else by the `[router.tierN]` block of
-/// the legacy ordinal it carries, else it is on.
-fn tier_enabled(spec: &TierSpec, router: &config::RouterConfig) -> bool {
-    spec.enabled
-        .or_else(|| {
-            spec.legacy_ordinal
-                .and_then(|ordinal| router.legacy_tier(ordinal))
-                .map(|tier| tier.enabled)
-        })
-        .unwrap_or(true)
+/// A configured tier instance is enabled independently of its definition.
+fn tier_enabled(spec: &TierInstanceSpec) -> bool {
+    spec.enabled.unwrap_or(true)
 }
 
-/// Endpoint and per-call timeout for a gRPC tier. The original two sidecar
-/// tiers keep their historical environment variables; every other tier uses
-/// `TIER_<NAME>_ENDPOINT` and `TIER_<NAME>_MAX_CALL_MS`.
-fn grpc_settings(
-    spec: &TierSpec,
-    router: &config::RouterConfig,
-) -> Result<(String, Duration), Box<dyn std::error::Error>> {
-    let legacy = spec.legacy_ordinal.and_then(|ordinal| router.legacy_tier(ordinal));
-    let endpoint = spec
-        .endpoint
-        .as_deref()
-        .or_else(|| legacy.and_then(|tier| tier.endpoint.as_deref()));
-    let timeout_ms = spec.timeout_ms.or_else(|| legacy.and_then(|tier| tier.timeout_ms));
+/// Endpoint and per-call timeout are instance settings. Environment names use
+/// the instance identity, never a position or architecture name.
+fn grpc_settings(spec: &TierInstanceSpec) -> Result<(String, Duration), Box<dyn std::error::Error>> {
     let upper = spec.id.as_str().to_ascii_uppercase().replace('-', "_");
-    let (endpoint_env, endpoint_aliases, timeout_env): (String, &[&str], String) =
-        match spec.legacy_ordinal {
-            Some(3) => (
-                "TIER3_SCORER_ENDPOINT".into(),
-                &["MODERNBERT_ENDPOINT"],
-                "TIER3_MAX_CALL_MS".into(),
-            ),
-            Some(4) => (
-                "TIER4_SCORER_ENDPOINT".into(),
-                &["TIER4_HARRIER_ENDPOINT", "TIER3_ENDPOINT"],
-                "TIER4_MAX_CALL_MS".into(),
-            ),
-            _ => (
-                format!("TIER_{upper}_ENDPOINT"),
-                &[],
-                format!("TIER_{upper}_MAX_CALL_MS"),
-            ),
-        };
+    let endpoint_env = format!("TIER_INSTANCE_{upper}_ENDPOINT");
+    let endpoint_alias = format!("TIER_{upper}_ENDPOINT");
+    let timeout_env = format!("TIER_{upper}_MAX_CALL_MS");
     Ok((
-        configured_endpoint(&endpoint_env, endpoint_aliases, endpoint)?,
-        configured_timeout(&timeout_env, timeout_ms)?,
+        configured_endpoint(&endpoint_env, &[endpoint_alias.as_str()], spec.endpoint.as_deref())?,
+        configured_timeout(&timeout_env, spec.timeout_ms)?,
     ))
 }
 
 fn configured_endpoint(
     name: &str,
-    legacy_names: &[&str],
+    aliases: &[&str],
     configured: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    for candidate in std::iter::once(name).chain(legacy_names.iter().copied()) {
+    for candidate in std::iter::once(name).chain(aliases.iter().copied()) {
         if let Ok(value) = std::env::var(candidate) {
             return Ok(value);
         }
@@ -114,7 +83,7 @@ fn configured_endpoint(
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "missing endpoint: set {name}, or configure `endpoint` on the tier ([[tier]] in config/tasks.toml or [router.tierN] in config/router.toml)"
+                    "missing endpoint: set {name}, or configure `endpoint` on the tier instance ([[tier_instance]] in config/tasks.toml)"
                 ),
             )
             .into()
@@ -131,7 +100,7 @@ fn configured_timeout(
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "missing timeout: set {name}, or configure `timeout_ms` on the tier ([[tier]] in config/tasks.toml or [router.tierN] in config/router.toml)"
+                    "missing timeout: set {name}, or configure `timeout_ms` on the tier instance ([[tier_instance]] in config/tasks.toml)"
                 ),
             )
         })?,
@@ -264,10 +233,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = config::load_from_path(&config_path)?;
     tracing::info!(config_path, "loaded router configuration");
     tracing::info!(
-        tier1_enabled = config.router.tier1.enabled,
-        tier2_enabled = config.router.tier2.enabled,
-        tier3_enabled = config.router.tier3.enabled,
-        tier4_enabled = config.router.tier4.enabled,
         tier5_enabled = config.router.tier5.enabled,
         tier6_enabled = config.router.tier6.enabled,
         "configured tier status"
@@ -295,40 +260,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("tasks.toml: tag_in_request = true but no [tier_policy.<tier>.tag] policy is configured".into());
         }
         let has_executable_tag_head = pipeline_config.tiers.iter().any(|spec| {
-            spec.kind == TierKind::Grpc
-                && spec.joint
-                && tier_enabled(spec, &config.router)
-                && pipeline_config
-                    .tier_policies
-                    .get(&spec.id)
-                    .is_some_and(|by_task| by_task.contains_key(&TaskId::tag()))
+            pipeline_config.definitions.iter().any(|definition| {
+                definition.id == spec.tier_id
+                    && definition.kind == TierKind::Grpc
+                    && spec.joint
+                    && tier_enabled(spec)
+                    && pipeline_config.tier_policies
+                        .get(&spec.id)
+                        .is_some_and(|by_task| by_task.contains_key(&TaskId::tag()))
+            })
         });
         if !has_executable_tag_head {
-            return Err("tasks.toml: joint tagging requires a tag policy on an enabled gRPC tier marked joint ([[tier]] joint = true, or pipeline.joint_tiers)".into());
+            return Err("tasks.toml: joint tagging requires a tag policy on an enabled gRPC tier marked joint ([[tier_instance]] joint = true, or pipeline.joint_tiers)".into());
         }
         Some(profile)
     } else {
         None
     };
 
-    // ---- Build the tier registry ------------------------------------------
-    // Execution order is the order of the [[tier]] entries in tasks.toml (or the
-    // original four tiers when there are none). Tier names identify tiers in
-    // policies and telemetry; they never decide order.
-    let mut registry = TierRegistry::new();
+    // ---- Build definition catalog and ordered instance registry ------------
+    // The definitions catalog is unordered. Only tier_instance array order
+    // determines execution order.
+    let mut definitions = TierDefinitionRegistry::new();
+    for definition in &pipeline_config.definitions {
+        definitions.register(TierDefinition::new(definition.id.clone(), definition.kind))?;
+    }
+    let mut registry = TierRegistry::new(definitions);
     let mut tier1_hash = "disabled".to_string();
     let mut tier2_hash = "disabled".to_string();
     for spec in &pipeline_config.tiers {
-        if !tier_enabled(spec, &config.router) {
+        if !tier_enabled(spec) {
             tracing::info!(tier = %spec.id, "tier disabled by configuration");
             continue;
         }
-        let tier: Arc<dyn Tier> = match spec.kind {
+        let definition = pipeline_config.definitions.iter()
+            .find(|definition| definition.id == spec.tier_id)
+            .expect("validated instance references a definition");
+        let tier: Arc<dyn Tier> = match definition.kind {
             TierKind::Rules => {
                 let path = env_or("TIER1_CONFIG", "config/tier1.toml");
                 let engine = Arc::new(Tier1Engine::new(Tier1Automaton::from_toml_file(&path)?)?);
                 tier1_hash = sha256_file(&path)?;
-                Arc::new(RulesTier::new(spec.id.clone(), engine))
+                Arc::new(RulesTier::new(spec.tier_id.clone(), engine))
             }
             TierKind::Fasttext => {
                 let path = std::env::var("FASTTEXT_MODEL")
@@ -343,25 +316,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let runner = Arc::new(Tier2Runner::new(&path)?);
                 tier2_hash = sha256_file(&path)?;
-                Arc::new(FastTextTier::new(spec.id.clone(), runner))
+                Arc::new(FastTextTier::new(spec.tier_id.clone(), runner))
             }
             TierKind::Grpc => {
-                let (endpoint, timeout) = grpc_settings(spec, &config.router)?;
+                let (endpoint, timeout) = grpc_settings(spec)?;
                 Arc::new(GrpcScoringTier::new(
-                    spec.id.clone(),
+                    spec.tier_id.clone(),
                     Tier3Runner::new(endpoint, timeout)?,
                     spec.joint,
                 ))
             }
         };
-        registry.register(tier, spec.legacy_ordinal)?;
+        registry.register(TierInstance::new(
+            spec.id.clone(), spec.tier_id.clone(), spec.model_id.clone(), tier,
+        )?)?;
     }
     if registry.is_empty() {
-        return Err("no cascade tier is enabled; enable at least one [[tier]]".into());
+        return Err("no cascade tier is enabled; enable at least one [[tier_instance]]".into());
     }
     tracing::info!(
-        order = ?registry.directory().infos().iter().map(|info| info.id.as_str()).collect::<Vec<_>>(),
-        "tier registry (execution order)"
+        order = ?registry.directory().infos().iter().map(|info| (info.id.as_str(), info.tier_id.as_str())).collect::<Vec<_>>(),
+        "tier instance registry (execution order)"
     );
     let hashes = telemetry::Hashes {
         tier1_toml: tier1_hash,
