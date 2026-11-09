@@ -254,7 +254,7 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::Mutex;
 
-    type CallLog = Arc<Mutex<Vec<(String, String, Vec<TaskId>)>>>;
+    type CallLog = Arc<Mutex<Vec<(String, String, Option<String>, Vec<TaskId>)>>>;
 
     struct FakeTier {
         id: TierId,
@@ -271,6 +271,7 @@ mod tests {
             self.calls.lock().unwrap().push((
                 ctx.tier_instance_id.to_string(),
                 ctx.tier_id.to_string(),
+                ctx.model_id.map(str::to_string),
                 ctx.tasks.to_vec(),
             ));
             let readings = ctx.tasks.iter().map(|task| {
@@ -346,6 +347,9 @@ mod tests {
         });
         assert_eq!(outcome.tier_calls[0].model_id, "modernbert-base");
         assert_eq!(outcome.tier_calls[1].model_id, "harrier-v1");
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls[0].2.as_deref(), Some("modernbert-base"));
+        assert_eq!(calls[1].2.as_deref(), Some("harrier-v1"));
         assert_eq!(outcome.tier_calls[0].tier_id, outcome.tier_calls[1].tier_id);
     }
 
