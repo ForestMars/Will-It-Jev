@@ -453,8 +453,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 taxonomy_version,
                 output_kind,
                 ollama_tagger,
-            )
-            .with_tier_directory(cascade.directory()),
+            ),
         );
         tracing::info!("sampled task tagging joins the route request's single cascade");
         tagging::spawn(tagger, tag_config)
