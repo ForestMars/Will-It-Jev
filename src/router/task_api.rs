@@ -304,6 +304,7 @@ fn task_outcome_json(outcome: &TaskOutcome, tiers: &TierDirectory) -> Value {
         Resolution::Tier { tier, model_id, reading } => json!({
             "kind": "tier",
             "tier": tier.as_str(),
+            "kind": tiers.kind(tier),
             "position": tiers.position(tier),
             "model_id": model_id,
             "label": reading.label,
@@ -347,6 +348,7 @@ fn task_outcome_json(outcome: &TaskOutcome, tiers: &TierDirectory) -> Value {
         };
         json!({
             "tier": entry.tier.as_str(),
+            "kind": tiers.kind(&entry.tier),
             "position": tiers.position(&entry.tier),
             "model_id": entry.model_id,
             "reading": reading,
