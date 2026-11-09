@@ -247,12 +247,14 @@ impl TierRegistry {
 
     pub fn directory(&self) -> TierDirectory {
         TierDirectory {
-            infos: self.sequence.iter().enumerate().filter_map(|(position, id)| {
-                self.instances.get(id).map(|instance| TierInstanceInfo {
+            infos: self.sequence.iter().enumerate().map(|(position, id)| {
+                let instance = self.instances.get(id)
+                    .expect("every ID in the execution sequence has a registered instance");
+                TierInstanceInfo {
                     id: instance.id.clone(),
                     tier_id: instance.tier_id.clone(),
                     position,
-                })
+                }
             }).collect(),
         }
     }
@@ -341,6 +343,8 @@ mod tests {
             instance("alpha", "grpc", "m2"),
             instance("middle", "grpc", "m3"),
         ]);
+        let sequence: Vec<_> = registry.sequence().iter().map(TierInstanceId::as_str).collect();
+        assert_eq!(sequence, ["zeta", "alpha", "middle"]);
         let directory = registry.directory();
         let order: Vec<_> = directory.infos().iter().map(|info| info.id.as_str()).collect();
         assert_eq!(order, ["zeta", "alpha", "middle"]);
