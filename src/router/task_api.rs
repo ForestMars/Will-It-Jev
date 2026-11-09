@@ -301,10 +301,12 @@ fn selected_task_results(
 /// execution order, for clients that want to show the order.
 fn task_outcome_json(outcome: &TaskOutcome, tiers: &TierDirectory) -> Value {
     let resolution = match &outcome.resolution {
-        Resolution::Tier { tier, model_id, reading } => json!({
+        Resolution::Tier { tier_instance_id, tier_id, model_id, reading } => json!({
             "kind": "tier",
-            "tier": tier.as_str(),
-            "position": tiers.position(tier),
+            "tier_instance_id": tier_instance_id.as_str(),
+            "tier_id": tier_id.as_str(),
+            "tier": tier_instance_id.as_str(),
+            "position": tiers.position(tier_instance_id),
             "model_id": model_id,
             "label": reading.label,
             "confidence": reading.confidence,
@@ -346,8 +348,10 @@ fn task_outcome_json(outcome: &TaskOutcome, tiers: &TierDirectory) -> Value {
             }),
         };
         json!({
-            "tier": entry.tier.as_str(),
-            "position": tiers.position(&entry.tier),
+            "tier_instance_id": entry.tier_instance_id.as_str(),
+            "tier_id": entry.tier_id.as_str(),
+            "tier": entry.tier_instance_id.as_str(),
+            "position": tiers.position(&entry.tier_instance_id),
             "model_id": entry.model_id,
             "reading": reading,
             "decision": decision,
@@ -360,7 +364,7 @@ fn task_outcome_json(outcome: &TaskOutcome, tiers: &TierDirectory) -> Value {
 mod tests {
     use super::*;
     use crate::pipeline::{
-        registry::{tid, TierId, TierRegistry},
+        registry::{iid, tid, TierInstance, TierId, TierRegistry},
         task::{FallbackPolicy, OutputKind, Reading, TierPolicy},
         tier::{Tier, TierContext, TierOutput},
     };
@@ -380,22 +384,20 @@ mod tests {
     #[async_trait]
     impl Tier for FixtureTier {
         fn id(&self) -> &TierId { &self.id }
-        fn name(&self) -> &str { "fixture" }
+        fn name(&self) -> &str { self.id.as_str() }
 
         async fn evaluate(&self, context: &TierContext<'_>) -> TierOutput {
             self.calls.lock().unwrap().push((
-                self.id.to_string(),
+                context.tier_instance_id.to_string(),
                 context.tasks.iter().map(|task| task.as_str().to_string()).collect(),
             ));
             sleep(self.delay).await;
-            let readings = context.tasks.iter().map(|task| {
-                (
-                    task.clone(),
-                    self.readings.get(task).cloned().unwrap_or(TierReading::Unsupported),
-                )
-            }).collect();
+            let readings = context.tasks.iter().map(|task| (
+                task.clone(),
+                self.readings.get(task).cloned().unwrap_or(TierReading::Unsupported),
+            )).collect();
             TierOutput {
-                model_id: format!("fixture-tier-{}", self.id),
+                model_id: format!("fixture-{}", context.tier_instance_id),
                 readings,
             }
         }
@@ -430,21 +432,22 @@ mod tests {
             calls: calls.clone(),
         };
         let tier2 = FixtureTier {
-            id: tid("modernbert"),
-            delay: Duration::from_millis(300),
+            id: tid("grpc"),
+            delay: Duration::from_millis(30),
             readings: [
                 (TaskId::new("urgency"), TierReading::Scored(Reading::new("high", 0.91))),
                 (TaskId::new("fraud_risk"), TierReading::Scored(Reading::new("payment_abuse", 0.88))),
             ].into(),
             calls: calls.clone(),
         };
-        let cascade = Arc::new(CascadeRunner::new(TierRegistry::of(vec![
-            Arc::new(tier1),
-            Arc::new(tier2),
-        ])));
+        let instances = vec![
+            TierInstance::new(iid("rules"), tid("rules"), None, Arc::new(tier1)).unwrap(),
+            TierInstance::new(iid("encoder_modernbert"), tid("grpc"), Some("modernbert-model".into()), Arc::new(tier2)).unwrap(),
+        ];
+        let cascade = Arc::new(CascadeRunner::new(TierRegistry::of(instances)));
         let policies: TierPolicyMap = [
-            (tid("rules"), [(TaskId::new("customer_intent"), TierPolicy::new(0.90))].into()),
-            (tid("modernbert"), [
+            (iid("rules"), [(TaskId::new("customer_intent"), TierPolicy::new(0.90))].into()),
+            (iid("encoder_modernbert"), [
                 (TaskId::new("urgency"), TierPolicy::new(0.80)),
                 (TaskId::new("fraud_risk"), TierPolicy::new(0.80)),
             ].into()),
@@ -458,20 +461,18 @@ mod tests {
         };
         let request = TaskExecutionRequest {
             prompt: "Evaluate the support request.".into(),
-            tasks: vec![
-                "customer_intent".into(),
-                "urgency".into(),
-                "fraud_risk".into(),
-            ],
+            tasks: vec!["customer_intent".into(), "urgency".into(), "fraud_risk".into()],
             required_tasks: Some(vec!["customer_intent".into()]),
         };
 
         let response = execute_task_request(&state, request).await.unwrap();
         assert_eq!(response["status"], "partial");
+        assert_eq!(response["tasks"]["customer_intent"]["resolution"]["label"], "billing");
         assert_eq!(
-            response["tasks"]["customer_intent"]["resolution"]["label"],
-            "billing"
+            response["tasks"]["customer_intent"]["resolution"]["tier_instance_id"],
+            "rules"
         );
+        assert_eq!(response["tasks"]["customer_intent"]["resolution"]["tier_id"], "rules");
         assert_eq!(response["pending_tasks"], json!(["urgency", "fraud_risk"]));
         let run_id = response["run_id"].as_str().unwrap().to_string();
         assert!(matches!(state.runs.poll(&run_id).unwrap(), TaskRunLookup::Pending));
@@ -491,8 +492,9 @@ mod tests {
         assert_eq!(
             complete.tasks[&TaskId::new("urgency")].resolution,
             Resolution::Tier {
-                tier: tid("modernbert"),
-                model_id: "fixture-tier-modernbert".into(),
+                tier_instance_id: iid("encoder_modernbert"),
+                tier_id: tid("grpc"),
+                model_id: "modernbert-model".into(),
                 reading: Reading::new("high", 0.91),
             }
         );
@@ -501,7 +503,7 @@ mod tests {
         assert_eq!(calls[0], ("rules".to_string(), vec!["customer_intent".into()]));
         assert_eq!(
             calls[1],
-            ("modernbert".to_string(), vec!["urgency".into(), "fraud_risk".into()])
+            ("encoder_modernbert".to_string(), vec!["urgency".into(), "fraud_risk".into()])
         );
     }
 }
