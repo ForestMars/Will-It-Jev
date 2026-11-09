@@ -79,7 +79,8 @@ fn default_tier_instances() -> Vec<TierInstanceSpec> {
 fn tier_specs_from(
     raw_definitions: Vec<RawTierDefinition>,
     raw_instances: Vec<RawTierInstance>,
-) -> Result<(Vec<TierDefinitionSpec>, Vec<TierInstanceSpec>), Box<dyn Error>> {
+ ) -> Result<(Vec<TierDefinitionSpec>, Vec<TierInstanceSpec>), Box<dyn Error>> {
+    let no_custom_tier_config = raw_definitions.is_empty() && raw_instances.is_empty();
     let definitions = if raw_definitions.is_empty() {
         default_tier_definitions()
     } else {
@@ -95,7 +96,7 @@ fn tier_specs_from(
     };
 
     let instances = if raw_instances.is_empty() {
-        default_tier_instances()
+        if no_custom_tier_config { default_tier_instances() } else { Vec::new() }
     } else {
         let mut result: Vec<TierInstanceSpec> = Vec::with_capacity(raw_instances.len());
         for raw in raw_instances {
@@ -369,7 +370,7 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
             }
             if by_task.insert(task, policy).is_some() {
                 return Err(format!(
-                    "tier_policy.{tier}.{task_name}: defined twice (a tier name and its tierN alias both appear)"
+                    "tier_policy.{tier}.{task_name}: defined more than once for the same tier instance"
                 )
                 .into());
             }
@@ -543,12 +544,12 @@ timeout_ms = 0"#,
     }
 
     #[test]
-    fn defaults_use_shared_grpc_definition_and_named_instances() {
+    fn defaults_use_shared_encoder_definition_and_named_instances() {
         let cfg = parse("").unwrap();
         assert_eq!(cfg.definitions.len(), 3);
         assert_eq!(
             cfg.tiers.iter().map(|i| (i.id.as_str(), i.tier_id.as_str())).collect::<Vec<_>>(),
-            [("rules", "rules"), ("fasttext", "fasttext"), ("modernbert", "grpc"), ("harrier", "grpc")]
+            [("rules", "rules"), ("fasttext", "fasttext"), ("modernbert", "encoder"), ("harrier", "encoder")]
         );
     }
 }
