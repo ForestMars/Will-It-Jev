@@ -27,19 +27,16 @@ pub struct RouteRecord {
     /// the route handler returns before best-effort work has completed.
     #[serde(default)]
     pub tasks: Vec<TaskDecisionRecord>,
-    /// What every tier that ran said about the route task, keyed by tier name, in
-    /// execution order. This is the complete record. The fixed `tier1_outcome` to
-    /// `tier4_outcome` fields below are derived from it for the original four
-    /// tiers (by legacy ordinal) and kept for existing consumers.
+    /// What every configured instance said about the route task, in execution
+    /// order. Each record preserves instance, definition and model identity.
     #[serde(default)]
     pub tier_outcomes: Vec<TierOutcomeRecord>,
     pub tier1_outcome: Tier1Outcome,
     pub tier2_outcome: Option<Tier2Outcome>,
     pub tier3_outcome: Option<Tier3Outcome>,
     pub tier4_outcome: Option<Tier4Outcome>,
-    /// Legacy ordinal of the deciding tier (1..=4 for the original tiers, 6 for
-    /// fallback, 0 for a tier that has no legacy ordinal). The name is the
-    /// identity; see `decided_by_tier_name`.
+    /// One-based position in the configured instance vector, or 6 for fallback.
+    /// The configured instance name is the identity; see `decided_by_tier_name`.
     #[serde(default)]
     pub cascade_decision_tier: u8,
     /// Name of the tier that decided the route, or `fallback`.
@@ -79,9 +76,6 @@ pub struct TierOutcomeRecord {
     pub tier: String,
     /// Zero-based execution position in the tier registry.
     pub position: usize,
-    /// The 1..=4 number the original tiers carried, when this tier has one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub legacy_ordinal: Option<u8>,
     pub model_id: String,
     /// `scored`, `abstain` or `unsupported`.
     pub status: String,
