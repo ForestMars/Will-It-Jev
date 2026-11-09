@@ -251,7 +251,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .profile(&TaskId::route())
         .ok_or("tasks.toml: missing [task.route] definition")?;
     if !pipeline_config.has_policy(&TaskId::route()) {
-        return Err("tasks.toml: route task has no [tier_policy.<tier>.route] entries".into());
+        return Err("tasks.toml: route task has no [tier_policy.<instance>.route] entries".into());
     }
     let tier_policies = Arc::new(pipeline_config.tier_policies.clone());
     // tag_via_cascade is retained as a compatibility alias. Both settings
@@ -263,7 +263,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "tasks.toml: tag_in_request = true but there is no [task.tag] profile",
         )?;
         if !pipeline_config.has_policy(&TaskId::tag()) {
-            return Err("tasks.toml: tag_in_request = true but no [tier_policy.<tier>.tag] policy is configured".into());
+            return Err("tasks.toml: tag_in_request = true but no [tier_policy.<instance>.tag] policy is configured".into());
         }
         let has_executable_tag_head = pipeline_config.tiers.iter().any(|spec| {
             spec.kind == TierKind::Grpc
@@ -284,14 +284,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ---- Build the tier registry ------------------------------------------
     // Execution order is the order of the [[tier]] entries in tasks.toml (or the
-    // original four tiers when there are none). Tier names identify tiers in
-    // policies and telemetry; they never decide order.
+    // default instances when there are none). Instance names identify configured
+    // realizations in policies and telemetry; they never decide order.
     let mut registry = TierRegistry::new();
     let mut tier1_hash = "disabled".to_string();
     let mut tier2_hash = "disabled".to_string();
     for spec in &pipeline_config.tiers {
         if !tier_enabled(spec, &config.router) {
-            tracing::info!(tier = %spec.id, "tier disabled by configuration");
+            tracing::info!(tier_instance_id = %spec.id, tier_id = %spec.tier_id, "tier instance disabled by configuration");
             continue;
         }
         let tier: Arc<dyn Tier> = match spec.kind {
@@ -333,7 +333,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         registry.register(instance)?;
     }
     if registry.is_empty() {
-        return Err("no cascade tier is enabled; enable at least one [[tier]]".into());
+        return Err("no cascade tier instance is enabled; enable at least one [[tier]]".into());
     }
     tracing::info!(
         order = ?registry.directory().infos().iter().map(|info| info.id.as_str()).collect::<Vec<_>>(),
