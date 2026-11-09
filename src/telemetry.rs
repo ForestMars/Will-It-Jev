@@ -69,7 +69,13 @@ pub struct RouteRecord {
 /// One tier's reading and decision for the route task.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TierOutcomeRecord {
-    /// Tier name.
+    /// Configured realization that executed.
+    #[serde(default)]
+    pub tier_instance_id: String,
+    /// Reusable execution contract.
+    #[serde(default)]
+    pub tier_id: String,
+    /// Backward-compatible alias for the instance name.
     pub tier: String,
     /// Zero-based execution position in the tier registry.
     pub position: usize,
@@ -103,6 +109,12 @@ pub struct TaskDecisionRecord {
     /// Name of the tier that resolved the task; absent for fallback or deferred.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolving_tier_name: Option<String>,
+    /// Stable configured instance identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolving_tier_instance_id: Option<String>,
+    /// Reusable execution contract identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolving_tier_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
