@@ -505,6 +505,7 @@ fn tier_outcome_records(trace: &[TierTrace], tiers: &TierDirectory) -> Vec<TierO
             };
             TierOutcomeRecord {
                 tier: entry.tier.to_string(),
+                kind: tiers.kind(&entry.tier).unwrap_or("unknown").to_string(),
                 position: tiers.position(&entry.tier).unwrap_or_default(),
                 legacy_ordinal: tiers.legacy_ordinal(&entry.tier),
                 model_id: entry.model_id.clone(),
@@ -673,6 +674,7 @@ mod tests {
     impl Tier for NamedTier {
         fn id(&self) -> &TierId { &self.0 }
         fn name(&self) -> &str { "named" }
+        fn kind(&self) -> &'static str { "grpc" }
         async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
             TierOutput::abstain_all("named", ctx.tasks, "test")
         }
@@ -814,6 +816,8 @@ mod tests {
         assert_eq!(winner.confidence, Some(0.97));
         assert_eq!(winner.scores.len(), 2);
         assert_eq!(winner.model_id, "m-modernbert");
+        // Identity triplet: instance name, definition, model.
+        assert_eq!((winner.tier.as_str(), winner.kind.as_str(), winner.model_id.as_str()), ("modernbert", "grpc", "m-modernbert"));
     }
 
     #[test]
