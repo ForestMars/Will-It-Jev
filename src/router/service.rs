@@ -245,7 +245,9 @@ async fn completion(
     };
     for call in &outcome.tier_calls {
         tracing::debug!(
-            tier = %call.tier,
+            tier_instance_id = %call.tier_instance_id,
+            tier_id = %call.tier_id,
+            model_id = %call.model_id,
             task_count = call.tasks.len(),
             elapsed_ms = call.took.as_secs_f64() * 1000.0,
             "cascade tier completed"
@@ -369,7 +371,8 @@ fn route_record(
     let trace = route_outcome.map(|task| task.trace.as_slice()).unwrap_or(&[]);
     for entry in trace {
         tracing::debug!(
-            tier = %entry.tier,
+            tier_instance_id = %entry.tier_instance_id,
+            tier_id = %entry.tier_id,
             model_id = %entry.model_id,
             decision = ?entry.decision,
             "route task tier trace"
@@ -434,6 +437,8 @@ fn route_record(
                 latency_ms,
                 resolving_tier: None,
                 resolving_tier_name: None,
+                resolving_tier_instance_id: None,
+                resolving_tier_id: None,
                 model_id: None,
                 label: None,
                 confidence: None,
