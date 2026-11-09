@@ -17,7 +17,7 @@ checks AS (
     SELECT 'rules_named' AS check_name, '1' AS expected,
         toString(countIf(decided_by_tier_name = 'rules' AND decided_by_tier = 1)) AS actual FROM fixture
     UNION ALL SELECT 'new_tier_named_without_ordinal', '1',
-        toString(countIf(decided_by_tier_name = 'triage' AND decided_by_tier = 0)) FROM fixture
+        toString(countIf(decided_by_tier_name = 'prefilter' AND decided_by_tier = 0)) FROM fixture
     UNION ALL SELECT 'pre_004_row_name_derived_from_ordinal', '1',
         toString(countIf(decided_by_tier_name = 'modernbert' AND decided_by_tier = 3)) FROM fixture
     UNION ALL SELECT 'task_json_has_tier_name', '1',
