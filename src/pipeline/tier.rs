@@ -10,13 +10,19 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use super::registry::TierId;
+use super::registry::{TierId, TierInstanceId};
 use super::task::{OutputKind, Reading, TaskId, TaskProfile, TierReading, LABEL_JEV, LABEL_LLM};
 use crate::router::tier1_runner::Tier1Engine;
 use crate::router::tier2_runner::{Tier2Outcome, Tier2Route, Tier2Runner};
 use crate::router::tier3_runner::{TasksError, Tier3Runner};
 
 pub struct TierContext<'a> {
+    /// Configured realization executing this call.
+    pub tier_instance_id: &'a TierInstanceId,
+    /// Reusable execution contract implemented by the adapter.
+    pub tier_id: &'a TierId,
+    /// Configured model choice, when this instance selects one explicitly.
+    pub model_id: Option<&'a str>,
     pub prompt: &'a str,
     /// Tasks still open that this tier is eligible to answer.
     pub tasks: &'a [TaskId],
@@ -104,8 +110,12 @@ pub struct RulesTier {
 
 impl RulesTier {
     #[allow(dead_code)]
-    pub fn new(id: TierId, engine: Arc<Tier1Engine>) -> Self {
-        Self { id, engine, task_scorers: BTreeMap::new() }
+    pub fn new(engine: Arc<Tier1Engine>) -> Self {
+        Self {
+            id: TierId::new("rules").expect("built-in tier definition is valid"),
+            engine,
+            task_scorers: BTreeMap::new(),
+        }
     }
 
     #[allow(dead_code)]
@@ -168,8 +178,12 @@ pub struct FastTextTier {
 
 impl FastTextTier {
     #[allow(dead_code)]
-    pub fn new(id: TierId, runner: Arc<Tier2Runner>) -> Self {
-        Self { id, runner, task_scorers: BTreeMap::new() }
+    pub fn new(runner: Arc<Tier2Runner>) -> Self {
+        Self {
+            id: TierId::new("fasttext").expect("built-in tier definition is valid"),
+            runner,
+            task_scorers: BTreeMap::new(),
+        }
     }
 
     #[allow(dead_code)]
@@ -241,9 +255,9 @@ pub struct GrpcScoringTier {
 }
 
 impl GrpcScoringTier {
-    pub fn new(id: TierId, runner: Tier3Runner, joint: bool) -> Self {
+    pub fn new(runner: Tier3Runner, joint: bool) -> Self {
         Self {
-            id,
+            id: TierId::new("grpc").expect("built-in tier definition is valid"),
             runner,
             joint,
             joint_unimplemented: AtomicBool::new(false),
@@ -447,7 +461,7 @@ mod tests {
         let sidecar = TestSidecar { joint: true, ..Default::default() };
         let calls = sidecar.tasks_calls.clone();
         let scorer = Tier3Runner::new(endpoint(sidecar).await, Duration::from_secs(2)).unwrap();
-        let tier = GrpcScoringTier::new(crate::pipeline::registry::tid("alternate"), scorer, true);
+        let tier = GrpcScoringTier::new(scorer, true);
         let tasks = [TaskId::route(), TaskId::tag()];
         let profiles = [
             TaskProfile {
@@ -468,7 +482,15 @@ mod tests {
             },
         ];
         let output = tier
-            .evaluate(&TierContext { prompt: "test", tasks: &tasks, task_profiles: &profiles, budget: Duration::from_secs(2) })
+            .evaluate(&TierContext {
+                tier_instance_id: &crate::pipeline::registry::iid("encoder_test"),
+                tier_id: &crate::pipeline::registry::tid("grpc"),
+                model_id: Some("test-model"),
+                prompt: "test",
+                tasks: &tasks,
+                task_profiles: &profiles,
+                budget: Duration::from_secs(2),
+            })
             .await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(matches!(output.readings[&TaskId::route()], TierReading::Scored(_)));
