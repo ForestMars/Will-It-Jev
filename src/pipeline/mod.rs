@@ -10,6 +10,6 @@ pub mod tagger;
 pub mod task;
 pub mod tier;
 
-pub use registry::TierRegistry;
+pub use registry::{TierDefinitionRegistry, TierId, TierInstance, TierInstanceId, TierRegistry};
 pub use runner::CascadeRunner;
 pub use task::TaskId;
