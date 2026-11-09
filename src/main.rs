@@ -13,6 +13,7 @@ use pipeline::tagger::{CascadeTagger, JointTagStore};
 use pipeline::config::{TierKind, TierSpec};
 use pipeline::tier::{FastTextTier, GrpcScoringTier, RulesTier, Tier};
 use pipeline::{CascadeRunner, TaskId, TierRegistry};
+use pipeline::registry::TierInstance;
 use router::dispatch::DownstreamDispatcher;
 use router::service;
 use router::tier1_runner::{Tier1Automaton, Tier1Engine};
@@ -47,53 +48,23 @@ fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
-/// A tier is enabled by its own `enabled`, else by the `[router.tierN]` block of
-/// the legacy ordinal it carries, else it is on.
-fn tier_enabled(spec: &TierSpec, router: &config::RouterConfig) -> bool {
-    spec.enabled
-        .or_else(|| {
-            spec.legacy_ordinal
-                .and_then(|ordinal| router.legacy_tier(ordinal))
-                .map(|tier| tier.enabled)
-        })
-        .unwrap_or(true)
+/// An instance is enabled independently of every other instance.
+fn tier_enabled(spec: &TierSpec, _router: &config::RouterConfig) -> bool {
+    spec.enabled.unwrap_or(true)
 }
 
-/// Endpoint and per-call timeout for a gRPC tier. The original two sidecar
-/// tiers keep their historical environment variables; every other tier uses
-/// `TIER_<NAME>_ENDPOINT` and `TIER_<NAME>_MAX_CALL_MS`.
+/// Endpoint and call timeout are instance configuration. Environment variable
+/// names derive from the instance name, never from sequence position.
 fn grpc_settings(
     spec: &TierSpec,
-    router: &config::RouterConfig,
+    _router: &config::RouterConfig,
 ) -> Result<(String, Duration), Box<dyn std::error::Error>> {
-    let legacy = spec.legacy_ordinal.and_then(|ordinal| router.legacy_tier(ordinal));
-    let endpoint = spec
-        .endpoint
-        .as_deref()
-        .or_else(|| legacy.and_then(|tier| tier.endpoint.as_deref()));
-    let timeout_ms = spec.timeout_ms.or_else(|| legacy.and_then(|tier| tier.timeout_ms));
     let upper = spec.id.as_str().to_ascii_uppercase().replace('-', "_");
-    let (endpoint_env, endpoint_aliases, timeout_env): (String, &[&str], String) =
-        match spec.legacy_ordinal {
-            Some(3) => (
-                "TIER3_SCORER_ENDPOINT".into(),
-                &["MODERNBERT_ENDPOINT"],
-                "TIER3_MAX_CALL_MS".into(),
-            ),
-            Some(4) => (
-                "TIER4_SCORER_ENDPOINT".into(),
-                &["TIER4_HARRIER_ENDPOINT", "TIER3_ENDPOINT"],
-                "TIER4_MAX_CALL_MS".into(),
-            ),
-            _ => (
-                format!("TIER_{upper}_ENDPOINT"),
-                &[],
-                format!("TIER_{upper}_MAX_CALL_MS"),
-            ),
-        };
+    let endpoint_env = format!("TIER_{upper}_ENDPOINT");
+    let timeout_env = format!("TIER_{upper}_MAX_CALL_MS");
     Ok((
-        configured_endpoint(&endpoint_env, endpoint_aliases, endpoint)?,
-        configured_timeout(&timeout_env, timeout_ms)?,
+        configured_endpoint(&endpoint_env, &[], spec.endpoint.as_deref())?,
+        configured_timeout(&timeout_env, spec.timeout_ms)?,
     ))
 }
 
@@ -328,7 +299,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let path = env_or("TIER1_CONFIG", "config/tier1.toml");
                 let engine = Arc::new(Tier1Engine::new(Tier1Automaton::from_toml_file(&path)?)?);
                 tier1_hash = sha256_file(&path)?;
-                Arc::new(RulesTier::new(spec.id.clone(), engine))
+                Arc::new(RulesTier::new(engine))
             }
             TierKind::Fasttext => {
                 let path = std::env::var("FASTTEXT_MODEL")
@@ -343,18 +314,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let runner = Arc::new(Tier2Runner::new(&path)?);
                 tier2_hash = sha256_file(&path)?;
-                Arc::new(FastTextTier::new(spec.id.clone(), runner))
+                Arc::new(FastTextTier::new(runner))
             }
             TierKind::Grpc => {
                 let (endpoint, timeout) = grpc_settings(spec, &config.router)?;
                 Arc::new(GrpcScoringTier::new(
-                    spec.id.clone(),
                     Tier3Runner::new(endpoint, timeout)?,
                     spec.joint,
                 ))
             }
         };
-        registry.register(tier, spec.legacy_ordinal)?;
+        let instance = TierInstance::new(
+            spec.id.clone(),
+            spec.tier_id.clone(),
+            spec.model_id.clone(),
+            tier,
+        )?;
+        registry.register(instance)?;
     }
     if registry.is_empty() {
         return Err("no cascade tier is enabled; enable at least one [[tier]]".into());
