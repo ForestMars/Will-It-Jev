@@ -115,6 +115,8 @@ impl Error for RegistryError {}
 #[derive(Debug, Clone)]
 pub struct TierInfo {
     pub id: TierId,
+    /// Definition this tier is an instance of (`rules`, `fasttext`, `grpc`, ...).
+    pub kind: &'static str,
     /// Zero-based execution position.
     pub position: usize,
     /// The 1..=4 number the original tiers carried, kept only so numbered
@@ -134,6 +136,10 @@ impl TierDirectory {
 
     pub fn position(&self, id: &TierId) -> Option<usize> {
         self.infos.iter().find(|info| &info.id == id).map(|info| info.position)
+    }
+
+    pub fn kind(&self, id: &TierId) -> Option<&'static str> {
+        self.infos.iter().find(|info| &info.id == id).map(|info| info.kind)
     }
 
     pub fn legacy_ordinal(&self, id: &TierId) -> Option<u8> {
@@ -197,6 +203,7 @@ impl TierRegistry {
                 .enumerate()
                 .map(|(position, (tier, legacy_ordinal))| TierInfo {
                     id: tier.id().clone(),
+                    kind: tier.kind(),
                     position,
                     legacy_ordinal: *legacy_ordinal,
                 })
@@ -291,5 +298,18 @@ mod tests {
         assert_eq!(directory.id_for_ordinal(2), None);
         assert_eq!(directory.position(&tid("modernbert")), Some(2));
         assert_eq!(directory.position(&tid("missing")), None);
+    }
+
+    #[test]
+    fn several_instances_can_share_one_definition() {
+        let mut registry = TierRegistry::new();
+        registry.register(named("encoder-fast"), None).unwrap();
+        registry.register(named("encoder-accurate"), None).unwrap();
+        let directory = registry.directory();
+        let fast = directory.kind(&tid("encoder-fast")).unwrap();
+        let accurate = directory.kind(&tid("encoder-accurate")).unwrap();
+        assert_eq!(fast, accurate, "both instances are the same definition");
+        assert_ne!(tid("encoder-fast"), tid("encoder-accurate"), "but distinct instances");
+        assert_eq!(directory.position(&tid("encoder-accurate")), Some(1));
     }
 }
