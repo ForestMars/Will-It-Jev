@@ -70,6 +70,10 @@ struct RawTier {
     /// gRPC tiers only. Defaults to `router.tier<legacy_ordinal>`.
     endpoint: Option<String>,
     timeout_ms: Option<u64>,
+    /// kind = "rules" only: path to the rules file. Defaults to TIER1_CONFIG.
+    config: Option<String>,
+    /// kind = "fasttext" only: path to the model. Defaults to FASTTEXT_MODEL.
+    model: Option<String>,
 }
 
 /// One entry of the tier registry. Position in `PipelineConfig::tiers` is the
@@ -83,6 +87,10 @@ pub struct TierSpec {
     pub enabled: Option<bool>,
     pub endpoint: Option<String>,
     pub timeout_ms: Option<u64>,
+    /// Rules file for this instance (kind = rules).
+    pub config: Option<String>,
+    /// Model file for this instance (kind = fasttext).
+    pub model: Option<String>,
 }
 
 /// Registry used when a config has no `[[tier]]` entries: the original four
@@ -103,6 +111,8 @@ fn default_tier_specs() -> Vec<TierSpec> {
         enabled: None,
         endpoint: None,
         timeout_ms: None,
+        config: None,
+        model: None,
     })
     .collect()
 }
@@ -129,6 +139,17 @@ fn tier_specs_from(raw: Vec<RawTier>) -> Result<Vec<TierSpec>, Box<dyn Error>> {
                 .into());
             }
         }
+        if tier.config.is_some() && tier.kind != TierKind::Rules {
+            return Err(format!("[[tier]] {name:?}: config applies to kind = \"rules\" only").into());
+        }
+        if tier.model.is_some() && tier.kind != TierKind::Fasttext {
+            return Err(format!("[[tier]] {name:?}: model applies to kind = \"fasttext\" only").into());
+        }
+        if tier.config.as_deref().is_some_and(|path| path.trim().is_empty())
+            || tier.model.as_deref().is_some_and(|path| path.trim().is_empty())
+        {
+            return Err(format!("[[tier]] {name:?}: config and model paths must be non-empty").into());
+        }
         if tier.kind != TierKind::Grpc {
             if tier.endpoint.is_some() || tier.timeout_ms.is_some() {
                 return Err(format!(
@@ -138,13 +159,6 @@ fn tier_specs_from(raw: Vec<RawTier>) -> Result<Vec<TierSpec>, Box<dyn Error>> {
             }
             if tier.joint {
                 return Err(format!("[[tier]] {name:?}: joint applies to kind = \"grpc\" only").into());
-            }
-            if specs.iter().any(|existing| existing.kind == tier.kind) {
-                return Err(format!(
-                    "[[tier]] {name:?}: only one tier of kind {:?} may be configured",
-                    tier.kind
-                )
-                .into());
             }
         }
         if tier.endpoint.as_deref().is_some_and(|endpoint| endpoint.trim().is_empty()) {
@@ -161,7 +175,30 @@ fn tier_specs_from(raw: Vec<RawTier>) -> Result<Vec<TierSpec>, Box<dyn Error>> {
             enabled: tier.enabled,
             endpoint: tier.endpoint,
             timeout_ms: tier.timeout_ms,
+            config: tier.config,
+            model: tier.model,
         });
+    }
+    // A kind is the definition; each [[tier]] is an instance of it. Several
+    // instances of one kind are fine, but they must each say which file they use,
+    // otherwise they would silently share the single environment default.
+    for kind in [TierKind::Rules, TierKind::Fasttext] {
+        let instances: Vec<&TierSpec> = specs.iter().filter(|spec| spec.kind == kind).collect();
+        if instances.len() > 1 {
+            for spec in instances {
+                let (field, set) = match kind {
+                    TierKind::Rules => ("config", spec.config.is_some()),
+                    _ => ("model", spec.model.is_some()),
+                };
+                if !set {
+                    return Err(format!(
+                        "[[tier]] {:?}: several tiers of kind {kind:?} are configured, so each needs its own `{field}` path",
+                        spec.id.as_str()
+                    )
+                    .into());
+                }
+            }
+        }
     }
     Ok(specs)
 }
@@ -616,5 +653,59 @@ mod tests {
             );
         }
         assert!(cfg.has_policy(&TaskId::route()));
+    }
+
+    const ROUTE: &str = "[task.route]\nfallback_label = \"needs_llm\"\nlabels = [\"jev_capable\", \"needs_llm\"]\n";
+
+    #[test]
+    fn one_kind_can_back_several_instances_each_with_its_own_model() {
+        let cfg = parse(&format!(
+            "{ROUTE}\n[[tier]]\nname = \"intent-small\"\nkind = \"fasttext\"\nmodel = \"models/small.bin\"\n\
+             [[tier]]\nname = \"intent-large\"\nkind = \"fasttext\"\nmodel = \"models/large.bin\"\n\
+             [[tier]]\nname = \"rules-a\"\nkind = \"rules\"\nconfig = \"config/a.toml\"\n\
+             [[tier]]\nname = \"rules-b\"\nkind = \"rules\"\nconfig = \"config/b.toml\"\n"
+        ))
+        .unwrap();
+        let by_name = |n: &str| cfg.tiers.iter().find(|t| t.id.as_str() == n).unwrap();
+        assert_eq!(by_name("intent-small").kind, by_name("intent-large").kind);
+        assert_ne!(by_name("intent-small").id, by_name("intent-large").id);
+        assert_eq!(by_name("intent-small").model.as_deref(), Some("models/small.bin"));
+        assert_eq!(by_name("intent-large").model.as_deref(), Some("models/large.bin"));
+        assert_eq!(by_name("rules-b").config.as_deref(), Some("config/b.toml"));
+    }
+
+    #[test]
+    fn several_instances_of_one_kind_must_each_name_their_file() {
+        let missing_model = format!(
+            "{ROUTE}\n[[tier]]\nname = \"a\"\nkind = \"fasttext\"\nmodel = \"models/a.bin\"\n\
+             [[tier]]\nname = \"b\"\nkind = \"fasttext\"\n"
+        );
+        let error = parse(&missing_model).unwrap_err().to_string();
+        assert!(error.contains("\"b\"") && error.contains("model"), "{error}");
+        // A single instance may keep using the environment default.
+        assert!(parse(&format!("{ROUTE}\n[[tier]]\nname = \"a\"\nkind = \"fasttext\"\n")).is_ok());
+        // Fields belong to their kind.
+        assert!(parse(&format!("{ROUTE}\n[[tier]]\nname = \"a\"\nkind = \"grpc\"\nmodel = \"x\"\n")).is_err());
+        assert!(parse(&format!("{ROUTE}\n[[tier]]\nname = \"a\"\nkind = \"fasttext\"\nconfig = \"x\"\n")).is_err());
+        assert!(parse(&format!("{ROUTE}\n[[tier]]\nname = \"a\"\nkind = \"fasttext\"\nmodel = \"\"\n")).is_err());
+    }
+
+    #[test]
+    fn swapping_an_instances_model_keeps_its_identity_and_position() {
+        let with = |model: &str| {
+            parse(&format!(
+                "{ROUTE}\n[[tier]]\nname = \"first\"\nkind = \"rules\"\n\
+                 [[tier]]\nname = \"intent\"\nkind = \"fasttext\"\nmodel = \"{model}\"\n\
+                 [tier_policy.intent.route]\nmin_confidence = 0.9\n"
+            ))
+            .unwrap()
+        };
+        let (before, after) = (with("models/v1.bin"), with("models/v2.bin"));
+        let intent = |cfg: &PipelineConfig| cfg.tiers.iter().position(|t| t.id.as_str() == "intent").unwrap();
+        assert_eq!(intent(&before), intent(&after));
+        assert_eq!(before.tiers[1].id, after.tiers[1].id);
+        assert_ne!(before.tiers[1].model, after.tiers[1].model);
+        // The policy bound to the instance name is unaffected by the swap.
+        assert_eq!(format!("{:?}", before.tier_policies), format!("{:?}", after.tier_policies));
     }
 }
