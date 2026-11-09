@@ -1,20 +1,11 @@
-# Three separate concerns:
-#   [task.*]               what a task is (labels, fallback). No tier names here.
-#   [[tier]]               the named execution tiers. Array order IS execution order.
-#   [tier_policy.<tier>.*] when a named tier may resolve a task.
-#
-# Tier names identify tiers; they never decide order. To add a tier, add a
-# [[tier]] entry where it should run and give it policies below.
+# Task contracts, tier definitions, configured instances and policies are
+# separate. Each [[tier]] entry is one configured instance; array order is run
+# order. Multiple instances may reference the same tier definition.
 
 [pipeline]
-# The normal OvenV1Tagger remains the default tagger. Enable only after a sidecar
-# has a trained `tag` head and matching tier policies are configured below.
 tag_via_cascade = false
 tag_in_request = false
-# Must remain below TagConfig.call_timeout (5 seconds).
 tag_budget_ms = 4000
-# gRPC tiers whose sidecars support the joint ScoreTasks RPC, by name. A tier can
-# equally set `joint = true` on its own [[tier]] entry.
 joint_tiers = []
 
 [task.route]
@@ -26,39 +17,44 @@ output_kind = "multiclass"
 taxonomy = "../taskonomies/help_desk.json"
 fallback = "defer"
 
-# ---- Tier registry ---------------------------------------------------------
-# kind = "rules"     pattern rules (at most one); config in TIER1_CONFIG
-# kind = "fasttext"  fastText classifier (at most one); model in FASTTEXT_MODEL
-# kind = "grpc"      any sidecar speaking the scorer protocol (as many as needed)
+# ---- Configured tier instances ---------------------------------------------
+# name: stable instance identity, used by policies and telemetry
+# tier: reusable execution definition (rules | fasttext | grpc)
+# model_id: selected model artifact/configuration for this instance
 #
-# `legacy_ordinal` is the number these tiers carried before they had names. It
-# keeps `[tier_policy.tierN.*]` keys and the numbered telemetry columns working
-# and picks up `[router.tierN]` (enabled / endpoint / timeout_ms) from
-# config/router.toml. New tiers omit it and set enabled/endpoint/timeout_ms here,
-# with TIER_<NAME>_ENDPOINT and TIER_<NAME>_MAX_CALL_MS as environment overrides.
+# The two gRPC instances below share the same execution definition while
+# selecting different model configurations and endpoints.
+
 [[tier]]
 name = "rules"
-kind = "rules"
-legacy_ordinal = 1
+tier = "rules"
+enabled = true
 
 [[tier]]
 name = "fasttext"
-kind = "fasttext"
-legacy_ordinal = 2
+tier = "fasttext"
+model_id = "fasttext-default"
+enabled = true
 
 [[tier]]
 name = "modernbert"
-kind = "grpc"
-legacy_ordinal = 3
+tier = "grpc"
+model_id = "modernbert"
+enabled = true
+endpoint = "http://[::1]:50052"
+timeout_ms = 500
 
 [[tier]]
 name = "harrier"
-kind = "grpc"
-legacy_ordinal = 4
+tier = "grpc"
+model_id = "harrier"
+enabled = true
+endpoint = "http://[::1]:50051"
+timeout_ms = 500
 
-# Route resolution calibration. The rules and fasttext tiers are route-only
-# scorers unless a TaskScorer is registered; the sidecar tiers may serve any task
-# for which their sidecar exposes a head.
+# Calibration is instance-scoped. The two grpc instances can diverge without
+# changing their shared execution definition.
+
 [tier_policy.rules.route]
 min_confidence = 0.78
 strict = true
@@ -76,13 +72,8 @@ label_min_confidence = { jev_capable = 0.95, needs_llm = 0.70 }
 min_confidence = 0.95
 label_min_confidence = { jev_capable = 0.95, needs_llm = 0.70 }
 
-# Enable after one configured joint sidecar has a trained tag head.
-# Tagging is best-effort and shares the route request's cascade run.
+# To enable a joint tag task on one encoder instance, set joint = true on that
+# instance and add [tier_policy.<instance>.tag].
 #
 # [tier_policy.modernbert.tag]
 # min_confidence = 0.85
-#
-# [tier_policy.harrier.tag]
-# min_confidence = 0.85
-#
-# Set pipeline.tag_in_request = true and mark the relevant tier joint.

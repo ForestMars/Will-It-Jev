@@ -11,6 +11,9 @@ service Tier3Scorer {
 
 message ScoreRequest {
   string prompt = 1;
+  // Configured model selection for this tier instance. Empty leaves selection
+  // to the sidecar's deployment default.
+  string model_id = 2;
 }
 
 message ScoreResponse {
@@ -42,6 +45,9 @@ message ScoreTasksRequest {
   // Typed task contracts from the Rust cascade. Sidecars validate their local
   // heads against these labels and output shapes before returning readings.
   repeated TaskSpec task_specs = 3;
+  // Configured model selection for this tier instance. Empty leaves selection
+  // to the sidecar's deployment default.
+  string model_id = 4;
 }
 
 message LabelScore {

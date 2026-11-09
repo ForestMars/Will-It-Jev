@@ -41,6 +41,7 @@ impl Tier3Runner {
     pub async fn score_raw(
         &self,
         prompt: &str,
+        model_id: Option<&str>,
         budget: Duration,
     ) -> Result<RawScore, &'static str> {
         if budget.is_zero() {
@@ -50,6 +51,7 @@ impl Tier3Runner {
         let mut client = self.client.clone();
         let request = ScoreRequest {
             prompt: prompt.to_string(),
+            model_id: model_id.unwrap_or_default().to_string(),
         };
         match timeout(deadline, client.score(request)).await {
             Err(_) => Err("timeout"),
@@ -70,6 +72,7 @@ impl Tier3Runner {
         &self,
         prompt: &str,
         profiles: &[TaskProfile],
+        model_id: Option<&str>,
         budget: Duration,
     ) -> Result<ScoreTasksResponse, TasksError> {
         if budget.is_zero() {
@@ -115,6 +118,7 @@ impl Tier3Runner {
             prompt: prompt.to_string(),
             tasks,
             task_specs,
+            model_id: model_id.unwrap_or_default().to_string(),
         };
         match timeout(deadline, client.score_tasks(request)).await {
             Err(_) => Err(TasksError::Fault("timeout")),
