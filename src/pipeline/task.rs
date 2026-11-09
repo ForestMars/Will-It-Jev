@@ -9,7 +9,7 @@ use std::fmt;
 
 use serde::Deserialize;
 
-use super::registry::TierId;
+use super::registry::TierInstanceId;
 
 pub const LABEL_JEV: &str = "jev_capable";
 pub const LABEL_LLM: &str = "needs_llm";
@@ -148,7 +148,7 @@ impl TierPolicy {
 /// Execution calibration indexed independently from task definitions:
 /// tier name -> task id -> resolution policy. Execution order is not encoded
 /// here; it belongs to the `TierRegistry`.
-pub type TierPolicyMap = BTreeMap<TierId, BTreeMap<TaskId, TierPolicy>>;
+pub type TierPolicyMap = BTreeMap<TierInstanceId, BTreeMap<TaskId, TierPolicy>>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FallbackPolicy {
