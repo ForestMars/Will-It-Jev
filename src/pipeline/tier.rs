@@ -56,9 +56,9 @@ impl TierOutput {
 
 #[async_trait]
 pub trait Tier: Send + Sync {
-    /// Stable name of this tier. It identifies the tier in policies, traces and
-    /// telemetry; it says nothing about where the tier runs. Execution order is
-    /// owned by the `TierRegistry`.
+    /// Stable identity of the reusable execution definition. Policies, traces
+    /// and telemetry identify the configured instance separately; this ID never
+    /// encodes a position. Execution order belongs to the instance vector.
     fn id(&self) -> &TierId;
     /// Label recorded as `model_id` when the tier reports without a model of its own.
     fn name(&self) -> &str;
@@ -243,10 +243,9 @@ impl Tier for FastTextTier {
     }
 }
 
-/// Generic adapter for any gRPC sidecar implementing the scorer protocol. Every
-/// sidecar-backed tier (ModernBERT, Harrier, Oryn, ...) is an instance of this
-/// type with its own name and endpoint; the Rust transport and output contract
-/// are identical, so adding one needs configuration, not code.
+/// Reusable gRPC execution definition. Each configured TierInstance supplies
+/// its own endpoint, timeout, model selection and joint-call setting through
+/// its executor configuration and TierContext.
 pub struct GrpcScoringTier {
     id: TierId,
     runner: Tier3Runner,
