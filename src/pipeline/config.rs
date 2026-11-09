@@ -513,7 +513,7 @@ mod tests {
         legacy_ordinal = 2
 
         [[tier]]
-        name = "triage"
+        name = "prefilter"
         kind = "grpc"
         endpoint = "http://127.0.0.1:50061"
         timeout_ms = 150
@@ -529,13 +529,13 @@ mod tests {
     fn tier_array_order_is_execution_order() {
         let cfg = parse(TIERS).unwrap();
         let names: Vec<_> = cfg.tiers.iter().map(|tier| tier.id.as_str()).collect();
-        assert_eq!(names, ["fasttext", "triage", "modernbert"]);
-        let triage = &cfg.tiers[1];
-        assert_eq!(triage.kind, TierKind::Grpc);
-        assert!(triage.joint);
-        assert_eq!(triage.legacy_ordinal, None);
-        assert_eq!(triage.endpoint.as_deref(), Some("http://127.0.0.1:50061"));
-        assert_eq!(triage.timeout_ms, Some(150));
+        assert_eq!(names, ["fasttext", "prefilter", "modernbert"]);
+        let prefilter = &cfg.tiers[1];
+        assert_eq!(prefilter.kind, TierKind::Grpc);
+        assert!(prefilter.joint);
+        assert_eq!(prefilter.legacy_ordinal, None);
+        assert_eq!(prefilter.endpoint.as_deref(), Some("http://127.0.0.1:50061"));
+        assert_eq!(prefilter.timeout_ms, Some(150));
     }
 
     #[test]
@@ -550,15 +550,15 @@ mod tests {
 
     #[test]
     fn policies_resolve_by_name_or_legacy_alias_and_reject_unknown_tiers() {
-        let by_name = format!("{TIERS}\n[tier_policy.triage.route]\nmin_confidence = 0.8\n");
+        let by_name = format!("{TIERS}\n[tier_policy.prefilter.route]\nmin_confidence = 0.8\n");
         let cfg = parse(&by_name).unwrap();
-        assert!(cfg.tier_policies.keys().any(|id| id.as_str() == "triage"));
+        assert!(cfg.tier_policies.keys().any(|id| id.as_str() == "prefilter"));
 
         let by_alias = format!("{TIERS}\n[tier_policy.tier3.route]\nmin_confidence = 0.9\n");
         let cfg = parse(&by_alias).unwrap();
         assert!(cfg.tier_policies.keys().any(|id| id.as_str() == "modernbert"));
 
-        // triage has no legacy ordinal, so no tierN alias reaches it.
+        // prefilter has no legacy ordinal, so no tierN alias reaches it.
         let unreachable = format!("{TIERS}\n[tier_policy.tier1.route]\nmin_confidence = 0.9\n");
         assert!(parse(&unreachable).is_err());
 
@@ -595,7 +595,7 @@ mod tests {
         // because the tables are independent.
         let cfg = parse(&by_name).unwrap();
         assert!(cfg.tiers.iter().find(|t| t.id.as_str() == "modernbert").unwrap().joint);
-        assert!(cfg.tiers.iter().find(|t| t.id.as_str() == "triage").unwrap().joint);
+        assert!(cfg.tiers.iter().find(|t| t.id.as_str() == "prefilter").unwrap().joint);
 
         let by_number = format!("{TIERS}\n[pipeline]\njoint_tiers = [3]\n");
         assert!(parse(&by_number).unwrap().tiers.iter().find(|t| t.id.as_str() == "modernbert").unwrap().joint);

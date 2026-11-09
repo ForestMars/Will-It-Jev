@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn tier_names_are_validated() {
-        for ok in ["rules", "fasttext", "modernbert", "harrier", "oryn-2", "a", "triage_v2"] {
+        for ok in ["rules", "fasttext", "modernbert", "harrier", "oryn-2", "a", "prefilter_v2"] {
             assert!(TierId::new(ok).is_ok(), "{ok} should be valid");
         }
         for bad in ["", "Rules", "2fast", "has space", "x.y", "fallback", "tier3", &"a".repeat(33)] {
@@ -282,11 +282,11 @@ mod tests {
     fn directory_maps_between_names_and_legacy_ordinals() {
         let mut registry = TierRegistry::new();
         registry.register(named("rules"), Some(1)).unwrap();
-        registry.register(named("triage"), None).unwrap();
+        registry.register(named("prefilter"), None).unwrap();
         registry.register(named("modernbert"), Some(3)).unwrap();
         let directory = registry.directory();
         assert_eq!(directory.legacy_ordinal(&tid("modernbert")), Some(3));
-        assert_eq!(directory.legacy_ordinal(&tid("triage")), None);
+        assert_eq!(directory.legacy_ordinal(&tid("prefilter")), None);
         assert_eq!(directory.id_for_ordinal(3), Some(&tid("modernbert")));
         assert_eq!(directory.id_for_ordinal(2), None);
         assert_eq!(directory.position(&tid("modernbert")), Some(2));
