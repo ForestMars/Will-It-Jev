@@ -2,7 +2,7 @@ mod schema;
 
 use std::{error::Error, fs, path::Path};
 
-pub use schema::AppConfig;
+pub use schema::{AppConfig, RouterConfig};
 
 pub fn load_from_path(path: impl AsRef<Path>) -> Result<AppConfig, Box<dyn Error>> {
     let contents = fs::read_to_string(path)?;

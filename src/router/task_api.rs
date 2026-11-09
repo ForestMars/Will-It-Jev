@@ -24,6 +24,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::pipeline::{
+    registry::TierDirectory,
     runner::{CascadeRunner, Resolution, RunOutcome, TaskOutcome},
     task::{Decision, TaskId, TaskProfile, TierPolicyMap, TierReading},
 };
@@ -171,7 +172,7 @@ async fn get_task_run(
             Json(json!({
                 "run_id": run_id,
                 "status": "complete",
-                "tasks": all_task_results(&outcome),
+                "tasks": all_task_results(&outcome, &state.cascade.directory()),
             })),
         ).into_response(),
         Ok(TaskRunLookup::Failed(error)) | Err(error) => (
@@ -244,7 +245,7 @@ async fn execute_task_request(
         return Ok(json!({
             "run_id": run_id,
             "status": "complete",
-            "tasks": all_task_results(&outcome),
+            "tasks": all_task_results(&outcome, &state.cascade.directory()),
         }));
     }
 
@@ -269,34 +270,41 @@ async fn execute_task_request(
         "run_id": run_id,
         "status": "partial",
         "required_tasks": required_names,
-        "tasks": selected_task_results(&required_outcome, &required_ids),
+        "tasks": selected_task_results(&required_outcome, &required_ids, &state.cascade.directory()),
         "pending_tasks": pending_names,
     }))
 }
 
-fn all_task_results(outcome: &RunOutcome) -> Value {
+fn all_task_results(outcome: &RunOutcome, tiers: &TierDirectory) -> Value {
     let mut tasks = Map::new();
     for (task_id, task_outcome) in &outcome.tasks {
-        tasks.insert(task_id.as_str().to_string(), task_outcome_json(task_outcome));
+        tasks.insert(task_id.as_str().to_string(), task_outcome_json(task_outcome, tiers));
     }
     Value::Object(tasks)
 }
 
-fn selected_task_results(outcome: &RunOutcome, selected: &BTreeSet<TaskId>) -> Value {
+fn selected_task_results(
+    outcome: &RunOutcome,
+    selected: &BTreeSet<TaskId>,
+    tiers: &TierDirectory,
+) -> Value {
     let mut tasks = Map::new();
     for task_id in selected {
         if let Some(task_outcome) = outcome.tasks.get(task_id) {
-            tasks.insert(task_id.as_str().to_string(), task_outcome_json(task_outcome));
+            tasks.insert(task_id.as_str().to_string(), task_outcome_json(task_outcome, tiers));
         }
     }
     Value::Object(tasks)
 }
 
-fn task_outcome_json(outcome: &TaskOutcome) -> Value {
+/// `tier` is the tier's name; `position` is its zero-based place in the
+/// execution order, for clients that want to show the order.
+fn task_outcome_json(outcome: &TaskOutcome, tiers: &TierDirectory) -> Value {
     let resolution = match &outcome.resolution {
         Resolution::Tier { tier, model_id, reading } => json!({
             "kind": "tier",
-            "tier": tier,
+            "tier": tier.as_str(),
+            "position": tiers.position(tier),
             "model_id": model_id,
             "label": reading.label,
             "confidence": reading.confidence,
@@ -338,7 +346,8 @@ fn task_outcome_json(outcome: &TaskOutcome) -> Value {
             }),
         };
         json!({
-            "tier": entry.tier,
+            "tier": entry.tier.as_str(),
+            "position": tiers.position(&entry.tier),
             "model_id": entry.model_id,
             "reading": reading,
             "decision": decision,
@@ -351,6 +360,7 @@ fn task_outcome_json(outcome: &TaskOutcome) -> Value {
 mod tests {
     use super::*;
     use crate::pipeline::{
+        registry::{tid, TierId, TierRegistry},
         task::{FallbackPolicy, OutputKind, Reading, TierPolicy},
         tier::{Tier, TierContext, TierOutput},
     };
@@ -358,10 +368,10 @@ mod tests {
     use std::collections::BTreeMap;
     use tokio::time::{sleep, timeout};
 
-    type CallLog = Arc<Mutex<Vec<(u8, Vec<String>)>>>;
+    type CallLog = Arc<Mutex<Vec<(String, Vec<String>)>>>;
 
     struct FixtureTier {
-        id: u8,
+        id: TierId,
         delay: Duration,
         readings: BTreeMap<TaskId, TierReading>,
         calls: CallLog,
@@ -369,12 +379,12 @@ mod tests {
 
     #[async_trait]
     impl Tier for FixtureTier {
-        fn id(&self) -> u8 { self.id }
+        fn id(&self) -> &TierId { &self.id }
         fn name(&self) -> &str { "fixture" }
 
         async fn evaluate(&self, context: &TierContext<'_>) -> TierOutput {
             self.calls.lock().unwrap().push((
-                self.id,
+                self.id.to_string(),
                 context.tasks.iter().map(|task| task.as_str().to_string()).collect(),
             ));
             sleep(self.delay).await;
@@ -411,7 +421,7 @@ mod tests {
             profile("fraud_risk", OutputKind::Multilabel, &["account_takeover", "payment_abuse"]),
         ];
         let tier1 = FixtureTier {
-            id: 1,
+            id: tid("rules"),
             delay: Duration::ZERO,
             readings: [(
                 TaskId::new("customer_intent"),
@@ -420,7 +430,7 @@ mod tests {
             calls: calls.clone(),
         };
         let tier2 = FixtureTier {
-            id: 2,
+            id: tid("modernbert"),
             delay: Duration::from_millis(300),
             readings: [
                 (TaskId::new("urgency"), TierReading::Scored(Reading::new("high", 0.91))),
@@ -428,13 +438,13 @@ mod tests {
             ].into(),
             calls: calls.clone(),
         };
-        let cascade = Arc::new(CascadeRunner::new(vec![
+        let cascade = Arc::new(CascadeRunner::new(TierRegistry::of(vec![
             Arc::new(tier1),
             Arc::new(tier2),
-        ]));
+        ])));
         let policies: TierPolicyMap = [
-            (1, [(TaskId::new("customer_intent"), TierPolicy::new(0.90))].into()),
-            (2, [
+            (tid("rules"), [(TaskId::new("customer_intent"), TierPolicy::new(0.90))].into()),
+            (tid("modernbert"), [
                 (TaskId::new("urgency"), TierPolicy::new(0.80)),
                 (TaskId::new("fraud_risk"), TierPolicy::new(0.80)),
             ].into()),
@@ -481,17 +491,17 @@ mod tests {
         assert_eq!(
             complete.tasks[&TaskId::new("urgency")].resolution,
             Resolution::Tier {
-                tier: 2,
-                model_id: "fixture-tier-2".into(),
+                tier: tid("modernbert"),
+                model_id: "fixture-tier-modernbert".into(),
                 reading: Reading::new("high", 0.91),
             }
         );
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0], (1, vec!["customer_intent".into()]));
+        assert_eq!(calls[0], ("rules".to_string(), vec!["customer_intent".into()]));
         assert_eq!(
             calls[1],
-            (2, vec!["urgency".into(), "fraud_risk".into()])
+            ("modernbert".to_string(), vec!["urgency".into(), "fraud_risk".into()])
         );
     }
 }

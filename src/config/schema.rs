@@ -22,6 +22,21 @@ pub struct RouterConfig {
     pub tier6: TierConfig,
 }
 
+impl RouterConfig {
+    /// Settings block for a tier that still carries its original 1..=6 number.
+    pub fn legacy_tier(&self, ordinal: u8) -> Option<&TierConfig> {
+        match ordinal {
+            1 => Some(&self.tier1),
+            2 => Some(&self.tier2),
+            3 => Some(&self.tier3),
+            4 => Some(&self.tier4),
+            5 => Some(&self.tier5),
+            6 => Some(&self.tier6),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct TierConfig {
     #[serde(default)]

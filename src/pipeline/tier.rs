@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use super::registry::TierId;
 use super::task::{OutputKind, Reading, TaskId, TaskProfile, TierReading, LABEL_JEV, LABEL_LLM};
 use crate::router::tier1_runner::Tier1Engine;
 use crate::router::tier2_runner::{Tier2Outcome, Tier2Route, Tier2Runner};
@@ -49,8 +50,11 @@ impl TierOutput {
 
 #[async_trait]
 pub trait Tier: Send + Sync {
-    /// Position in the execution cascade; it is not a task identifier.
-    fn id(&self) -> u8;
+    /// Stable name of this tier. It identifies the tier in policies, traces and
+    /// telemetry; it says nothing about where the tier runs. Execution order is
+    /// owned by the `TierRegistry`.
+    fn id(&self) -> &TierId;
+    /// Label recorded as `model_id` when the tier reports without a model of its own.
     fn name(&self) -> &str;
     /// A tier without a compatible head reports the task as unsupported.
     async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput;
@@ -91,15 +95,17 @@ fn route_only(ctx: &TierContext<'_>, model_id: &str, route: TierReading) -> Tier
     }
 }
 
-pub struct Tier1Tier {
+/// Pattern-rule tier (Aho-Corasick plus fuzzy matching).
+pub struct RulesTier {
+    id: TierId,
     engine: Arc<Tier1Engine>,
     task_scorers: BTreeMap<TaskId, Arc<dyn TaskScorer>>,
 }
 
-impl Tier1Tier {
+impl RulesTier {
     #[allow(dead_code)]
-    pub fn new(engine: Arc<Tier1Engine>) -> Self {
-        Self { engine, task_scorers: BTreeMap::new() }
+    pub fn new(id: TierId, engine: Arc<Tier1Engine>) -> Self {
+        Self { id, engine, task_scorers: BTreeMap::new() }
     }
 
     #[allow(dead_code)]
@@ -110,9 +116,9 @@ impl Tier1Tier {
 }
 
 #[async_trait]
-impl Tier for Tier1Tier {
-    fn id(&self) -> u8 {
-        1
+impl Tier for RulesTier {
+    fn id(&self) -> &TierId {
+        &self.id
     }
 
     fn name(&self) -> &str {
@@ -153,15 +159,17 @@ impl Tier for Tier1Tier {
     }
 }
 
-pub struct Tier2Tier {
+/// fastText classifier tier.
+pub struct FastTextTier {
+    id: TierId,
     runner: Arc<Tier2Runner>,
     task_scorers: BTreeMap<TaskId, Arc<dyn TaskScorer>>,
 }
 
-impl Tier2Tier {
+impl FastTextTier {
     #[allow(dead_code)]
-    pub fn new(runner: Arc<Tier2Runner>) -> Self {
-        Self { runner, task_scorers: BTreeMap::new() }
+    pub fn new(id: TierId, runner: Arc<Tier2Runner>) -> Self {
+        Self { id, runner, task_scorers: BTreeMap::new() }
     }
 
     #[allow(dead_code)]
@@ -195,9 +203,9 @@ pub fn tier2_reading(outcome: &Tier2Outcome) -> TierReading {
 }
 
 #[async_trait]
-impl Tier for Tier2Tier {
-    fn id(&self) -> u8 {
-        2
+impl Tier for FastTextTier {
+    fn id(&self) -> &TierId {
+        &self.id
     }
 
     fn name(&self) -> &str {
@@ -221,22 +229,21 @@ impl Tier for Tier2Tier {
     }
 }
 
-/// Generic adapter for any gRPC sidecar implementing the Tier 3 scorer
-/// protocol. Tier 4 (Harrier/Oryn) is another instance with a different ID,
-/// name, and endpoint; the Rust transport and output contract are identical.
+/// Generic adapter for any gRPC sidecar implementing the scorer protocol. Every
+/// sidecar-backed tier (ModernBERT, Harrier, Oryn, ...) is an instance of this
+/// type with its own name and endpoint; the Rust transport and output contract
+/// are identical, so adding one needs configuration, not code.
 pub struct GrpcScoringTier {
-    id: u8,
-    name: &'static str,
+    id: TierId,
     runner: Tier3Runner,
     joint: bool,
     joint_unimplemented: AtomicBool,
 }
 
 impl GrpcScoringTier {
-    pub fn new(id: u8, name: &'static str, runner: Tier3Runner, joint: bool) -> Self {
+    pub fn new(id: TierId, runner: Tier3Runner, joint: bool) -> Self {
         Self {
             id,
-            name,
             runner,
             joint,
             joint_unimplemented: AtomicBool::new(false),
@@ -245,7 +252,7 @@ impl GrpcScoringTier {
 
     async fn route_via_score(&self, ctx: &TierContext<'_>) -> TierOutput {
         match self.runner.score_raw(ctx.prompt, ctx.budget).await {
-            Err(reason) => TierOutput::abstain_all(self.name, ctx.tasks, reason),
+            Err(reason) => TierOutput::abstain_all(self.id.as_str(), ctx.tasks, reason),
             Ok(raw) => route_only(
                 ctx,
                 &raw.model_id,
@@ -257,12 +264,12 @@ impl GrpcScoringTier {
 
 #[async_trait]
 impl Tier for GrpcScoringTier {
-    fn id(&self) -> u8 {
-        self.id
+    fn id(&self) -> &TierId {
+        &self.id
     }
 
     fn name(&self) -> &str {
-        self.name
+        self.id.as_str()
     }
 
     async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
@@ -328,10 +335,10 @@ impl Tier for GrpcScoringTier {
                     };
                 }
                 Err(TasksError::Fault(reason)) => {
-                    return TierOutput::abstain_all(self.name, ctx.tasks, reason);
+                    return TierOutput::abstain_all(self.id.as_str(), ctx.tasks, reason);
                 }
                 Err(TasksError::Unimplemented) => {
-                    tracing::warn!(tier = self.id, "sidecar has no ScoreTasks RPC; falling back to single-task Score");
+                    tracing::warn!(tier = %self.id, "sidecar has no ScoreTasks RPC; falling back to single-task Score");
                     self.joint_unimplemented.store(true, Ordering::Relaxed);
                 }
             }
@@ -340,7 +347,7 @@ impl Tier for GrpcScoringTier {
         if ctx.tasks.contains(&route_id) {
             self.route_via_score(ctx).await
         } else {
-            unsupported_all(ctx, self.name)
+            unsupported_all(ctx, self.id.as_str())
         }
     }
 }
@@ -440,7 +447,7 @@ mod tests {
         let sidecar = TestSidecar { joint: true, ..Default::default() };
         let calls = sidecar.tasks_calls.clone();
         let scorer = Tier3Runner::new(endpoint(sidecar).await, Duration::from_secs(2)).unwrap();
-        let tier = GrpcScoringTier::new(4, "alternate-sidecar", scorer, true);
+        let tier = GrpcScoringTier::new(crate::pipeline::registry::tid("alternate"), scorer, true);
         let tasks = [TaskId::route(), TaskId::tag()];
         let profiles = [
             TaskProfile {
