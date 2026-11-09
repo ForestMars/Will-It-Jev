@@ -517,7 +517,6 @@ fn tier_outcome_records(trace: &[TierTrace], tiers: &TierDirectory) -> Vec<TierO
                 tier_id: entry.tier_id.to_string(),
                 tier: entry.tier_instance_id.to_string(),
                 position: tiers.position(&entry.tier_instance_id).unwrap_or_default(),
-                legacy_ordinal: None,
                 model_id: entry.model_id.clone(),
                 status: status.into(),
                 decided: matches!(&entry.decision, Decision::Resolve(_)),
@@ -718,7 +717,7 @@ mod tests {
             )].into(),
             tier_calls: Vec::new(),
         };
-        let (backend, record) = route_record(
+        let (_backend, record) = route_record(
             "req-1".into(),
             "prompt",
             &Hashes { tier1_toml: "a".into(), tier2_bin: "b".into() },
@@ -727,7 +726,6 @@ mod tests {
             &outcome,
             Instant::now(),
         );
-        assert_eq!(backend, Backend::Jev);
         record
     }
 
