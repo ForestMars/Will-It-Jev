@@ -378,16 +378,16 @@ fn route_record(
             "route task tier trace"
         );
     }
-    let tier1_outcome = trace_for_ordinal(trace, tiers, 1)
+    let tier1_outcome = trace_at_position(trace, tiers, 1)
         .map(tier1_record)
         .unwrap_or(Tier1Record {
             confidence: 0.0,
             decided: false,
             reason: "disabled".into(),
         });
-    let tier2_outcome = trace_for_ordinal(trace, tiers, 2).map(tier2_record);
-    let tier3_outcome = trace_for_ordinal(trace, tiers, 3).map(tier3_record);
-    let tier4_outcome = trace_for_ordinal(trace, tiers, 4).map(tier3_record);
+    let tier2_outcome = trace_at_position(trace, tiers, 2).map(tier2_record);
+    let tier3_outcome = trace_at_position(trace, tiers, 3).map(tier3_record);
+    let tier4_outcome = trace_at_position(trace, tiers, 4).map(tier3_record);
     let latency_us = started.elapsed().as_micros();
     let task_decisions = outcome.tasks.iter().map(|(task_id, task_outcome)| {
         let output_kind = profiles.iter()
@@ -529,15 +529,14 @@ fn tier_outcome_records(trace: &[TierTrace], tiers: &TierDirectory) -> Vec<TierO
         .collect()
 }
 
-/// The numbered telemetry fields (`tier1_outcome` .. `tier4_outcome`) describe
-/// the original four tiers. Find the trace entry of whichever registered tier
-/// carries that legacy ordinal.
-fn trace_for_ordinal<'a>(
+/// Compatibility projections for the first four configured positions. They
+/// never participate in registry identity, ordering or policy lookup.
+fn trace_at_position<'a>(
     trace: &'a [TierTrace],
     tiers: &TierDirectory,
-    ordinal: u8,
+    one_based_position: u8,
 ) -> Option<&'a TierTrace> {
-    let position = usize::from(ordinal.checked_sub(1)?);
+    let position = usize::from(one_based_position.checked_sub(1)?);
     trace.iter().find(|entry| tiers.position(&entry.tier_instance_id) == Some(position))
 }
 
