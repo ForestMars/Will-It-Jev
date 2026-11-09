@@ -196,11 +196,12 @@ impl TierDirectory {
     }
 }
 
-/// Ordered collection of configured instances. Definitions may be shared by
-/// any number of entries; only instance IDs must be unique.
+/// Ordered collection of configured instances. The execution sequence is
+/// explicitly a vector of IDs; instance values live in a separate lookup map.
 pub struct TierRegistry {
     definitions: TierDefinitionRegistry,
-    entries: Vec<TierInstance>,
+    sequence: Vec<TierInstanceId>,
+    instances: BTreeMap<TierInstanceId, TierInstance>,
 }
 
 impl Default for TierRegistry {
@@ -213,7 +214,11 @@ impl TierRegistry {
     }
 
     pub fn with_definitions(definitions: TierDefinitionRegistry) -> Self {
-        Self { definitions, entries: Vec::new() }
+        Self {
+            definitions,
+            sequence: Vec::new(),
+            instances: BTreeMap::new(),
+        }
     }
 
     pub fn definitions(&self) -> &TierDefinitionRegistry { &self.definitions }
@@ -222,28 +227,39 @@ impl TierRegistry {
         if !self.definitions.contains(&instance.tier_id) {
             return Err(RegistryError::UnknownDefinition(instance.tier_id));
         }
-        if self.entries.iter().any(|existing| existing.id == instance.id) {
+        if self.instances.contains_key(&instance.id) {
             return Err(RegistryError::DuplicateInstance(instance.id));
         }
-        self.entries.push(instance);
+        self.sequence.push(instance.id.clone());
+        self.instances.insert(instance.id.clone(), instance);
         Ok(())
     }
 
-    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+    pub fn instance(&self, id: &TierInstanceId) -> Option<&TierInstance> {
+        self.instances.get(id)
+    }
+
+    pub fn sequence(&self) -> &[TierInstanceId] {
+        &self.sequence
+    }
+
+    pub fn is_empty(&self) -> bool { self.sequence.is_empty() }
 
     pub fn directory(&self) -> TierDirectory {
         TierDirectory {
-            infos: self.entries.iter().enumerate().map(|(position, instance)| {
-                TierInstanceInfo {
+            infos: self.sequence.iter().enumerate().filter_map(|(position, id)| {
+                self.instances.get(id).map(|instance| TierInstanceInfo {
                     id: instance.id.clone(),
                     tier_id: instance.tier_id.clone(),
                     position,
-                }
+                })
             }).collect(),
         }
     }
 
-    pub(crate) fn into_instances(self) -> Vec<TierInstance> { self.entries }
+    pub(crate) fn into_ordered(self) -> (Vec<TierInstanceId>, BTreeMap<TierInstanceId, TierInstance>) {
+        (self.sequence, self.instances)
+    }
 
     #[cfg(test)]
     pub fn of(instances: Vec<TierInstance>) -> Self {
