@@ -85,7 +85,7 @@ fn configured_endpoint(
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "missing endpoint: set {name}, or configure `endpoint` on the tier ([[tier]] in config/tasks.toml or [router.tierN] in config/router.toml)"
+                    "missing endpoint: set {name}, or configure `endpoint` on the tier instance ([[tier]] in config/tasks.toml)"
                 ),
             )
             .into()
@@ -102,7 +102,7 @@ fn configured_timeout(
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "missing timeout: set {name}, or configure `timeout_ms` on the tier ([[tier]] in config/tasks.toml or [router.tierN] in config/router.toml)"
+                    "missing timeout: set {name}, or configure `timeout_ms` on the tier instance ([[tier]] in config/tasks.toml)"
                 ),
             )
         })?,
