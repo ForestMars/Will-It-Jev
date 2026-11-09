@@ -264,7 +264,7 @@ impl GrpcScoringTier {
     }
 
     async fn route_via_score(&self, ctx: &TierContext<'_>) -> TierOutput {
-        match self.runner.score_raw(ctx.prompt, ctx.budget).await {
+        match self.runner.score_raw(ctx.prompt, ctx.model_id, ctx.budget).await {
             Err(reason) => TierOutput::abstain_all(self.id.as_str(), ctx.tasks, reason),
             Ok(raw) => route_only(
                 ctx,
@@ -299,7 +299,7 @@ impl Tier for GrpcScoringTier {
                 .collect();
             match self
                 .runner
-                .score_tasks(ctx.prompt, &requested_profiles, ctx.budget)
+                .score_tasks(ctx.prompt, &requested_profiles, ctx.model_id, ctx.budget)
                 .await
             {
                 Ok(response) => {
