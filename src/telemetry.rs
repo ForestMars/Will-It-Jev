@@ -66,14 +66,20 @@ pub struct RouteRecord {
     pub sampling: Sampling,
 }
 
-/// One tier's reading and decision for the route task.
+/// One tier instance's reading and decision for the route task.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TierOutcomeRecord {
     /// Tier name.
     pub tier: String,
+    /// Stable configured instance identity (same as the legacy `tier` alias).
+    #[serde(default)]
+    pub tier_instance_id: String,
+    /// Reusable execution architecture identity.
+    #[serde(default)]
+    pub tier_id: String,
     /// Zero-based execution position in the tier registry.
     pub position: usize,
-    /// The 1..=4 number the original tiers carried, when this tier has one.
+    /// One-based vector position, retained under the legacy field name for compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_ordinal: Option<u8>,
     pub model_id: String,
@@ -100,9 +106,13 @@ pub struct TaskDecisionRecord {
     pub latency_ms: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolving_tier: Option<u8>,
-    /// Name of the tier that resolved the task; absent for fallback or deferred.
+    /// Instance name that resolved the task; absent for fallback or deferred.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolving_tier_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

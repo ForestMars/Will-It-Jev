@@ -120,8 +120,8 @@ impl<F: Tagger> Tagger for CascadeTagger<F> {
             return self.fallback.tag(input).await;
         };
         match outcome.tasks.get(&TaskId::tag()).map(|task| &task.resolution) {
-            Some(Resolution::Tier { tier, model_id, reading }) => {
-                tracing::debug!(request_id = %input.request_id, tier = %tier, model_id,
+            Some(Resolution::Tier { tier_instance_id, tier_id, model_id, reading }) => {
+                tracing::debug!(request_id = %input.request_id, tier_instance_id = %tier_instance_id, tier_id = %tier_id, model_id,
                     "tag decision reused from request cascade");
                 Ok(TaggerOutput {
                     verdict: verdict(reading),
@@ -129,8 +129,10 @@ impl<F: Tagger> Tagger for CascadeTagger<F> {
                     decision: Some(TaskDecisionMetadata {
                         task_id: TaskId::tag().as_str().to_string(),
                         output_kind: self.output_kind.clone(),
-                        resolving_tier: self.tiers.legacy_ordinal(tier),
-                        resolving_tier_name: Some(tier.to_string()),
+                        resolving_tier: self.tiers.legacy_ordinal(tier_instance_id),
+                        resolving_tier_name: Some(tier_instance_id.to_string()),
+                        tier_instance_id: Some(tier_instance_id.to_string()),
+                        tier_id: Some(tier_id.to_string()),
                         model_id: Some(model_id.clone()),
                         scores: reading.scores.iter().map(|(category_id, score)| {
                             CategoryScore { category_id: category_id.clone(), score: *score }
@@ -148,7 +150,7 @@ impl<F: Tagger> Tagger for CascadeTagger<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::registry::tid;
+    use crate::pipeline::registry::{iid, tid};
     use std::future::Future;
     use crate::pipeline::runner::{RunOutcome, TaskOutcome};
     use crate::pipeline::task::TaskId;
@@ -188,7 +190,8 @@ mod tests {
                 TaskId::tag(),
                 TaskOutcome {
                     resolution: Resolution::Tier {
-                        tier: tid("modernbert"),
+                        tier_instance_id: iid("modernbert"),
+                        tier_id: tid("encoder"),
                         model_id: "shared-encoder".into(),
                         reading: Reading {
                             label: "help_desk".into(),

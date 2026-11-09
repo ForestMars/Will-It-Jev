@@ -301,10 +301,12 @@ fn selected_task_results(
 /// execution order, for clients that want to show the order.
 fn task_outcome_json(outcome: &TaskOutcome, tiers: &TierDirectory) -> Value {
     let resolution = match &outcome.resolution {
-        Resolution::Tier { tier, model_id, reading } => json!({
+        Resolution::Tier { tier_instance_id, tier_id, model_id, reading } => json!({
             "kind": "tier",
-            "tier": tier.as_str(),
-            "position": tiers.position(tier),
+            "tier": tier_instance_id.as_str(),
+            "tier_instance_id": tier_instance_id.as_str(),
+            "tier_id": tier_id.as_str(),
+            "position": tiers.position(tier_instance_id),
             "model_id": model_id,
             "label": reading.label,
             "confidence": reading.confidence,
@@ -346,8 +348,10 @@ fn task_outcome_json(outcome: &TaskOutcome, tiers: &TierDirectory) -> Value {
             }),
         };
         json!({
-            "tier": entry.tier.as_str(),
-            "position": tiers.position(&entry.tier),
+            "tier": entry.tier_instance_id.as_str(),
+            "tier_instance_id": entry.tier_instance_id.as_str(),
+            "tier_id": entry.tier_id.as_str(),
+            "position": tiers.position(&entry.tier_instance_id),
             "model_id": entry.model_id,
             "reading": reading,
             "decision": decision,
@@ -360,7 +364,7 @@ fn task_outcome_json(outcome: &TaskOutcome, tiers: &TierDirectory) -> Value {
 mod tests {
     use super::*;
     use crate::pipeline::{
-        registry::{tid, TierId, TierRegistry},
+        registry::{iid, tid, TierId, TierRegistry},
         task::{FallbackPolicy, OutputKind, Reading, TierPolicy},
         tier::{Tier, TierContext, TierOutput},
     };
@@ -443,8 +447,8 @@ mod tests {
             Arc::new(tier2),
         ])));
         let policies: TierPolicyMap = [
-            (tid("rules"), [(TaskId::new("customer_intent"), TierPolicy::new(0.90))].into()),
-            (tid("modernbert"), [
+            (iid("rules"), [(TaskId::new("customer_intent"), TierPolicy::new(0.90))].into()),
+            (iid("modernbert"), [
                 (TaskId::new("urgency"), TierPolicy::new(0.80)),
                 (TaskId::new("fraud_risk"), TierPolicy::new(0.80)),
             ].into()),
@@ -491,7 +495,8 @@ mod tests {
         assert_eq!(
             complete.tasks[&TaskId::new("urgency")].resolution,
             Resolution::Tier {
-                tier: tid("modernbert"),
+                tier_instance_id: iid("modernbert"),
+                tier_id: tid("modernbert"),
                 model_id: "fixture-tier-modernbert".into(),
                 reading: Reading::new("high", 0.91),
             }

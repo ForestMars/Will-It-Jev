@@ -50,9 +50,8 @@ impl TierOutput {
 
 #[async_trait]
 pub trait Tier: Send + Sync {
-    /// Stable name of this tier. It identifies the tier in policies, traces and
-    /// telemetry; it says nothing about where the tier runs. Execution order is
-    /// owned by the `TierRegistry`.
+    /// Stable identity of the reusable execution architecture. Configured
+    /// instance identity and model selection belong to `TierInstance`.
     fn id(&self) -> &TierId;
     /// Label recorded as `model_id` when the tier reports without a model of its own.
     fn name(&self) -> &str;
@@ -155,7 +154,7 @@ impl Tier for RulesTier {
                 .unwrap_or(TierReading::Unsupported);
             readings.insert(task.clone(), reading);
         }
-        TierOutput { model_id: self.name().to_string(), readings }
+        TierOutput { model_id: ctx.model_id.to_string(), readings }
     }
 }
 
@@ -225,14 +224,13 @@ impl Tier for FastTextTier {
                 .unwrap_or(TierReading::Unsupported);
             readings.insert(task.clone(), reading);
         }
-        TierOutput { model_id: self.name().to_string(), readings }
+        TierOutput { model_id: ctx.model_id.to_string(), readings }
     }
 }
 
-/// Generic adapter for any gRPC sidecar implementing the scorer protocol. Every
-/// sidecar-backed tier (ModernBERT, Harrier, Oryn, ...) is an instance of this
-/// type with its own name and endpoint; the Rust transport and output contract
-/// are identical, so adding one needs configuration, not code.
+/// Generic executor for a definition using the gRPC scorer protocol. Multiple
+/// encoder instances can share this executor contract while selecting distinct
+/// model references and endpoints through TierInstance configuration.
 pub struct GrpcScoringTier {
     id: TierId,
     runner: Tier3Runner,
@@ -251,8 +249,8 @@ impl GrpcScoringTier {
     }
 
     async fn route_via_score(&self, ctx: &TierContext<'_>) -> TierOutput {
-        match self.runner.score_raw(ctx.prompt, ctx.budget).await {
-            Err(reason) => TierOutput::abstain_all(self.id.as_str(), ctx.tasks, reason),
+        match self.runner.score_raw(ctx.prompt, ctx.model_id, ctx.budget).await {
+            Err(reason) => TierOutput::abstain_all(ctx.model_id, ctx.tasks, reason),
             Ok(raw) => route_only(
                 ctx,
                 &raw.model_id,
@@ -286,7 +284,7 @@ impl Tier for GrpcScoringTier {
                 .collect();
             match self
                 .runner
-                .score_tasks(ctx.prompt, &requested_profiles, ctx.budget)
+                .score_tasks(ctx.prompt, ctx.model_id, &requested_profiles, ctx.budget)
                 .await
             {
                 Ok(response) => {
@@ -335,7 +333,7 @@ impl Tier for GrpcScoringTier {
                     };
                 }
                 Err(TasksError::Fault(reason)) => {
-                    return TierOutput::abstain_all(self.id.as_str(), ctx.tasks, reason);
+                    return TierOutput::abstain_all(ctx.model_id, ctx.tasks, reason);
                 }
                 Err(TasksError::Unimplemented) => {
                     tracing::warn!(tier = %self.id, "sidecar has no ScoreTasks RPC; falling back to single-task Score");
@@ -468,7 +466,7 @@ mod tests {
             },
         ];
         let output = tier
-            .evaluate(&TierContext { prompt: "test", tasks: &tasks, task_profiles: &profiles, budget: Duration::from_secs(2) })
+            .evaluate(&TierContext { prompt: "test", tasks: &tasks, task_profiles: &profiles, model_id: "test-model", budget: Duration::from_secs(2) })
             .await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(matches!(output.readings[&TaskId::route()], TierReading::Scored(_)));
