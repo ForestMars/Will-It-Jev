@@ -480,17 +480,18 @@ mod tests {
                 fallback: super::super::task::FallbackPolicy::Defer,
             },
         ];
-        let output = tier
-            .evaluate(&TierContext {
-                tier_instance_id: &crate::pipeline::registry::iid("encoder_test"),
-                tier_id: &crate::pipeline::registry::tid("grpc"),
-                model_id: Some("test-model"),
-                prompt: "test",
-                tasks: &tasks,
-                task_profiles: &profiles,
-                budget: Duration::from_secs(2),
-            })
-            .await;
+        let tier_instance_id = crate::pipeline::registry::iid("encoder_test");
+        let tier_id = crate::pipeline::registry::tid("grpc");
+        let context = TierContext {
+            tier_instance_id: &tier_instance_id,
+            tier_id: &tier_id,
+            model_id: Some("test-model"),
+            prompt: "test",
+            tasks: &tasks,
+            task_profiles: &profiles,
+            budget: Duration::from_secs(2),
+        };
+        let output = tier.evaluate(&context).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(matches!(output.readings[&TaskId::route()], TierReading::Scored(_)));
         assert!(matches!(output.readings[&TaskId::tag()], TierReading::Scored(_)));
