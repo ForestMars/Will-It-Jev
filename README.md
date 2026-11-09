@@ -44,7 +44,7 @@ The engine is a **six-tier deterministic fallback cascade**. Each tier either re
 - **Early exit.** A request leaves the cascade at the first tier whose confidence meets its configured threshold.
 - **No GC pauses, minimal allocation.** The hot path is native Rust with C++ bindings, a replaced global allocator, and zero-copy ingress for the cheapest tiers.
 - **Deterministic behavior.** Given the same input, model artifacts, and configuration, the router returns the same decision.
-- **Independent semantic stages.** ModernBERT and Harrier run as sequential tiers with separate enable flags; ModernBERT currently abstains until ONNX inference is integrated.
+- **Independent model instances.** ModernBERT and Harrier are separately configured instances of the shared gRPC scoring definition. Each instance has its own model reference, endpoint, timeout, enable flag, policy and telemetry identity.
 
 ---
 
@@ -61,26 +61,38 @@ Tier 6 is the terminal generative tier. Provider availability determines whether
 
 Disabled tiers are skipped without cost, and a tier is never re-entered once passed. Tiers run in the order of the `[[tier]]` entries in `config/tasks.toml`; that order, not any number in a tier's name, is the execution order.
 
-### Tier registry
+### Tier definitions and instances
 
-Every cascade tier has a stable **name** (`rules`, `fasttext`, `modernbert`, `harrier`) and a **position** in the registry. Policies (`[tier_policy.<name>.<task>]`), traces, resolutions, API responses and telemetry refer to tiers by name. Position only decides when a tier runs.
+A **tier definition** names a reusable execution contract (`rules`, `fasttext`, `grpc`). A **tier instance** is a configured realization of that contract. Its `name` is its stable identity; `tier` selects the definition; `model_id`, endpoint, timeout and enablement are instance configuration. Multiple instances may share one definition. Task policies reference instance names, not definitions.
+
+The `[[tier]]` array in `config/tasks.toml` is the execution vector. Inserting or reordering entries changes execution order. Position is derived from the vector index and is never inferred from a name or assigned as a tier ID.
 
 ```toml
 [[tier]]
-name = "fasttext"
-kind = "fasttext"       # rules | fasttext | grpc
-legacy_ordinal = 2      # optional: keeps tier2 config keys and numbered telemetry columns
+name = "encoder_modernbert"
+tier = "grpc"
+model_id = "modernbert-base"
+endpoint = "http://127.0.0.1:50052"
+timeout_ms = 150
 
 [[tier]]
-name = "triage"         # a new tier is a config entry, not a code change
-kind = "grpc"
-endpoint = "http://127.0.0.1:50061"
-timeout_ms = 150
-joint = true            # sidecar implements ScoreTasks
+name = "encoder_harrier"
+tier = "grpc"
+model_id = "harrier-v1"
+endpoint = "http://127.0.0.1:50051"
+timeout_ms = 250
+joint = true
+
+[tier_policy.encoder_modernbert.route]
+min_confidence = 0.95
+
+[tier_policy.encoder_harrier.route]
+min_confidence = 0.90
 ```
 
-Inserting that second entry between two existing tiers runs it between them; `tierN` policy keys continue to resolve for tiers that declare a `legacy_ordinal`. A config with no `[[tier]]` entries gets the original four tiers in their original order. Telemetry identifies tiers by name. `tier_outcomes` on the route record lists every tier that ran for the route task, by name, with its position, model, status, decision and scores, in execution order, including tiers that have no legacy ordinal. `decided_by_tier_name`, `resolving_tier_name` and `final_routing.tier_name` name the deciding and serving tiers. The numbered fields (`tier1_outcome` to `tier4_outcome`, `cascade_decision_tier`, `final_routing.tier`) are kept for existing consumers and describe only tiers with legacy ordinals 1 to 4. In ClickHouse the same data is in `tier_outcomes_json`, `decided_by_tier_name` and `final_tier_name`. Tiers 5 and 6 are downstream execution backends, not cascade tiers, and are unchanged.
+The two instances use the same `grpc` definition but have different model references, endpoints and policies. The runner traverses the ordered instance vector and does not change when an instance is inserted. A `TierTrace`, `TierCall`, resolution, API result and telemetry record preserve `tier_instance_id`, `tier_id` and `model_id` independently. The legacy numbered telemetry projections are positional compatibility fields: their one-based value is the vector index plus one. They do not identify a reusable definition or control execution order.
 
+Tiers 5 and 6 are downstream execution backends and remain configured separately from the cascade instance vector.
 ---
 
 ## Tier Reference
@@ -105,7 +117,7 @@ Inserting that second entry between two existing tiers runs it between them; `ti
 
 ### Tier 3: ModernBERT ONNX Runtime
 
-- **Placement:** ModernBERT evaluates requests after FastText and before Harrier.
+- **Placement:** The ModernBERT model is selected by one gRPC instance after FastText; another gRPC instance may run later in the same vector.
 - **Runtime:** ModernBERT runs through ONNX Runtime, not GGUF. The router calls a dedicated gRPC sidecar, which tokenizes the prompt and scores the two-class ONNX output.
 
 ### Tier 4: Micro-Transformer / Embedding Evaluators
@@ -117,7 +129,7 @@ SIMD targets: AVX-512 on x86-64, NEON on ARM.
 Remote path: the gRPC client in src/tier2/remote/ allows the same evaluator contract to be served out of process.
 
 - **Semantic Classification:** Harrier is the gRPC-backed classifier after ModernBERT. A confident result resolves the route; weak or failed evaluations pass through to Tier 5.
-- **Independent Stage:** ModernBERT and Harrier are separate sequential tiers, not swappable backends.
+- **Separate Instances:** ModernBERT and Harrier remain independently ordered and configured model instances, even though both use the same gRPC execution definition.
 
 ### Tier 5: Jev Self-Evaluation
 
@@ -158,7 +170,7 @@ src/
     mod.rs            Low-overhead tracing and telemetry initialization
   pipeline/           Task-agnostic cascade engine (see "Multi-task cascade" below)
     task.rs           TaskId, raw readings, TaskProfile (per-task bars, labels, fallback)
-    registry.rs       TierId (name), TierRegistry (ordered), TierDirectory (name/position/legacy ordinal)
+    registry.rs       TierDefinitionRegistry, TierInstanceId, TierInstance, ordered TierRegistry, TierDirectory
     tier.rs           Tier trait + RulesTier, FastTextTier, GrpcScoringTier (joint ScoreTasks for sidecars)
     runner.rs         CascadeRunner: one pass over the union of open tasks
     config.rs         config/tasks.toml loader
@@ -198,7 +210,7 @@ src/
 
 ## Configuration
 
-At startup, the router reads `config/router.toml`. Set `enabled = true` for each tier that should be constructed and used; omitted tiers default to disabled. Override the config file path with `ROUTER_CONFIG`.
+At startup, the dispatcher reads `config/router.toml`; it continues to configure downstream backends. The cascade reads `config/tasks.toml`, where each `[[tier]]` is a configured instance and array order is execution order. Instance `enabled`, endpoint and timeout values belong in that entry. Override the dispatcher config path with `ROUTER_CONFIG` and the cascade config path with `TASKS_CONFIG`.
 
 ```toml
 [router.tier1]
@@ -408,9 +420,9 @@ applied to enable typed route-decision and task-tag ingestion. The route and tag
 JSONL spool files under `logs/`; ClickHouse insert failures are logged and do not block gateway
 responses. Spool lines remain available for manual replay if ClickHouse is unavailable.
 
-The principal runtime overrides are `ROUTER_BIND`, `MODERNBERT_ENDPOINT` (default
-`http://[::1]:50052`), `TIER4_HARRIER_ENDPOINT` (falls back to
-`TIER3_ENDPOINT` for compatibility), `TIER5_ENDPOINT` (falls back to `TIER4_ENDPOINT`, default
+The principal runtime overrides are `ROUTER_BIND`, `TIER_MODERNBERT_ENDPOINT` (default
+`http://[::1]:50052`), `TIER_HARRIER_ENDPOINT` (default
+`http://[::1]:50051`), `TIER5_ENDPOINT` (falls back to `TIER4_ENDPOINT`, default
 `http://127.0.0.1:11435/api/decide`), `OLLAMA_GENERATE_URL` (default
 `http://127.0.0.1:11434/api/generate`), `GEMMA_MODEL` (default `gemma3:latest`),
 `TAGGER_OLLAMA_URL` (default `http://127.0.0.1:11434`), `TAGGER_MODEL` (default
