@@ -72,7 +72,7 @@ kind = "fasttext"       # rules | fasttext | grpc
 legacy_ordinal = 2      # optional: keeps tier2 config keys and numbered telemetry columns
 
 [[tier]]
-name = "triage"         # a new tier is a config entry, not a code change
+name = "prefilter"         # a new tier is a config entry, not a code change
 kind = "grpc"
 endpoint = "http://127.0.0.1:50061"
 timeout_ms = 150

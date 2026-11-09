@@ -434,7 +434,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let policies: TierPolicyMap = [
             (tid("fasttext"), [(TaskId::route(), TierPolicy::new(0.95))].into()),
-            (tid("triage"), [(TaskId::route(), TierPolicy::new(0.80))].into()),
+            (tid("prefilter"), [(TaskId::route(), TierPolicy::new(0.80))].into()),
             (tid("modernbert"), [(TaskId::route(), TierPolicy::new(0.95))].into()),
         ].into();
 
@@ -448,14 +448,14 @@ mod tests {
         calls.lock().unwrap().clear();
         let after = CascadeRunner::new(TierRegistry::of(vec![
             Arc::new(FakeTier::new("fasttext", vec![(TaskId::route(), scored(LABEL_JEV, 0.60))], &calls)),
-            Arc::new(FakeTier::new("triage", vec![(TaskId::route(), scored(LABEL_JEV, 0.85))], &calls)),
+            Arc::new(FakeTier::new("prefilter", vec![(TaskId::route(), scored(LABEL_JEV, 0.85))], &calls)),
             Arc::new(FakeTier::new("modernbert", vec![(TaskId::route(), scored(LABEL_JEV, 0.99))], &calls)),
         ]));
         let outcome = after.run("p", &[route_profile()], &policies, Duration::from_secs(1)).await;
-        assert!(resolved_at(&outcome.tasks[&TaskId::route()].resolution, "triage"));
+        assert!(resolved_at(&outcome.tasks[&TaskId::route()].resolution, "prefilter"));
         let order: Vec<String> = calls.lock().unwrap().iter().map(|(name, _)| name.clone()).collect();
-        assert_eq!(order, ["fasttext", "triage"], "modernbert must not run once triage resolves");
-        assert_eq!(after.directory().position(&tid("triage")), Some(1));
+        assert_eq!(order, ["fasttext", "prefilter"], "modernbert must not run once prefilter resolves");
+        assert_eq!(after.directory().position(&tid("prefilter")), Some(1));
     }
 
     #[tokio::test]
