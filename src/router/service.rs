@@ -678,10 +678,10 @@ mod tests {
         }
     }
 
-    /// rules(1), triage(no ordinal), modernbert(3) in that execution order.
+    /// rules(1), prefilter(no ordinal), modernbert(3) in that execution order.
     fn directory() -> TierDirectory {
         let mut registry = TierRegistry::new();
-        for (name, ordinal) in [("rules", Some(1)), ("triage", None), ("modernbert", Some(3))] {
+        for (name, ordinal) in [("rules", Some(1)), ("prefilter", None), ("modernbert", Some(3))] {
             registry.register(Arc::new(NamedTier(tid(name))), ordinal).unwrap();
         }
         registry.directory()
@@ -749,14 +749,14 @@ mod tests {
     fn a_tier_without_a_legacy_ordinal_is_identified_by_name_only() {
         let reading = Reading::new(LABEL_JEV, 0.9);
         let record = record_for(
-            Resolution::Tier { tier: tid("triage"), model_id: "m".into(), reading: reading.clone() },
-            vec![trace("triage", TierReading::Scored(reading.clone()), Decision::Resolve(reading))],
+            Resolution::Tier { tier: tid("prefilter"), model_id: "m".into(), reading: reading.clone() },
+            vec![trace("prefilter", TierReading::Scored(reading.clone()), Decision::Resolve(reading))],
         );
-        assert_eq!(record.decided_by_tier_name, "triage");
+        assert_eq!(record.decided_by_tier_name, "prefilter");
         assert_eq!(record.cascade_decision_tier, 0);
         assert_eq!(record.tasks[0].resolving_tier, None);
-        assert_eq!(record.tasks[0].resolving_tier_name.as_deref(), Some("triage"));
-        // No numbered field claims the triage trace.
+        assert_eq!(record.tasks[0].resolving_tier_name.as_deref(), Some("prefilter"));
+        // No numbered field claims the prefilter trace.
         assert!(record.tier3_outcome.is_none());
         assert_eq!(record.tier1_outcome.reason, "disabled");
     }
@@ -791,12 +791,12 @@ mod tests {
             Resolution::Tier { tier: tid("modernbert"), model_id: "m".into(), reading: reading.clone() },
             vec![
                 trace("rules", TierReading::Abstain("conflict"), pass()),
-                trace("triage", TierReading::Unsupported, pass()),
+                trace("prefilter", TierReading::Unsupported, pass()),
                 trace("modernbert", TierReading::Scored(reading.clone()), Decision::Resolve(reading)),
             ],
         );
         let names: Vec<_> = record.tier_outcomes.iter().map(|o| o.tier.as_str()).collect();
-        assert_eq!(names, ["rules", "triage", "modernbert"]);
+        assert_eq!(names, ["rules", "prefilter", "modernbert"]);
 
         let rules = &record.tier_outcomes[0];
         assert_eq!((rules.position, rules.legacy_ordinal, rules.status.as_str(), rules.decided), (0, Some(1), "abstain", false));
@@ -804,8 +804,8 @@ mod tests {
 
         // A tier with no legacy ordinal is fully described here even though no
         // numbered field can hold it.
-        let triage = &record.tier_outcomes[1];
-        assert_eq!((triage.position, triage.legacy_ordinal, triage.status.as_str()), (1, None, "unsupported"));
+        let prefilter = &record.tier_outcomes[1];
+        assert_eq!((prefilter.position, prefilter.legacy_ordinal, prefilter.status.as_str()), (1, None, "unsupported"));
 
         let winner = &record.tier_outcomes[2];
         assert_eq!((winner.position, winner.legacy_ordinal, winner.decided), (2, Some(3), true));
@@ -820,13 +820,13 @@ mod tests {
     fn a_tier_without_a_legacy_ordinal_decides_visibly_in_tier_outcomes() {
         let reading = Reading::new(LABEL_JEV, 0.9);
         let record = record_for(
-            Resolution::Tier { tier: tid("triage"), model_id: "m".into(), reading: reading.clone() },
-            vec![trace("triage", TierReading::Scored(reading.clone()), Decision::Resolve(reading))],
+            Resolution::Tier { tier: tid("prefilter"), model_id: "m".into(), reading: reading.clone() },
+            vec![trace("prefilter", TierReading::Scored(reading.clone()), Decision::Resolve(reading))],
         );
         assert!(record.tier3_outcome.is_none());
         assert_eq!(record.tier_outcomes.len(), 1);
         assert!(record.tier_outcomes[0].decided);
-        assert_eq!(record.tier_outcomes[0].tier, "triage");
+        assert_eq!(record.tier_outcomes[0].tier, "prefilter");
     }
 
     #[test]
