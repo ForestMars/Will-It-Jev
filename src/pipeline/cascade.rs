@@ -47,6 +47,8 @@ impl CascadeGraph {
         let mut successors: BTreeMap<TierId, BTreeSet<TierId>> = BTreeMap::new();
         let mut indegree: BTreeMap<TierId, usize> = BTreeMap::new();
         let mut tasks_by_tier: BTreeMap<TierId, BTreeSet<TaskId>> = BTreeMap::new();
+        let mut first_seen: BTreeMap<TierId, usize> = BTreeMap::new();
+        let mut next_rank = 0usize;
 
         for (task, path) in &paths {
             let mut seen = BTreeSet::new();
