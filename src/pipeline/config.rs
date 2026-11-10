@@ -263,6 +263,7 @@ pub fn parse(contents: &str) -> Result<PipelineConfig, Box<dyn Error>> {
 
 fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dyn Error>> {
     let raw: RawFile = toml::from_str(contents)?;
+    let has_explicit_tier_registry = !raw.tier.is_empty();
     let tiers = tier_specs_from(raw.tier)?;
     let registered: std::collections::BTreeSet<TierId> = tiers.iter().map(|spec| spec.id.clone()).collect();
     let mut profiles = BTreeMap::new();
@@ -274,7 +275,10 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
             Some(names) => names.into_iter().map(|tier_name| {
                 TierId::new(tier_name.clone()).map_err(|error| format!("task.{name}.cascade: {error}"))
             }).collect::<Result<Vec<_>, _>>()?,
-            None => tiers.iter().map(|spec| spec.id.clone()).collect(),
+            None if has_explicit_tier_registry => {
+                return Err(format!("task.{name}: cascade is required when [[tier]] entries are configured").into());
+            }
+            None => default_tier_specs().into_iter().map(|spec| spec.id).collect(),
         };
         task_paths.insert(task.clone(), path);
 
@@ -418,8 +422,8 @@ mod tests {
     }
 
     #[test]
-    fn omitted_paths_keep_the_legacy_default_sequence() {
-        let cfg = parse(r#"
+    fn explicit_tier_registry_requires_each_task_to_declare_its_cascade() {
+        let result = parse(r#"
             [task.route]
             fallback_label = "needs_llm"
             [[tier]]
@@ -428,14 +432,17 @@ mod tests {
             transport = "grpc"
             request_shape = "score"
             endpoint = "http://127.0.0.1:50051"
-            [[tier]]
-            name = "alpha"
-            executor = "scorer"
-            transport = "grpc"
-            request_shape = "score"
-            endpoint = "http://127.0.0.1:50052"
-        "#).unwrap();
-        assert_eq!(cfg.cascades.paths()[&TaskId::route()].iter().map(TierId::as_str).collect::<Vec<_>>(), ["zeta", "alpha"]);
+        "#);
+        assert!(result.is_err_and(|error| error.to_string().contains("cascade is required")));
+    }
+
+    #[test]
+    fn legacy_config_without_a_named_registry_keeps_the_original_four_tier_path() {
+        let cfg = parse("[task.route]\nfallback_label = \"needs_llm\"").unwrap();
+        assert_eq!(
+            cfg.cascades.paths()[&TaskId::route()].iter().map(TierId::as_str).collect::<Vec<_>>(),
+            ["rules", "fasttext", "modernbert", "harrier"]
+        );
     }
 
     #[test]

@@ -85,6 +85,8 @@ timeout_ms = 500
 
 A new task normally adds a head and a path through already-registered TierIds; it does not add another encoder execution. When a required capability is absent, register a new TierId with its executor, transport and request shape, then reference that ID in the task's cascade. `executor` selects the computation, `transport` describes how the router reaches it, and `request_shape` selects the scorer RPC contract. These are separate configuration fields.
 
+When no explicit `[[tier]]` registry exists, legacy configuration retains the original four-tier path. Once a named registry is declared, every task must declare its own `cascade`; the router never infers execution order from registry entries.
+
 The graph derives a deterministic topological order. Position in the directory is an execution/telemetry projection of that order, not a TierId and not the registry's insertion order. Legacy ordinals remain only for old `tierN` aliases and numbered telemetry projections. The complete `tier_outcomes` array remains name-keyed in execution order; existing numbered fields remain compatibility projections. Tiers 5 and 6 are downstream execution backends, not cascade nodes.
 
 ---
