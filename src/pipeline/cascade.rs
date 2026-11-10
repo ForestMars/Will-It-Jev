@@ -59,6 +59,10 @@ impl CascadeGraph {
                 }
                 successors.entry(tier.clone()).or_default();
                 indegree.entry(tier.clone()).or_insert(0);
+                if !first_seen.contains_key(tier) {
+                    first_seen.insert(tier.clone(), next_rank);
+                    next_rank += 1;
+                }
                 tasks_by_tier.entry(tier.clone()).or_default().insert(task.clone());
             }
             for edge in path.windows(2) {
@@ -68,19 +72,28 @@ impl CascadeGraph {
             }
         }
 
-        // Sorted ready nodes yield a stable topological order when task paths
-        // leave otherwise-independent nodes unordered.
-        let mut ready: BTreeSet<TierId> = indegree.iter()
-            .filter_map(|(tier, degree)| (*degree == 0).then_some(tier.clone()))
+        // Preserve first appearance in the configured task paths whenever
+        // dependency edges leave nodes unordered. This is deterministic and
+        // avoids making lexical TierId order an accidental scheduling policy.
+        let mut ready: BTreeSet<(usize, TierId)> = indegree.iter()
+            .filter_map(|(tier, degree)| (*degree == 0).then_some((
+                *first_seen.get(tier).expect("registered graph node has a rank"),
+                tier.clone(),
+            )))
             .collect();
         let mut order = Vec::with_capacity(indegree.len());
-        while let Some(tier) = ready.pop_first() {
+        while let Some((_, tier)) = ready.pop_first() {
             order.push(tier.clone());
             if let Some(next) = successors.get(&tier) {
                 for dependent in next {
                     let degree = indegree.get_mut(dependent).expect("edge target has indegree");
                     *degree -= 1;
-                    if *degree == 0 { ready.insert(dependent.clone()); }
+                    if *degree == 0 {
+                        ready.insert((
+                            *first_seen.get(dependent).expect("registered graph node has a rank"),
+                            dependent.clone(),
+                        ));
+                    }
                 }
             }
         }
