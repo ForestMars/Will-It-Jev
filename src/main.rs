@@ -303,7 +303,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .is_some_and(|by_task| by_task.contains_key(&TaskId::tag()))
         });
         if !has_executable_tag_head {
-            return Err("tasks.toml: joint tagging requires a tag policy on an enabled scorer tier configured with request_shape = "score_tasks"".into());
+            return Err(r#"tasks.toml: joint tagging requires a tag policy on an enabled scorer tier configured with request_shape = "score_tasks""#.into());
         }
         Some(profile)
     } else {
