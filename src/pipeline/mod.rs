@@ -3,6 +3,7 @@
 // Task-independent inference cascade. Task definitions, tier/task resolution
 // policies, and execution-tier implementations are separate interfaces.
 
+pub mod cascade;
 pub mod config;
 pub mod registry;
 pub mod runner;

@@ -10,7 +10,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use crate::tagging::{ClickHouseRawTable, OvenV1Tagger, TagConfig};
 use pipeline::tagger::{CascadeTagger, JointTagStore};
-use pipeline::config::{TierKind, TierSpec};
+use pipeline::config::{TierExecutor, TierRequestShape, TierSpec, TierTransport};
 use pipeline::tier::{FastTextTier, GrpcScoringTier, RulesTier, Tier};
 use pipeline::{CascadeRunner, TaskId, TierRegistry};
 use router::dispatch::DownstreamDispatcher;
@@ -295,26 +295,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("tasks.toml: tag_in_request = true but no [tier_policy.<tier>.tag] policy is configured".into());
         }
         let has_executable_tag_head = pipeline_config.tiers.iter().any(|spec| {
-            spec.kind == TierKind::Grpc
-                && spec.joint
+            spec.executor == TierExecutor::Scorer
+                && spec.request_shape == Some(TierRequestShape::ScoreTasks)
                 && tier_enabled(spec, &config.router)
-                && pipeline_config
-                    .tier_policies
-                    .get(&spec.id)
+                && pipeline_config.cascades.task_uses(&TaskId::tag(), &spec.id)
+                && pipeline_config.tier_policies.get(&spec.id)
                     .is_some_and(|by_task| by_task.contains_key(&TaskId::tag()))
         });
         if !has_executable_tag_head {
-            return Err("tasks.toml: joint tagging requires a tag policy on an enabled gRPC tier marked joint ([[tier]] joint = true, or pipeline.joint_tiers)".into());
+            return Err("tasks.toml: joint tagging requires a tag policy on an enabled scorer tier configured with request_shape = "score_tasks"".into());
         }
         Some(profile)
     } else {
         None
     };
 
-    // ---- Build the tier registry ------------------------------------------
-    // Execution order is the order of the [[tier]] entries in tasks.toml (or the
-    // original four tiers when there are none). Tier names identify tiers in
-    // policies and telemetry; they never decide order.
+    // ---- Build the available-tier registry -------------------------------
+    // TierRegistry is the complete lookup of available TierIds. Task cascades
+    // independently determine which registered tiers run and in what order.
     let mut registry = TierRegistry::new();
     let mut tier1_hash = "disabled".to_string();
     let mut tier2_hash = "disabled".to_string();
@@ -323,51 +321,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!(tier = %spec.id, "tier disabled by configuration");
             continue;
         }
-        let tier: Arc<dyn Tier> = match spec.kind {
-            TierKind::Rules => {
+        let tier: Arc<dyn Tier> = match (spec.executor, spec.transport) {
+            (TierExecutor::Rules, TierTransport::InProcess) => {
                 let path = env_or("TIER1_CONFIG", "config/tier1.toml");
                 let engine = Arc::new(Tier1Engine::new(Tier1Automaton::from_toml_file(&path)?)?);
                 tier1_hash = sha256_file(&path)?;
                 Arc::new(RulesTier::new(spec.id.clone(), engine))
             }
-            TierKind::Fasttext => {
-                let path = std::env::var("FASTTEXT_MODEL")
-                    .unwrap_or_else(|_| default_fasttext_model_path());
-                if path == "models/tier2.bin"
-                    && !std::path::Path::new("models/tier2_small.bin").exists()
-                {
-                    tracing::warn!(
-                        model_path = %path,
-                        "using legacy fastText tier-2 model; prefer models/tier2_small.bin when available"
-                    );
+            (TierExecutor::Fasttext, TierTransport::InProcess) => {
+                let path = std::env::var("FASTTEXT_MODEL").unwrap_or_else(|_| default_fasttext_model_path());
+                if path == "models/tier2.bin" && !std::path::Path::new("models/tier2_small.bin").exists() {
+                    tracing::warn!(model_path = %path, "using legacy fastText tier-2 model; prefer models/tier2_small.bin when available");
                 }
                 let runner = Arc::new(Tier2Runner::new(&path)?);
                 tier2_hash = sha256_file(&path)?;
                 Arc::new(FastTextTier::new(spec.id.clone(), runner))
             }
-            TierKind::Grpc => {
+            (TierExecutor::Scorer, TierTransport::Grpc) => {
+                let request_shape = spec.request_shape.ok_or("scorer tier is missing request_shape")?;
                 let (endpoint, timeout) = grpc_settings(spec, &config.router)?;
                 Arc::new(GrpcScoringTier::new(
                     spec.id.clone(),
                     Tier3Runner::new(endpoint, timeout)?,
-                    spec.joint,
+                    request_shape,
                 ))
             }
+            _ => return Err(format!("unsupported tier configuration for {}", spec.id).into()),
         };
         registry.register(tier, spec.legacy_ordinal)?;
     }
     if registry.is_empty() {
         return Err("no cascade tier is enabled; enable at least one [[tier]]".into());
     }
+    let execution_graph = pipeline_config.cascades.retain_available(&registry.ids())?;
+    if execution_graph.order().is_empty() {
+        return Err("no task cascade contains an enabled tier".into());
+    }
     tracing::info!(
-        order = ?registry.directory().infos().iter().map(|info| info.id.as_str()).collect::<Vec<_>>(),
-        "tier registry (execution order)"
+        order = ?execution_graph.order().iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+        "cascade DAG topological order"
     );
-    let hashes = telemetry::Hashes {
-        tier1_toml: tier1_hash,
-        tier2_bin: tier2_hash,
-    };
-    let cascade = Arc::new(CascadeRunner::new(registry));
+    let hashes = telemetry::Hashes { tier1_toml: tier1_hash, tier2_bin: tier2_hash };
+    let cascade = Arc::new(CascadeRunner::new(registry, execution_graph)?);
 
     let downstream_timeout =
         Duration::from_millis(env_or("DOWNSTREAM_TIMEOUT_MS", "120000").parse()?);

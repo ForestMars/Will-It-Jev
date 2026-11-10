@@ -684,7 +684,7 @@ mod tests {
         for (name, ordinal) in [("rules", Some(1)), ("prefilter", None), ("modernbert", Some(3))] {
             registry.register(Arc::new(NamedTier(tid(name))), ordinal).unwrap();
         }
-        registry.directory()
+        registry.directory(&[tid("rules"), tid("prefilter"), tid("modernbert")])
     }
 
     fn route_profile() -> TaskProfile {

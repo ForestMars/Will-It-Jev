@@ -59,27 +59,33 @@ Each tier returns one of two outcomes:
 
 Tier 6 is the terminal generative tier. Provider availability determines whether a response can be returned.
 
-Disabled tiers are skipped without cost, and a tier is never re-entered once passed. Tiers run in the order of the `[[tier]]` entries in `config/tasks.toml`; that order, not any number in a tier's name, is the execution order.
+Disabled tiers are omitted from the runtime registry without cost. Each task declares its own ordered `cascade` of existing `TierId` values. The router unions adjacent path entries into a directed acyclic graph (DAG), rejects cycles, then executes each shared TierId node once. At a node it batches every still-open task whose path reaches that TierId, allowing one `ScoreTasks` request to evaluate multiple heads against one shared representation.
 
-### Tier registry
+### Available tiers and task cascades
 
-Every cascade tier has a stable **name** (`rules`, `fasttext`, `modernbert`, `harrier`) and a **position** in the registry. Policies (`[tier_policy.<name>.<task>]`), traces, resolutions, API responses and telemetry refer to tiers by name. Position only decides when a tier runs.
+`TierRegistry` is the lookup of all available configured tiers. It does not impose execution order. Each tier has one stable `TierId`; task policies, traces, resolutions, API responses and telemetry refer to that ID.
+
+Each `[task.<id>]` declares an ordered `cascade = [ ... ]` of TierIds. The order defines dependencies for that task. The union of task paths is the execution DAG: shared TierIds are shared nodes, while tasks can follow different paths. If two task paths imply contradictory ordering, configuration fails rather than silently choosing an order.
 
 ```toml
-[[tier]]
-name = "fasttext"
-kind = "fasttext"       # rules | fasttext | grpc
-legacy_ordinal = 2      # optional: keeps tier2 config keys and numbered telemetry columns
+[task.route]
+cascade = ["rules", "fasttext", "modernbert", "harrier"]
+
+[task.tag]
+cascade = ["modernbert", "harrier"]
 
 [[tier]]
-name = "prefilter"         # a new tier is a config entry, not a code change
-kind = "grpc"
-endpoint = "http://127.0.0.1:50061"
-timeout_ms = 150
-joint = true            # sidecar implements ScoreTasks
+name = "modernbert"
+executor = "scorer"
+transport = "grpc"
+request_shape = "score_tasks"
+endpoint = "http://127.0.0.1:50052"
+timeout_ms = 500
 ```
 
-Inserting that second entry between two existing tiers runs it between them; `tierN` policy keys continue to resolve for tiers that declare a `legacy_ordinal`. A config with no `[[tier]]` entries gets the original four tiers in their original order. Telemetry identifies tiers by name. `tier_outcomes` on the route record lists every tier that ran for the route task, by name, with its position, model, status, decision and scores, in execution order, including tiers that have no legacy ordinal. `decided_by_tier_name`, `resolving_tier_name` and `final_routing.tier_name` name the deciding and serving tiers. The numbered fields (`tier1_outcome` to `tier4_outcome`, `cascade_decision_tier`, `final_routing.tier`) are kept for existing consumers and describe only tiers with legacy ordinals 1 to 4. In ClickHouse the same data is in `tier_outcomes_json`, `decided_by_tier_name` and `final_tier_name`. Tiers 5 and 6 are downstream execution backends, not cascade tiers, and are unchanged.
+A new task normally adds a head and a path through already-registered TierIds; it does not add another encoder execution. When a required capability is absent, register a new TierId with its executor, transport and request shape, then reference that ID in the task's cascade. `executor` selects the computation, `transport` describes how the router reaches it, and `request_shape` selects the scorer RPC contract. These are separate configuration fields.
+
+The graph derives a deterministic topological order. Position in the directory is an execution/telemetry projection of that order, not a TierId and not the registry's insertion order. Legacy ordinals remain only for old `tierN` aliases and numbered telemetry projections. The complete `tier_outcomes` array remains name-keyed in execution order; existing numbered fields remain compatibility projections. Tiers 5 and 6 are downstream execution backends, not cascade nodes.
 
 ---
 
@@ -158,9 +164,10 @@ src/
     mod.rs            Low-overhead tracing and telemetry initialization
   pipeline/           Task-agnostic cascade engine (see "Multi-task cascade" below)
     task.rs           TaskId, raw readings, TaskProfile (per-task bars, labels, fallback)
-    registry.rs       TierId (name), TierRegistry (ordered), TierDirectory (name/position/legacy ordinal)
+    registry.rs       TierId, available TierRegistry, and execution-facing TierDirectory
+    cascade.rs        Task-specific ordered paths combined into a validated execution DAG
     tier.rs           Tier trait + RulesTier, FastTextTier, GrpcScoringTier (joint ScoreTasks for sidecars)
-    runner.rs         CascadeRunner: one pass over the union of open tasks
+    runner.rs         CascadeRunner: one topological pass, batching open tasks at shared TierIds
     config.rs         config/tasks.toml loader
     tagger.rs         CascadeTagger: category tagging on the shared tiers
   router/

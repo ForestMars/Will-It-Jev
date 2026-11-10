@@ -1,64 +1,55 @@
-# Three separate concerns:
-#   [task.*]               what a task is (labels, fallback). No tier names here.
-#   [[tier]]               the named execution tiers. Array order IS execution order.
-#   [tier_policy.<tier>.*] when a named tier may resolve a task.
-#
-# Tier names identify tiers; they never decide order. To add a tier, add a
-# [[tier]] entry where it should run and give it policies below.
+# Task contracts, available tiers, task-specific cascades and resolution policies
+# are separate concerns. Each task's cascade is an ordered TierId path. The
+# union of all paths forms a DAG; shared TierIds execute once for all eligible
+# tasks that reach the node.
 
 [pipeline]
-# The normal OvenV1Tagger remains the default tagger. Enable only after a sidecar
-# has a trained `tag` head and matching tier policies are configured below.
 tag_via_cascade = false
 tag_in_request = false
-# Must remain below TagConfig.call_timeout (5 seconds).
 tag_budget_ms = 4000
-# gRPC tiers whose sidecars support the joint ScoreTasks RPC, by name. A tier can
-# equally set `joint = true` on its own [[tier]] entry.
-joint_tiers = []
 
 [task.route]
 labels = ["jev_capable", "needs_llm"]
 fallback_label = "needs_llm"
+cascade = ["rules", "fasttext", "modernbert", "harrier"]
 
 [task.tag]
 output_kind = "multiclass"
 taxonomy = "../taskonomies/help_desk.json"
 fallback = "defer"
+cascade = ["modernbert", "harrier"]
 
-# ---- Tier registry ---------------------------------------------------------
-# kind = "rules"     pattern rules (at most one); config in TIER1_CONFIG
-# kind = "fasttext"  fastText classifier (at most one); model in FASTTEXT_MODEL
-# kind = "grpc"      any sidecar speaking the scorer protocol (as many as needed)
-#
-# `legacy_ordinal` is the number these tiers carried before they had names. It
-# keeps `[tier_policy.tierN.*]` keys and the numbered telemetry columns working
-# and picks up `[router.tierN]` (enabled / endpoint / timeout_ms) from
-# config/router.toml. New tiers omit it and set enabled/endpoint/timeout_ms here,
-# with TIER_<NAME>_ENDPOINT and TIER_<NAME>_MAX_CALL_MS as environment overrides.
+# The registry catalogs available TierIds. It does not define execution order.
+# executor selects the computation; transport describes how the router reaches
+# it; request_shape selects the scorer RPC contract.
+
 [[tier]]
 name = "rules"
-kind = "rules"
+executor = "rules"
+transport = "in_process"
 legacy_ordinal = 1
 
 [[tier]]
 name = "fasttext"
-kind = "fasttext"
+executor = "fasttext"
+transport = "in_process"
 legacy_ordinal = 2
 
 [[tier]]
 name = "modernbert"
-kind = "grpc"
+executor = "scorer"
+transport = "grpc"
+request_shape = "score"
 legacy_ordinal = 3
 
 [[tier]]
 name = "harrier"
-kind = "grpc"
+executor = "scorer"
+transport = "grpc"
+request_shape = "score"
 legacy_ordinal = 4
 
-# Route resolution calibration. The rules and fasttext tiers are route-only
-# scorers unless a TaskScorer is registered; the sidecar tiers may serve any task
-# for which their sidecar exposes a head.
+# Calibration belongs to a TierId + TaskId pair.
 [tier_policy.rules.route]
 min_confidence = 0.78
 strict = true
@@ -76,13 +67,7 @@ label_min_confidence = { jev_capable = 0.95, needs_llm = 0.70 }
 min_confidence = 0.95
 label_min_confidence = { jev_capable = 0.95, needs_llm = 0.70 }
 
-# Enable after one configured joint sidecar has a trained tag head.
-# Tagging is best-effort and shares the route request's cascade run.
-#
+# To evaluate route and tag heads in one ScoreTasks call, change the relevant
+# tier's request_shape to "score_tasks" and add its tag policy:
 # [tier_policy.modernbert.tag]
 # min_confidence = 0.85
-#
-# [tier_policy.harrier.tag]
-# min_confidence = 0.85
-#
-# Set pipeline.tag_in_request = true and mark the relevant tier joint.

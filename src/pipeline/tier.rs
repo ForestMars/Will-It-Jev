@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use super::config::TierRequestShape;
 use super::registry::TierId;
 use super::task::{OutputKind, Reading, TaskId, TaskProfile, TierReading, LABEL_JEV, LABEL_LLM};
 use crate::router::tier1_runner::Tier1Engine;
@@ -52,7 +53,7 @@ impl TierOutput {
 pub trait Tier: Send + Sync {
     /// Stable name of this tier. It identifies the tier in policies, traces and
     /// telemetry; it says nothing about where the tier runs. Execution order is
-    /// owned by the `TierRegistry`.
+    /// owned by the task-specific `CascadeGraph`.
     fn id(&self) -> &TierId;
     /// Label recorded as `model_id` when the tier reports without a model of its own.
     fn name(&self) -> &str;
@@ -236,17 +237,17 @@ impl Tier for FastTextTier {
 pub struct GrpcScoringTier {
     id: TierId,
     runner: Tier3Runner,
-    joint: bool,
-    joint_unimplemented: AtomicBool,
+    request_shape: TierRequestShape,
+    request_shape_unimplemented: AtomicBool,
 }
 
 impl GrpcScoringTier {
-    pub fn new(id: TierId, runner: Tier3Runner, joint: bool) -> Self {
+    pub fn new(id: TierId, runner: Tier3Runner, request_shape: TierRequestShape) -> Self {
         Self {
             id,
             runner,
-            joint,
-            joint_unimplemented: AtomicBool::new(false),
+            request_shape,
+            request_shape_unimplemented: AtomicBool::new(false),
         }
     }
 
@@ -273,30 +274,26 @@ impl Tier for GrpcScoringTier {
     }
 
     async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
-        let route_id = TaskId::route();
-        let only_route = ctx.tasks.len() == 1 && ctx.tasks[0] == route_id;
-        let use_joint = self.joint
-            && !only_route
-            && !self.joint_unimplemented.load(Ordering::Relaxed);
-
-        if use_joint {
-            let requested_profiles: Vec<TaskProfile> = ctx.tasks.iter()
-                .filter_map(|task| ctx.task_profiles.iter()
-                    .find(|profile| profile.task.as_str() == task.as_str()).cloned())
-                .collect();
-            match self
-                .runner
-                .score_tasks(ctx.prompt, &requested_profiles, ctx.budget)
-                .await
-            {
-                Ok(response) => {
-                    let readings = ctx
-                        .tasks
-                        .iter()
-                        .map(|task| {
-                            let reading = response
-                                .results
-                                .iter()
+        match self.request_shape {
+            TierRequestShape::Score => {
+                if ctx.tasks.contains(&TaskId::route()) {
+                    self.route_via_score(ctx).await
+                } else {
+                    unsupported_all(ctx, self.id.as_str())
+                }
+            }
+            TierRequestShape::ScoreTasks => {
+                if self.request_shape_unimplemented.load(Ordering::Relaxed) {
+                    return TierOutput::abstain_all(self.id.as_str(), ctx.tasks, "score_tasks_unimplemented");
+                }
+                let requested_profiles: Vec<TaskProfile> = ctx.tasks.iter()
+                    .filter_map(|task| ctx.task_profiles.iter()
+                        .find(|profile| profile.task.as_str() == task.as_str()).cloned())
+                    .collect();
+                match self.runner.score_tasks(ctx.prompt, &requested_profiles, ctx.budget).await {
+                    Ok(response) => {
+                        let readings = ctx.tasks.iter().map(|task| {
+                            let reading = response.results.iter()
                                 .find(|result| result.task == task.as_str())
                                 .map(|result| {
                                     let expected = ctx.task_profiles.iter()
@@ -307,47 +304,32 @@ impl Tier for GrpcScoringTier {
                                             OutputKind::Multilabel => 3,
                                             OutputKind::Ordinal => 4,
                                         });
-                                    // Zero is the proto3 default and remains
-                                    // accepted for legacy sidecars that omit kinds.
+                                    // Zero is the proto3 default; accept it for older sidecars.
                                     let kind_matches = expected
-                                        // .map_or(true, |kind| result.output_kind == 0 || result.output_kind == kind);
                                         .is_none_or(|kind| result.output_kind == 0 || result.output_kind == kind);
-                                    if !kind_matches {
-                                        return TierReading::Unsupported;
-                                    }
+                                    if !kind_matches { return TierReading::Unsupported; }
                                     TierReading::Scored(Reading {
                                         label: result.label.clone(),
                                         confidence: result.confidence,
-                                        scores: result
-                                            .scores
-                                            .iter()
+                                        scores: result.scores.iter()
                                             .map(|score| (score.label.clone(), score.score))
                                             .collect(),
                                     })
                                 })
                                 .unwrap_or(TierReading::Unsupported);
                             (task.clone(), reading)
-                        })
-                        .collect();
-                    return TierOutput {
-                        model_id: response.model_id,
-                        readings,
-                    };
-                }
-                Err(TasksError::Fault(reason)) => {
-                    return TierOutput::abstain_all(self.id.as_str(), ctx.tasks, reason);
-                }
-                Err(TasksError::Unimplemented) => {
-                    tracing::warn!(tier = %self.id, "sidecar has no ScoreTasks RPC; falling back to single-task Score");
-                    self.joint_unimplemented.store(true, Ordering::Relaxed);
+                        }).collect();
+                        TierOutput { model_id: response.model_id, readings }
+                    }
+                    Err(TasksError::Fault(reason)) => {
+                        TierOutput::abstain_all(self.id.as_str(), ctx.tasks, reason)
+                    }
+                    Err(TasksError::Unimplemented) => {
+                        self.request_shape_unimplemented.store(true, Ordering::Relaxed);
+                        TierOutput::abstain_all(self.id.as_str(), ctx.tasks, "score_tasks_unimplemented")
+                    }
                 }
             }
-        }
-
-        if ctx.tasks.contains(&route_id) {
-            self.route_via_score(ctx).await
-        } else {
-            unsupported_all(ctx, self.id.as_str())
         }
     }
 }
@@ -447,7 +429,7 @@ mod tests {
         let sidecar = TestSidecar { joint: true, ..Default::default() };
         let calls = sidecar.tasks_calls.clone();
         let scorer = Tier3Runner::new(endpoint(sidecar).await, Duration::from_secs(2)).unwrap();
-        let tier = GrpcScoringTier::new(crate::pipeline::registry::tid("alternate"), scorer, true);
+        let tier = GrpcScoringTier::new(crate::pipeline::registry::tid("alternate"), scorer, TierRequestShape::ScoreTasks);
         let tasks = [TaskId::route(), TaskId::tag()];
         let profiles = [
             TaskProfile {
@@ -473,5 +455,66 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(matches!(output.readings[&TaskId::route()], TierReading::Scored(_)));
         assert!(matches!(output.readings[&TaskId::tag()], TierReading::Scored(_)));
+    }
+    #[tokio::test]
+    async fn score_tasks_request_shape_is_used_even_for_a_single_task() {
+        let sidecar = TestSidecar { joint: true, ..Default::default() };
+        let task_calls = sidecar.tasks_calls.clone();
+        let score_calls = sidecar.score_calls.clone();
+        let scorer = Tier3Runner::new(endpoint(sidecar).await, Duration::from_secs(2)).unwrap();
+        let tier = GrpcScoringTier::new(
+            crate::pipeline::registry::tid("route-scorer"),
+            scorer,
+            TierRequestShape::ScoreTasks,
+        );
+        let tasks = [TaskId::route()];
+        let profiles = [TaskProfile {
+            task: TaskId::route(),
+            output_kind: OutputKind::Binary,
+            labels: None,
+            label_metadata: Vec::new(),
+            taxonomy_version: None,
+            fallback: super::super::task::FallbackPolicy::Defer,
+        }];
+        let output = tier.evaluate(&TierContext {
+            prompt: "test",
+            tasks: &tasks,
+            task_profiles: &profiles,
+            budget: Duration::from_secs(2),
+        }).await;
+        assert_eq!(task_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(score_calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(output.readings[&TaskId::route()], TierReading::Scored(_)));
+    }
+
+    #[tokio::test]
+    async fn score_tasks_unimplemented_is_not_silently_downgraded_to_score() {
+        let sidecar = TestSidecar { joint: false, ..Default::default() };
+        let task_calls = sidecar.tasks_calls.clone();
+        let score_calls = sidecar.score_calls.clone();
+        let scorer = Tier3Runner::new(endpoint(sidecar).await, Duration::from_secs(2)).unwrap();
+        let tier = GrpcScoringTier::new(
+            crate::pipeline::registry::tid("no-joint"),
+            scorer,
+            TierRequestShape::ScoreTasks,
+        );
+        let tasks = [TaskId::route()];
+        let profiles = [TaskProfile {
+            task: TaskId::route(),
+            output_kind: OutputKind::Binary,
+            labels: None,
+            label_metadata: Vec::new(),
+            taxonomy_version: None,
+            fallback: super::super::task::FallbackPolicy::Defer,
+        }];
+        let output = tier.evaluate(&TierContext {
+            prompt: "test",
+            tasks: &tasks,
+            task_profiles: &profiles,
+            budget: Duration::from_secs(2),
+        }).await;
+        assert_eq!(task_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(score_calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(output.readings[&TaskId::route()], TierReading::Abstain("score_tasks_unimplemented")));
     }
 }

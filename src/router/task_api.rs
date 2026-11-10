@@ -24,6 +24,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::pipeline::{
+    cascade::CascadeGraph,
     registry::TierDirectory,
     runner::{CascadeRunner, Resolution, RunOutcome, TaskOutcome},
     task::{Decision, TaskId, TaskProfile, TierPolicyMap, TierReading},
@@ -438,10 +439,14 @@ mod tests {
             ].into(),
             calls: calls.clone(),
         };
-        let cascade = Arc::new(CascadeRunner::new(TierRegistry::of(vec![
-            Arc::new(tier1),
-            Arc::new(tier2),
-        ])));
+        let registry = TierRegistry::of(vec![Arc::new(tier1), Arc::new(tier2)]);
+        let paths: BTreeMap<TaskId, Vec<TierId>> = [
+            (TaskId::new("customer_intent"), vec![tid("rules")]),
+            (TaskId::new("urgency"), vec![tid("modernbert")]),
+            (TaskId::new("fraud_risk"), vec![tid("modernbert")]),
+        ].into();
+        let graph = CascadeGraph::from_task_paths(paths, &registry.ids()).unwrap();
+        let cascade = Arc::new(CascadeRunner::new(registry, graph).unwrap());
         let policies: TierPolicyMap = [
             (tid("rules"), [(TaskId::new("customer_intent"), TierPolicy::new(0.90))].into()),
             (tid("modernbert"), [

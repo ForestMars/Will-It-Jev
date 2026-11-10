@@ -4,14 +4,14 @@
 //
 // * `TierId` is a stable name ("rules", "fasttext", "modernbert", ...). Policies,
 //   traces, resolutions, and telemetry refer to tiers by name.
-// * `TierRegistry` is the ordered list of tiers. Execution order is the order
-//   in which tiers are registered, which `main` takes from the `[[tier]]`
-//   entries in `tasks.toml`. Nothing derives order from a number.
-// * `TierDirectory` is the read-only view of that registry that the rest of the
-//   router uses to look up a tier's position, and the optional legacy ordinal
+// * `TierRegistry` catalogs every available configured tier by TierId. It does
+//   not impose execution order.
+// * `CascadeGraph` owns task-specific ordering and dependencies. `TierDirectory`
+//   projects graph order for execution/telemetry and retains optional legacy ordinals
 //   that keeps the numbered telemetry columns (`tier1_outcome` ..
 //   `tier4_outcome`, `decided_by_tier`) meaningful for the original four tiers.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -115,10 +115,9 @@ impl Error for RegistryError {}
 #[derive(Debug, Clone)]
 pub struct TierInfo {
     pub id: TierId,
-    /// Zero-based execution position.
+    /// Zero-based position in the graph's deterministic topological order.
     pub position: usize,
-    /// The 1..=4 number the original tiers carried, kept only so numbered
-    /// telemetry columns and `tierN` config keys continue to resolve.
+    /// Legacy ordinal retained only for old telemetry projections and tierN aliases.
     pub legacy_ordinal: Option<u8>,
 }
 
@@ -128,92 +127,63 @@ pub struct TierDirectory {
 }
 
 impl TierDirectory {
-    pub fn infos(&self) -> &[TierInfo] {
-        &self.infos
-    }
-
+    pub fn infos(&self) -> &[TierInfo] { &self.infos }
     pub fn position(&self, id: &TierId) -> Option<usize> {
         self.infos.iter().find(|info| &info.id == id).map(|info| info.position)
     }
-
     pub fn legacy_ordinal(&self, id: &TierId) -> Option<u8> {
-        self.infos
-            .iter()
-            .find(|info| &info.id == id)
-            .and_then(|info| info.legacy_ordinal)
+        self.infos.iter().find(|info| &info.id == id).and_then(|info| info.legacy_ordinal)
     }
-
     pub fn id_for_ordinal(&self, ordinal: u8) -> Option<&TierId> {
-        self.infos
-            .iter()
-            .find(|info| info.legacy_ordinal == Some(ordinal))
-            .map(|info| &info.id)
+        self.infos.iter().find(|info| info.legacy_ordinal == Some(ordinal)).map(|info| &info.id)
     }
 }
 
-/// Ordered collection of execution tiers.
+/// All available configured tiers. Registration does not establish execution order.
 #[derive(Default)]
 pub struct TierRegistry {
-    entries: Vec<(Arc<dyn Tier>, Option<u8>)>,
+    entries: BTreeMap<TierId, (Arc<dyn Tier>, Option<u8>)>,
 }
 
 impl TierRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Appends a tier. It runs after every tier registered before it.
-    pub fn register(
-        &mut self,
-        tier: Arc<dyn Tier>,
-        legacy_ordinal: Option<u8>,
-    ) -> Result<(), RegistryError> {
-        if self.entries.iter().any(|(existing, _)| existing.id() == tier.id()) {
-            return Err(RegistryError::DuplicateTier(tier.id().clone()));
+    pub fn new() -> Self { Self::default() }
+    pub fn register(&mut self, tier: Arc<dyn Tier>, legacy_ordinal: Option<u8>) -> Result<(), RegistryError> {
+        let id = tier.id().clone();
+        if self.entries.contains_key(&id) {
+            return Err(RegistryError::DuplicateTier(id));
         }
         if let Some(ordinal) = legacy_ordinal {
-            if self.entries.iter().any(|(_, existing)| *existing == Some(ordinal)) {
+            if self.entries.values().any(|(_, existing)| *existing == Some(ordinal)) {
                 return Err(RegistryError::DuplicateOrdinal(ordinal));
             }
         }
-        self.entries.push((tier, legacy_ordinal));
+        self.entries.insert(id, (tier, legacy_ordinal));
         Ok(())
     }
-
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.entries.len()
+    pub fn get(&self, id: &TierId) -> Option<Arc<dyn Tier>> {
+        self.entries.get(id).map(|(tier, _)| Arc::clone(tier))
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+    pub fn ids(&self) -> BTreeSet<TierId> {
+        self.entries.keys().cloned().collect()
     }
-
-    pub fn directory(&self) -> TierDirectory {
+    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+    /// Construct the directory from graph order, never registry insertion order.
+    pub fn directory(&self, order: &[TierId]) -> TierDirectory {
         TierDirectory {
-            infos: self
-                .entries
-                .iter()
-                .enumerate()
-                .map(|(position, (tier, legacy_ordinal))| TierInfo {
-                    id: tier.id().clone(),
-                    position,
-                    legacy_ordinal: *legacy_ordinal,
+            infos: order.iter().enumerate().filter_map(|(position, id)| {
+                self.entries.get(id).map(|(_, legacy_ordinal)| TierInfo {
+                    id: id.clone(), position, legacy_ordinal: *legacy_ordinal,
                 })
-                .collect(),
+            }).collect(),
         }
     }
-
-    pub(crate) fn into_tiers(self) -> Vec<Arc<dyn Tier>> {
-        self.entries.into_iter().map(|(tier, _)| tier).collect()
-    }
-
-    /// Test helper: register tiers in the given order, no legacy ordinals.
+    #[cfg(test)]
+    pub fn len(&self) -> usize { self.entries.len() }
     #[cfg(test)]
     pub fn of(tiers: Vec<Arc<dyn Tier>>) -> Self {
         let mut registry = Self::new();
         for tier in tiers {
-            registry.register(tier, None).expect("test tiers must be distinct");
+            registry.register(tier, None).expect("test tiers must have unique IDs");
         }
         registry
     }
@@ -226,7 +196,6 @@ mod tests {
     use async_trait::async_trait;
 
     struct Named(TierId);
-
     #[async_trait]
     impl Tier for Named {
         fn id(&self) -> &TierId { &self.0 }
@@ -235,10 +204,7 @@ mod tests {
             TierOutput::abstain_all("named", ctx.tasks, "test")
         }
     }
-
-    fn named(name: &str) -> Arc<dyn Tier> {
-        Arc::new(Named(tid(name)))
-    }
+    fn named(name: &str) -> Arc<dyn Tier> { Arc::new(Named(tid(name))) }
 
     #[test]
     fn tier_names_are_validated() {
@@ -251,45 +217,25 @@ mod tests {
     }
 
     #[test]
-    fn execution_order_is_registration_order_not_name_order() {
+    fn registry_is_an_available_tier_lookup_not_an_execution_sequence() {
         let mut registry = TierRegistry::new();
-        for name in ["zeta", "alpha", "mid"] {
-            registry.register(named(name), None).unwrap();
-        }
-        let order: Vec<_> = registry.directory().infos().iter().map(|i| i.id.to_string()).collect();
-        assert_eq!(order, ["zeta", "alpha", "mid"]);
-        assert_eq!(registry.directory().position(&tid("alpha")), Some(1));
-        let tiers = registry.into_tiers();
-        assert_eq!(tiers[0].id().as_str(), "zeta");
-    }
-
-    #[test]
-    fn duplicates_are_rejected() {
-        let mut registry = TierRegistry::new();
-        registry.register(named("rules"), Some(1)).unwrap();
-        assert_eq!(
-            registry.register(named("rules"), None),
-            Err(RegistryError::DuplicateTier(tid("rules")))
-        );
-        assert_eq!(
-            registry.register(named("other"), Some(1)),
-            Err(RegistryError::DuplicateOrdinal(1))
-        );
-        assert_eq!(registry.len(), 1);
-    }
-
-    #[test]
-    fn directory_maps_between_names_and_legacy_ordinals() {
-        let mut registry = TierRegistry::new();
-        registry.register(named("rules"), Some(1)).unwrap();
-        registry.register(named("prefilter"), None).unwrap();
         registry.register(named("modernbert"), Some(3)).unwrap();
-        let directory = registry.directory();
+        registry.register(named("rules"), Some(1)).unwrap();
+        assert_eq!(registry.len(), 2);
+        assert!(registry.get(&tid("modernbert")).is_some());
+        assert!(registry.get(&tid("rules")).is_some());
+        let directory = registry.directory(&[tid("rules"), tid("modernbert")]);
+        assert_eq!(directory.position(&tid("rules")), Some(0));
+        assert_eq!(directory.position(&tid("modernbert")), Some(1));
         assert_eq!(directory.legacy_ordinal(&tid("modernbert")), Some(3));
-        assert_eq!(directory.legacy_ordinal(&tid("prefilter")), None);
-        assert_eq!(directory.id_for_ordinal(3), Some(&tid("modernbert")));
-        assert_eq!(directory.id_for_ordinal(2), None);
-        assert_eq!(directory.position(&tid("modernbert")), Some(2));
-        assert_eq!(directory.position(&tid("missing")), None);
+    }
+
+    #[test]
+    fn duplicates_and_duplicate_legacy_ordinals_are_rejected() {
+        let mut registry = TierRegistry::new();
+        registry.register(named("rules"), Some(1)).unwrap();
+        assert_eq!(registry.register(named("rules"), None), Err(RegistryError::DuplicateTier(tid("rules"))));
+        assert_eq!(registry.register(named("other"), Some(1)), Err(RegistryError::DuplicateOrdinal(1)));
+        assert_eq!(registry.len(), 1);
     }
 }

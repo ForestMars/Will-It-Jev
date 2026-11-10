@@ -12,20 +12,8 @@ pub fn load_from_path(path: impl AsRef<Path>) -> Result<AppConfig, Box<dyn Error
 fn parse(contents: &str) -> Result<AppConfig, Box<dyn Error>> {
     let config: AppConfig = toml::from_str(contents)?;
 
-    let any_tier_enabled = [
-        config.router.tier1.enabled,
-        config.router.tier2.enabled,
-        config.router.tier3.enabled,
-        config.router.tier4.enabled,
-        config.router.tier5.enabled,
-        config.router.tier6.enabled,
-    ]
-    .into_iter()
-    .any(|enabled| enabled);
-
-    if !any_tier_enabled {
-        return Err("at least one router tier must be enabled".into());
-    }
+    // Enabled cascade tiers are validated after the named registry and task
+    // paths have been loaded from tasks.toml.
 
     // Task confidence thresholds now live in config/tasks.toml under
     // [tier_policy.tierN.task]. router.toml contains only execution-tier
@@ -125,7 +113,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_config_with_no_enabled_tiers() {
-        assert!(parse("[router.tier1]\nenabled = false\n").is_err());
+    fn legacy_router_tiers_may_all_be_disabled() {
+        let config = parse("[router.tier1]\nenabled = false\n[router.tier2]\nenabled = false\n[router.tier3]\nenabled = false\n[router.tier4]\nenabled = false\n").unwrap();
+        assert!(!config.router.tier1.enabled);
+        assert!(!config.router.tier4.enabled);
     }
 }
