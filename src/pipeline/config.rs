@@ -478,7 +478,7 @@ mod tests {
     #[test]
     fn shipped_config_references_available_tiers() {
         let cfg = load_or_default("config/tasks.toml").unwrap();
-        let available: BTreeSet<_> = cfg.tiers.iter().map(|spec| spec.id.clone()).collect();
+        let available: std::collections::BTreeSet<_> = cfg.tiers.iter().map(|spec| spec.id.clone()).collect();
         for path in cfg.cascades.paths().values() {
             assert!(path.iter().all(|tier| available.contains(tier)));
         }
