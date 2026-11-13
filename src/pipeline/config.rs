@@ -22,7 +22,9 @@ use crate::legacy_tiers::LegacyTierNumbers;
 
 use super::cascade::CascadeGraph;
 use super::identity::TierName;
-use super::tier::{Computation, Params, RequestShape, Role, Tier, TierDecl, Transport};
+use super::tier::{Computation, Params, RequestShape, Role, Tier, Transport};
+
+type TierConfig = (TierName, Tier, Params);
 use super::task::{Cascade, FallbackPolicy, OutputKind, TaskLabelMetadata, Task, TierPolicy, TierPolicyMap};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -54,29 +56,29 @@ struct RawTier {
 }
 
 /// The available tier instances. Their vector order has no scheduling meaning.
-fn default_tier_decls() -> Vec<TierDecl> {
+fn default_tier_configs() -> Vec<TierConfig> {
     [
         ("rules", Role::Rules, Transport::InProcess, None, Computation::Automaton),
         ("fasttext", Role::FastText, Transport::InProcess, None, Computation::FastText),
         ("modernbert", Role::Encoder, Transport::Grpc, Some(RequestShape::Score), Computation::Onnx),
         ("harrier", Role::Encoder, Transport::Grpc, Some(RequestShape::Score), Computation::Gguf),
-    ].into_iter().map(|(name, role, transport, request_shape, computation)| TierDecl {
-        name: TierName::new(name).expect("built-in tier names are valid"),
-        tier: Tier { role, transport, request_shape },
-        params: Params {
+    ].into_iter().map(|(name, role, transport, request_shape, computation)| (
+        TierName::new(name).expect("built-in tier names are valid"),
+        Tier { role, transport, request_shape },
+        Params {
             computation, model: None, config: None, endpoint: None, timeout_ms: None,
             enabled: None,
         },
-    }).collect()
+    )).collect()
 }
 
-fn tier_decls_from(raw: Vec<RawTier>) -> Result<Vec<TierDecl>, Box<dyn Error>> {
-    if raw.is_empty() { return Ok(default_tier_decls()); }
-    let mut decls: Vec<TierDecl> = Vec::with_capacity(raw.len());
+fn tier_configs_from(raw: Vec<RawTier>) -> Result<Vec<TierConfig>, Box<dyn Error>> {
+    if raw.is_empty() { return Ok(default_tier_configs()); }
+    let mut tiers: Vec<TierConfig> = Vec::with_capacity(raw.len());
     for tier in raw {
         let name = TierName::new(tier.name.clone()).map_err(|error| format!("[[tier]]: {error}"))?;
         let label = name.as_str().to_string();
-        if decls.iter().any(|existing| existing.name == name) {
+        if tiers.iter().any(|existing| existing.0 == name) {
             return Err(format!("[[tier]] {label:?} is defined twice").into());
         }
         let definition = Tier { role: tier.role, transport: tier.transport, request_shape: tier.request_shape };
@@ -113,34 +115,34 @@ fn tier_decls_from(raw: Vec<RawTier>) -> Result<Vec<TierDecl>, Box<dyn Error>> {
         if tier.timeout_ms == Some(0) {
             return Err(format!("[[tier]] {label:?}: timeout_ms must be greater than zero").into());
         }
-        decls.push(TierDecl {
+        tiers.push((
             name,
-            tier: definition,
-            params: Params {
+            definition,
+            Params {
                 computation, model: tier.model, config: tier.config, endpoint: tier.endpoint,
                 timeout_ms: tier.timeout_ms, enabled: tier.enabled,
             },
-        });
+        ));
     }
-    Ok(decls)
+    Ok(tiers)
 }
 
-fn find_tier<'a>(decls: &'a [TierDecl], legacy: &LegacyTierNumbers, reference: &str) -> Option<&'a TierDecl> {
-    if let Some(decl) = decls.iter().find(|decl| decl.name.as_str() == reference) {
-        return Some(decl);
+fn find_tier<'a>(tiers: &'a [TierConfig], legacy: &LegacyTierNumbers, reference: &str) -> Option<&'a TierConfig> {
+    if let Some(tier) = tiers.iter().find(|tier| tier.0.as_str() == reference) {
+        return Some(tier);
     }
     reference
         .strip_prefix("tier")
         .and_then(|number| number.parse::<u8>().ok())
         .and_then(|ordinal| legacy.name_of(ordinal))
-        .and_then(|name| decls.iter().find(|decl| &decl.name == name))
+        .and_then(|name| tiers.iter().find(|tier| &tier.0 == name))
 }
 
 /// The compatibility numbering: `[legacy_tiers]` if present; otherwise the
 /// original four-tier numbering when no `[[tier]]` is declared; otherwise none.
 fn legacy_numbers_from(
     declared: Option<BTreeMap<String, u8>>,
-    decls: &[TierDecl],
+    tiers: &[TierConfig],
     has_explicit_tier_registry: bool,
 ) -> Result<LegacyTierNumbers, Box<dyn Error>> {
     let Some(declared) = declared else {
@@ -153,9 +155,9 @@ fn legacy_numbers_from(
     let mut pairs = Vec::with_capacity(declared.len());
     for (name, ordinal) in declared {
         let name = TierName::new(name.clone()).map_err(|error| format!("[legacy_tiers]: {error}"))?;
-        if !decls.iter().any(|decl| decl.name == name) {
+        if !tiers.iter().any(|tier| tier.0 == name) {
             return Err(format!(
-                "[legacy_tiers]: unknown tier {name}; registered tiers: {}", known_tier_names(decls)
+                "[legacy_tiers]: unknown tier {name}; registered tiers: {}", known_tier_names(tiers)
             ).into());
         }
         pairs.push((name, ordinal));
@@ -163,8 +165,8 @@ fn legacy_numbers_from(
     Ok(LegacyTierNumbers::new(pairs).map_err(|error| format!("[legacy_tiers]: {error}"))?)
 }
 
-fn known_tier_names(decls: &[TierDecl]) -> String {
-    decls.iter().map(|decl| decl.name.as_str()).collect::<Vec<_>>().join(", ")
+fn known_tier_names(tiers: &[TierConfig]) -> String {
+    tiers.iter().map(|tier| tier.0.as_str()).collect::<Vec<_>>().join(", ")
 }
 
 fn default_tag_budget_ms() -> u64 {
@@ -232,7 +234,7 @@ struct RawFile {
 pub struct PipelineConfig {
     pub settings: PipelineSettings,
     /// Available configured tiers; vector order carries no scheduling semantics.
-    pub tiers: Vec<TierDecl>,
+    pub(crate) tiers: Vec<TierConfig>,
     /// Union DAG formed from all task-specific cascade paths.
     pub cascades: CascadeGraph,
     profiles: BTreeMap<String, Task>,
@@ -291,9 +293,9 @@ pub fn parse(contents: &str) -> Result<PipelineConfig, Box<dyn Error>> {
 fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dyn Error>> {
     let raw: RawFile = toml::from_str(contents)?;
     let has_explicit_tier_registry = !raw.tier.is_empty();
-    let tiers = tier_decls_from(raw.tier)?;
+    let tiers = tier_configs_from(raw.tier)?;
     let legacy = legacy_numbers_from(raw.legacy_tiers, &tiers, has_explicit_tier_registry)?;
-    let registered: std::collections::BTreeSet<TierName> = tiers.iter().map(|decl| decl.name.clone()).collect();
+    let registered: std::collections::BTreeSet<TierName> = tiers.iter().map(|tier| tier.0.clone()).collect();
     let mut profiles = BTreeMap::new();
 
     for (name, profile) in raw.task {
@@ -305,7 +307,7 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
             None if has_explicit_tier_registry => {
                 return Err(format!("task.{name}: cascade is required when [[tier]] entries are configured").into());
             }
-            None => default_tier_decls().into_iter().map(|decl| decl.name).collect(),
+            None => default_tier_configs().into_iter().map(|tier| tier.0).collect(),
         };
 
         let (labels, label_metadata, taxonomy_version) = if let Some(taxonomy_path) = &profile.taxonomy {
@@ -358,7 +360,7 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
         let decl = find_tier(&tiers, &legacy, &tier_key).ok_or_else(|| format!(
             "tier_policy: unknown tier {tier_key:?}; registered tiers: {}", known_tier_names(&tiers)
         ))?;
-        let tier = decl.name.clone();
+        let tier = decl.0.clone();
         let by_task = tier_policies.entry(tier.clone()).or_default();
         for (task_name, policy) in task_policies {
             let task = task_name.clone();
@@ -517,7 +519,7 @@ mod tests {
     #[test]
     fn shipped_config_references_available_tiers() {
         let cfg = load_or_default("config/tasks.toml").unwrap();
-        let available: std::collections::BTreeSet<_> = cfg.tiers.iter().map(|decl| decl.name.clone()).collect();
+        let available: std::collections::BTreeSet<_> = cfg.tiers.iter().map(|tier| tier.0.clone()).collect();
         for path in cfg.cascades.paths().values() {
             assert!(path.iter().all(|tier| available.contains(tier)));
         }
