@@ -24,7 +24,7 @@ cascade = ["modernbert", "harrier"]
 # behavior, so a name can change without changing what the instance is. The
 # list catalogs available instances; it does not define execution order.
 #
-#   role         what the tier is for: rules | fasttext | encoder
+#   executor     which executor handles the tier: rules | fasttext | encoder
 #   transport    how the router reaches it: in_process | grpc
 #   request_shape  encoder only: the RPC contract, score | score_tasks
 #   computation  how this instance realizes its role: automaton | fasttext
@@ -35,29 +35,28 @@ cascade = ["modernbert", "harrier"]
 #   config       rules: rule file
 #
 # `model` / `config` fall back to FASTTEXT_MODEL / TIER1_CONFIG for an instance
-# that declares none. `executor` is accepted as an alias of `role`, and
-# `scorer` as an alias of `encoder`.
+# that declares none. `scorer` is accepted as an alias of `encoder`.
 
 [[tier]]
 name = "rules"
-role = "rules"
+executor = "rules"
 transport = "in_process"
 
 [[tier]]
 name = "fasttext"
-role = "fasttext"
+executor = "fasttext"
 transport = "in_process"
 
 [[tier]]
 name = "modernbert"
-role = "encoder"
+executor = "encoder"
 computation = "onnx"
 transport = "grpc"
 request_shape = "score"
 
 [[tier]]
 name = "harrier"
-role = "encoder"
+executor = "encoder"
 computation = "gguf"
 transport = "grpc"
 request_shape = "score"

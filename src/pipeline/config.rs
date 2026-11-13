@@ -42,8 +42,7 @@ pub struct PipelineSettings {
 #[serde(deny_unknown_fields)]
 struct RawTier {
     name: String,
-    #[serde(alias = "executor")]
-    role: Role,
+    executor: Role,
     transport: Transport,
     request_shape: Option<RequestShape>,
     computation: Option<Computation>,
@@ -538,7 +537,7 @@ mod tests {
         let cfg = parse(&with_tiers(r#"
             [[tier]]
             name = "a"
-            role = "encoder"
+            executor = "encoder"
             computation = "onnx"
             transport = "grpc"
             request_shape = "score"
@@ -562,7 +561,7 @@ mod tests {
         let cfg = parse(&with_tiers(r#"
             [[tier]]
             name = "a"
-            role = "fasttext"
+            executor = "fasttext"
             transport = "in_process"
             model = "models/small.bin"
             [[tier]]
@@ -603,7 +602,7 @@ mod tests {
             request_shape = "score"
             [[tier]]
             name = "b"
-            role = "rules"
+            executor = "rules"
             transport = "in_process"
         "#);
         assert!(parse(&missing).is_err_and(|e| e.to_string().contains("must declare `computation`")));
