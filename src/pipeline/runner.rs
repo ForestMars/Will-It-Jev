@@ -170,6 +170,7 @@ impl CascadeRunner {
         let plan = self.graph.plan(&requested);
         let profile_by_name: BTreeMap<&str, &Task> =
             profiles.iter().map(|profile| (profile.name.as_str(), profile)).collect();
+        let profile_order: Vec<String> = profiles.iter().map(|profile| profile.name.clone()).collect();
         let profiles = Arc::new(profiles.to_vec());
         let prompt = Arc::<str>::from(prompt.to_owned());
 
@@ -206,16 +207,23 @@ impl CascadeRunner {
                     }
                     continue;
                 };
-                let mut task_ids = Vec::new();
-                for task in task_set {
-                    if !active.contains(&task) { continue; }
-                    if policies.get(tier_id).is_some_and(|by_task| by_task.contains_key(&task)) {
-                        task_ids.push(task);
-                    } else if let Some(next) = self.graph.next(&task, tier_id).copied() {
-                        // A tier with no policy for this task is skipped, not invoked.
-                        ready.entry(next).or_default().insert(task);
+                for task in &task_set {
+                    if !active.contains(task) { continue; }
+                    if !policies.get(tier_id).is_some_and(|by_task| by_task.contains_key(task)) {
+                        if let Some(next) = self.graph.next(task, tier_id).copied() {
+                            // A tier with no policy is skipped. Since next is later
+                            // in topological order, it can join that tier's batch.
+                            batches.entry(next).or_default().insert(task.clone());
+                        }
                     }
                 }
+                // Preserve the caller's task order within each batched invocation.
+                let task_ids: Vec<String> = profile_order.iter()
+                    .filter(|task| task_set.contains(*task)
+                        && active.contains(*task)
+                        && policies.get(tier_id).is_some_and(|by_task| by_task.contains_key(*task)))
+                    .cloned()
+                    .collect();
                 if task_ids.is_empty() { continue; }
                 let remaining = budget.saturating_sub(start.elapsed());
                 let prompt = Arc::clone(&prompt);
