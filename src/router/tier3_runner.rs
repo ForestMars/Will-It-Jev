@@ -69,7 +69,7 @@ impl Tier3Runner {
     pub async fn score_tasks(
         &self,
         prompt: &str,
-        profiles: &[TaskProfile],
+        profiles: &[Task],
         budget: Duration,
     ) -> Result<ScoreTasksResponse, TasksError> {
         if budget.is_zero() {
@@ -77,7 +77,7 @@ impl Tier3Runner {
         }
         let deadline = budget.min(self.max_call);
         let mut client = self.client.clone();
-        let tasks = profiles.iter().map(|profile| profile.task.as_str().to_string()).collect();
+        let tasks = profiles.iter().map(|profile| profile.name.as_str().to_string()).collect();
         let task_specs = profiles.iter().map(|profile| {
             let labels = profile.labels.as_deref().unwrap_or_default().iter().map(|label| {
                 if let Some(metadata) = profile.label_metadata.iter().find(|item| item.id.as_str() == label.as_str()) {
@@ -105,7 +105,7 @@ impl Tier3Runner {
                 OutputKind::Ordinal => 4,
             };
             TaskSpec {
-                task: profile.task.as_str().to_string(),
+                task: profile.name.as_str().to_string(),
                 output_kind,
                 labels,
                 taxonomy_version: profile.taxonomy_version.clone().unwrap_or_default(),
