@@ -1,241 +1,228 @@
 // src/pipeline/registry.rs
 //
-// Tier identity and execution order are separate concerns.
+// Lookup of instantiated tiers, and the projection used by telemetry.
 //
-// * `TierId` is a stable name ("rules", "fasttext", "modernbert", ...). Policies,
-//   traces, resolutions, and telemetry refer to tiers by name.
-// * `TierRegistry` catalogs every available configured tier by TierId. It does
-//   not impose execution order.
-// * `CascadeGraph` owns task-specific ordering and dependencies. `TierDirectory`
-//   projects graph order for execution/telemetry and retains optional legacy ordinals
-//   that keeps the numbered telemetry columns (`tier1_outcome` ..
-//   `tier4_outcome`, `decided_by_tier`) meaningful for the original four tiers.
+// * `TierName`, `TierId` and `Slot` (see `identity.rs`) are not defined here.
+// * `TierInstance` (see `tier.rs`) keeps everything it was built from.
+// * `TierRegistry` finds every available instance by its user-authored name. It
+//   imposes no execution order and stores nothing about an instance that the
+//   instance does not already carry.
+// * `CascadeGraph` owns task-specific ordering. `CascadeRunner` turns graph order
+//   into slots. `TierDirectory` projects slots and ids for telemetry.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-use serde::Deserialize;
-
-use super::tier::Tier;
-
-/// Name recorded when a task takes its fallback instead of a tier's reading.
-/// Reserved: no tier may use it.
-pub const FALLBACK_TIER_NAME: &str = "fallback";
-
-const MAX_TIER_NAME_LEN: usize = 32;
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
-#[serde(try_from = "String")]
-pub struct TierId(String);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TierIdError(String);
-
-impl fmt::Display for TierIdError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl Error for TierIdError {}
-
-impl TierId {
-    /// A tier name is 1 to 32 characters: a lowercase ASCII letter followed by
-    /// lowercase letters, digits, `_` or `-`.
-    pub fn new(name: impl Into<String>) -> Result<Self, TierIdError> {
-        let name = name.into();
-        let mut chars = name.chars();
-        let valid = !name.is_empty()
-            && name.len() <= MAX_TIER_NAME_LEN
-            && chars.next().is_some_and(|c| c.is_ascii_lowercase())
-            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
-        if !valid {
-            return Err(TierIdError(format!(
-                "invalid tier name {name:?}: use 1 to {MAX_TIER_NAME_LEN} characters, starting with a \
-                 lowercase letter, then lowercase letters, digits, '_' or '-'"
-            )));
-        }
-        if name == FALLBACK_TIER_NAME {
-            return Err(TierIdError(format!(
-                "tier name {FALLBACK_TIER_NAME:?} is reserved for task fallbacks"
-            )));
-        }
-        if name.strip_prefix("tier").is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())) {
-            return Err(TierIdError(format!(
-                "tier name {name:?} is reserved: `tierN` is the alias for legacy ordinal N"
-            )));
-        }
-        Ok(Self(name))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl TryFrom<String> for TierId {
-    type Error = TierIdError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::new(value)
-    }
-}
-
-impl fmt::Display for TierId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Shorthand for tests, where names are literals.
-#[cfg(test)]
-pub fn tid(name: &str) -> TierId {
-    TierId::new(name).expect("test tier name must be valid")
-}
+use super::identity::{Slot, TierId, TierName};
+use super::task::{TaskId, TierPolicyMap};
+use super::tier::TierInstance;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistryError {
-    DuplicateTier(TierId),
-    DuplicateOrdinal(u8),
+    DuplicateName(TierName),
+    /// Two names for instances with identical behavior-determining content. They
+    /// are one instance: give them a different model, config or computation.
+    DuplicateId { id: TierId, existing: TierName, duplicate: TierName },
 }
 
 impl fmt::Display for RegistryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::DuplicateTier(id) => write!(f, "tier {id:?} is registered twice"),
-            Self::DuplicateOrdinal(n) => write!(f, "legacy ordinal {n} is assigned to two tiers"),
+            Self::DuplicateName(name) => write!(f, "tier {name} is registered twice"),
+            Self::DuplicateId { id, existing, duplicate } => write!(
+                f,
+                "tiers {existing} and {duplicate} have the same id {id}: identical role, computation, \
+                 model and rule file make them one instance, so declare what differs (for example `model`)"
+            ),
         }
     }
 }
 
 impl Error for RegistryError {}
 
-#[derive(Debug, Clone)]
+/// A tier's place in the cascade, as telemetry sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TierInfo {
+    pub name: TierName,
     pub id: TierId,
-    /// Zero-based position in the graph's deterministic topological order.
-    pub position: usize,
-    /// Legacy ordinal retained only for old telemetry projections and tierN aliases.
-    pub legacy_ordinal: Option<u8>,
+    pub slot: Slot,
 }
 
+/// Slot and id lookup by name, built from the compiled cascade.
 #[derive(Debug, Clone, Default)]
 pub struct TierDirectory {
     infos: Vec<TierInfo>,
 }
 
 impl TierDirectory {
+    #[allow(dead_code)]
     pub fn infos(&self) -> &[TierInfo] { &self.infos }
-    pub fn position(&self, id: &TierId) -> Option<usize> {
-        self.infos.iter().find(|info| &info.id == id).map(|info| info.position)
+    pub fn info(&self, name: &TierName) -> Option<&TierInfo> {
+        self.infos.iter().find(|info| &info.name == name)
     }
-    pub fn legacy_ordinal(&self, id: &TierId) -> Option<u8> {
-        self.infos.iter().find(|info| &info.id == id).and_then(|info| info.legacy_ordinal)
-    }
-    pub fn id_for_ordinal(&self, ordinal: u8) -> Option<&TierId> {
-        self.infos.iter().find(|info| info.legacy_ordinal == Some(ordinal)).map(|info| &info.id)
-    }
+    pub fn slot(&self, name: &TierName) -> Option<Slot> { self.info(name).map(|info| info.slot) }
 }
 
-/// All available configured tiers. Registration does not establish execution order.
+/// A policy that records the instance it was calibrated for, and the instance
+/// now running under that name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalibrationMismatch {
+    pub tier: TierName,
+    pub task: TaskId,
+    pub calibrated_for: TierId,
+    pub running: TierId,
+}
+
+/// Every available instance, looked up by name. Registration does not establish
+/// execution order.
 #[derive(Default)]
 pub struct TierRegistry {
-    entries: BTreeMap<TierId, (Arc<dyn Tier>, Option<u8>)>,
+    entries: BTreeMap<TierName, Arc<TierInstance>>,
 }
 
 impl TierRegistry {
     pub fn new() -> Self { Self::default() }
-    pub fn register(&mut self, tier: Arc<dyn Tier>, legacy_ordinal: Option<u8>) -> Result<(), RegistryError> {
-        let id = tier.id().clone();
-        if self.entries.contains_key(&id) {
-            return Err(RegistryError::DuplicateTier(id));
+
+    pub fn register(&mut self, tier: Arc<TierInstance>) -> Result<(), RegistryError> {
+        if self.entries.contains_key(tier.name()) {
+            return Err(RegistryError::DuplicateName(tier.name().clone()));
         }
-        if let Some(ordinal) = legacy_ordinal {
-            if self.entries.values().any(|(_, existing)| *existing == Some(ordinal)) {
-                return Err(RegistryError::DuplicateOrdinal(ordinal));
-            }
+        if let Some(existing) = self.entries.values().find(|existing| existing.id() == tier.id()) {
+            return Err(RegistryError::DuplicateId {
+                id: *tier.id(), existing: existing.name().clone(), duplicate: tier.name().clone(),
+            });
         }
-        self.entries.insert(id, (tier, legacy_ordinal));
+        self.entries.insert(tier.name().clone(), tier);
         Ok(())
     }
-    pub fn get(&self, id: &TierId) -> Option<Arc<dyn Tier>> {
-        self.entries.get(id).map(|(tier, _)| Arc::clone(tier))
+
+    pub fn get(&self, name: &TierName) -> Option<Arc<TierInstance>> {
+        self.entries.get(name).map(Arc::clone)
     }
-    pub fn ids(&self) -> BTreeSet<TierId> {
+
+    pub fn names(&self) -> BTreeSet<TierName> {
         self.entries.keys().cloned().collect()
     }
+
     pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+
+    /// Policies that name the instance they were calibrated for, where the
+    /// instance now running under that name is a different one.
+    pub fn calibration_mismatches(&self, policies: &TierPolicyMap) -> Vec<CalibrationMismatch> {
+        let mut mismatches = Vec::new();
+        for (name, by_task) in policies {
+            let Some(instance) = self.entries.get(name) else { continue };
+            for (task, policy) in by_task {
+                if let Some(calibrated_for) = policy.calibrated_for {
+                    if calibrated_for != *instance.id() {
+                        mismatches.push(CalibrationMismatch {
+                            tier: name.clone(), task: task.clone(), calibrated_for, running: *instance.id(),
+                        });
+                    }
+                }
+            }
+        }
+        mismatches
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize { self.entries.len() }
+
+    #[cfg(test)]
+    pub fn of(tiers: Vec<Arc<TierInstance>>) -> Self {
+        let mut registry = Self::new();
+        for tier in tiers {
+            registry.register(tier).expect("test tiers must have unique names and ids");
+        }
+        registry
+    }
+}
+
+impl TierDirectory {
     /// Construct the directory from graph order, never registry insertion order.
-    pub fn directory(&self, order: &[TierId]) -> TierDirectory {
-        TierDirectory {
-            infos: order.iter().enumerate().filter_map(|(position, id)| {
-                self.entries.get(id).map(|(_, legacy_ordinal)| TierInfo {
-                    id: id.clone(), position, legacy_ordinal: *legacy_ordinal,
+    pub fn from_order(registry: &TierRegistry, order: &[TierName]) -> Self {
+        Self {
+            infos: order.iter().enumerate().filter_map(|(index, name)| {
+                let tier = registry.entries.get(name)?;
+                Some(TierInfo {
+                    name: name.clone(), id: *tier.id(),
+                    slot: Slot::from_index(index)?,
                 })
             }).collect(),
         }
-    }
-    #[cfg(test)]
-    pub fn len(&self) -> usize { self.entries.len() }
-    #[cfg(test)]
-    pub fn of(tiers: Vec<Arc<dyn Tier>>) -> Self {
-        let mut registry = Self::new();
-        for tier in tiers {
-            registry.register(tier, None).expect("test tiers must have unique IDs");
-        }
-        registry
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::tier::{TierContext, TierOutput};
+    use crate::pipeline::identity::tname;
+    use crate::pipeline::tier::{FakeEvaluate, TierContext, TierOutput};
     use async_trait::async_trait;
 
-    struct Named(TierId);
+    struct Silent;
     #[async_trait]
-    impl Tier for Named {
-        fn id(&self) -> &TierId { &self.0 }
-        fn name(&self) -> &str { "named" }
+    impl FakeEvaluate for Silent {
         async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
-            TierOutput::abstain_all("named", ctx.tasks, "test")
+            TierOutput::abstain_all("silent", ctx.tasks, "test")
         }
     }
-    fn named(name: &str) -> Arc<dyn Tier> { Arc::new(Named(tid(name))) }
-
-    #[test]
-    fn tier_names_are_validated() {
-        for ok in ["rules", "fasttext", "modernbert", "harrier", "oryn-2", "a", "prefilter_v2"] {
-            assert!(TierId::new(ok).is_ok(), "{ok} should be valid");
-        }
-        for bad in ["", "Rules", "2fast", "has space", "x.y", "fallback", "tier3", &"a".repeat(33)] {
-            assert!(TierId::new(bad).is_err(), "{bad:?} should be rejected");
-        }
+    fn fake(name: &str) -> Arc<TierInstance> {
+        Arc::new(TierInstance::fake(name, Arc::new(Silent)))
     }
 
     #[test]
-    fn registry_is_an_available_tier_lookup_not_an_execution_sequence() {
+    fn registry_is_a_lookup_not_an_execution_sequence() {
         let mut registry = TierRegistry::new();
-        registry.register(named("modernbert"), Some(3)).unwrap();
-        registry.register(named("rules"), Some(1)).unwrap();
+        registry.register(fake("modernbert")).unwrap();
+        registry.register(fake("rules")).unwrap();
         assert_eq!(registry.len(), 2);
-        assert!(registry.get(&tid("modernbert")).is_some());
-        assert!(registry.get(&tid("rules")).is_some());
-        let directory = registry.directory(&[tid("rules"), tid("modernbert")]);
-        assert_eq!(directory.position(&tid("rules")), Some(0));
-        assert_eq!(directory.position(&tid("modernbert")), Some(1));
-        assert_eq!(directory.legacy_ordinal(&tid("modernbert")), Some(3));
+        let directory = TierDirectory::from_order(&registry, &[tname("rules"), tname("modernbert")]);
+        assert_eq!(directory.slot(&tname("rules")).map(Slot::index), Some(0));
+        assert_eq!(directory.slot(&tname("modernbert")).map(Slot::index), Some(1));
+        assert_eq!(directory.info(&tname("rules")).map(|info| info.id), registry.get(&tname("rules")).map(|tier| *tier.id()));
     }
 
     #[test]
-    fn duplicates_and_duplicate_legacy_ordinals_are_rejected() {
+    fn duplicate_names_are_rejected() {
         let mut registry = TierRegistry::new();
-        registry.register(named("rules"), Some(1)).unwrap();
-        assert_eq!(registry.register(named("rules"), None), Err(RegistryError::DuplicateTier(tid("rules"))));
-        assert_eq!(registry.register(named("other"), Some(1)), Err(RegistryError::DuplicateOrdinal(1)));
+        registry.register(fake("rules")).unwrap();
+        assert_eq!(registry.register(fake("rules")), Err(RegistryError::DuplicateName(tname("rules"))));
         assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn identical_content_under_two_names_is_one_instance() {
+        let mut registry = TierRegistry::new();
+        let first = Arc::new(TierInstance::fake_with_model("first", "same-model", Arc::new(Silent)));
+        let second = Arc::new(TierInstance::fake_with_model("second", "same-model", Arc::new(Silent)));
+        let id = *first.id();
+        registry.register(first).unwrap();
+        assert_eq!(
+            registry.register(second),
+            Err(RegistryError::DuplicateId { id, existing: tname("first"), duplicate: tname("second") }),
+        );
+    }
+
+    #[test]
+    fn a_policy_calibrated_for_another_instance_is_reported() {
+        use crate::pipeline::task::TierPolicy;
+        let mut registry = TierRegistry::new();
+        registry.register(fake("rules")).unwrap();
+        let running = *registry.get(&tname("rules")).unwrap().id();
+        let other = *fake("other").id();
+        let mut policy = TierPolicy::new(0.9);
+        let mut policies = TierPolicyMap::new();
+        policy.calibrated_for = Some(running);
+        policies.insert(tname("rules"), [(TaskId::route(), policy.clone())].into());
+        assert!(registry.calibration_mismatches(&policies).is_empty());
+        policy.calibrated_for = Some(other);
+        policies.insert(tname("rules"), [(TaskId::route(), policy)].into());
+        assert_eq!(
+            registry.calibration_mismatches(&policies),
+            vec![CalibrationMismatch { tier: tname("rules"), task: TaskId::route(), calibrated_for: other, running }],
+        );
     }
 }

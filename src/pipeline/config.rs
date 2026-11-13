@@ -6,17 +6,23 @@
 //   [task.<id>]               what a task is
 //   [[tier]]                  the available named tiers; no execution order
 //   [tier_policy.<tier>.<id>] when a tier may resolve a task
+//   [legacy_tiers]            compatibility: tier name -> its old number (optional)
 //
 // `<tier>` is a tier name. For configs written before tiers had names, the key
-// `tierN` is accepted as an alias for the tier whose `legacy_ordinal` is N.
+// `tierN` is accepted as an alias for the tier numbered N in `[legacy_tiers]`.
+// The numbers are read here, at the boundary, and handed on as a
+// `LegacyTierNumbers`; no tier, instance or cascade type carries them.
 
 use std::collections::BTreeMap;
 use std::{error::Error, fs, path::Path};
 
 use serde::Deserialize;
 
+use crate::legacy_tiers::LegacyTierNumbers;
+
 use super::cascade::CascadeGraph;
-use super::registry::TierId;
+use super::identity::TierName;
+use super::tier::{Computation, Params, RequestShape, Role, Tier, TierDecl, Transport};
 use super::task::{FallbackPolicy, OutputKind, TaskId, TaskLabelMetadata, TaskProfile, TierPolicy, TierPolicyMap};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -31,117 +37,134 @@ pub struct PipelineSettings {
     pub tag_budget_ms: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TierExecutor { Rules, Fasttext, Scorer }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TierTransport { InProcess, Grpc }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TierRequestShape { Score, ScoreTasks }
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTier {
     name: String,
-    executor: TierExecutor,
-    transport: TierTransport,
-    request_shape: Option<TierRequestShape>,
-    legacy_ordinal: Option<u8>,
+    #[serde(alias = "executor")]
+    role: Role,
+    transport: Transport,
+    request_shape: Option<RequestShape>,
+    computation: Option<Computation>,
+    model: Option<String>,
+    config: Option<String>,
     enabled: Option<bool>,
     endpoint: Option<String>,
     timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
-pub struct TierSpec {
-    pub id: TierId,
-    pub executor: TierExecutor,
-    pub transport: TierTransport,
-    pub request_shape: Option<TierRequestShape>,
-    pub legacy_ordinal: Option<u8>,
-    pub enabled: Option<bool>,
-    pub endpoint: Option<String>,
-    pub timeout_ms: Option<u64>,
-}
-
-/// The registry of available tiers. Its vector order has no scheduling meaning.
-fn default_tier_specs() -> Vec<TierSpec> {
+/// The available tier instances. Their vector order has no scheduling meaning.
+fn default_tier_decls() -> Vec<TierDecl> {
     [
-        ("rules", TierExecutor::Rules, TierTransport::InProcess, None, 1),
-        ("fasttext", TierExecutor::Fasttext, TierTransport::InProcess, None, 2),
-        ("modernbert", TierExecutor::Scorer, TierTransport::Grpc, Some(TierRequestShape::Score), 3),
-        ("harrier", TierExecutor::Scorer, TierTransport::Grpc, Some(TierRequestShape::Score), 4),
-    ].into_iter().map(|(name, executor, transport, request_shape, ordinal)| TierSpec {
-        id: TierId::new(name).expect("built-in tier names are valid"),
-        executor, transport, request_shape, legacy_ordinal: Some(ordinal),
-        enabled: None, endpoint: None, timeout_ms: None,
+        ("rules", Role::Rules, Transport::InProcess, None, Computation::Automaton),
+        ("fasttext", Role::FastText, Transport::InProcess, None, Computation::FastText),
+        ("modernbert", Role::Encoder, Transport::Grpc, Some(RequestShape::Score), Computation::Onnx),
+        ("harrier", Role::Encoder, Transport::Grpc, Some(RequestShape::Score), Computation::Gguf),
+    ].into_iter().map(|(name, role, transport, request_shape, computation)| TierDecl {
+        name: TierName::new(name).expect("built-in tier names are valid"),
+        tier: Tier { role, transport, request_shape },
+        params: Params {
+            computation, model: None, config: None, endpoint: None, timeout_ms: None,
+            enabled: None,
+        },
     }).collect()
 }
 
-fn tier_specs_from(raw: Vec<RawTier>) -> Result<Vec<TierSpec>, Box<dyn Error>> {
-    if raw.is_empty() { return Ok(default_tier_specs()); }
-    let mut specs: Vec<TierSpec> = Vec::with_capacity(raw.len());
+fn tier_decls_from(raw: Vec<RawTier>) -> Result<Vec<TierDecl>, Box<dyn Error>> {
+    if raw.is_empty() { return Ok(default_tier_decls()); }
+    let mut decls: Vec<TierDecl> = Vec::with_capacity(raw.len());
     for tier in raw {
-        let id = TierId::new(tier.name.clone()).map_err(|error| format!("[[tier]]: {error}"))?;
-        let name = id.as_str().to_string();
-        if specs.iter().any(|existing| existing.id == id) {
-            return Err(format!("[[tier]] {name:?} is defined twice").into());
+        let name = TierName::new(tier.name.clone()).map_err(|error| format!("[[tier]]: {error}"))?;
+        let label = name.as_str().to_string();
+        if decls.iter().any(|existing| existing.name == name) {
+            return Err(format!("[[tier]] {label:?} is defined twice").into());
         }
-        if let Some(ordinal) = tier.legacy_ordinal {
-            if ordinal == 0 { return Err(format!("[[tier]] {name:?}: legacy_ordinal must be positive").into()); }
-            if specs.iter().any(|existing| existing.legacy_ordinal == Some(ordinal)) {
-                return Err(format!("[[tier]] {name:?}: legacy_ordinal {ordinal} is already used").into());
+        let definition = Tier { role: tier.role, transport: tier.transport, request_shape: tier.request_shape };
+        definition.validate().map_err(|reason| format!("[[tier]] {label:?}: {reason}"))?;
+        let computation = match (tier.computation, definition.implied_computation()) {
+            (Some(computation), _) | (None, Some(computation)) => computation,
+            (None, None) => {
+                return Err(format!("[[tier]] {label:?}: an encoder must declare `computation` (\"onnx\" or \"gguf\")").into());
             }
+        };
+        if !definition.accepts(computation) {
+            return Err(format!(
+                "[[tier]] {label:?}: a {} tier cannot run computation {:?}",
+                definition.role.as_str(), computation.as_str()
+            ).into());
         }
-        match (tier.executor, tier.transport, tier.request_shape) {
-            (TierExecutor::Rules | TierExecutor::Fasttext, TierTransport::InProcess, None) => {
-                if tier.endpoint.is_some() || tier.timeout_ms.is_some() {
-                    return Err(format!("[[tier]] {name:?}: endpoint/timeout_ms require grpc transport").into());
-                }
-            }
-            (TierExecutor::Scorer, TierTransport::Grpc, Some(TierRequestShape::Score | TierRequestShape::ScoreTasks)) => {}
-            (TierExecutor::Rules | TierExecutor::Fasttext, _, _) => {
-                return Err(format!("[[tier]] {name:?}: rules/fasttext require transport = \"in_process\" and no request_shape").into());
-            }
-            (TierExecutor::Scorer, _, _) => {
-                return Err(format!("[[tier]] {name:?}: scorer requires transport = \"grpc\" and request_shape = \"score\" or \"score_tasks\"").into());
-            }
+        if definition.role != Role::Encoder && (tier.endpoint.is_some() || tier.timeout_ms.is_some()) {
+            return Err(format!("[[tier]] {label:?}: endpoint/timeout_ms require grpc transport").into());
         }
-        if tier.endpoint.as_deref().is_some_and(|value| value.trim().is_empty()) {
-            return Err(format!("[[tier]] {name:?}: endpoint must be non-empty").into());
+        match definition.role {
+            Role::Rules if tier.model.is_some() => {
+                return Err(format!("[[tier]] {label:?}: a rules tier takes `config`, not `model`").into());
+            }
+            Role::FastText | Role::Encoder if tier.config.is_some() => {
+                return Err(format!("[[tier]] {label:?}: `config` is only valid on a rules tier").into());
+            }
+            _ => {}
+        }
+        for (field, value) in [("endpoint", &tier.endpoint), ("model", &tier.model), ("config", &tier.config)] {
+            if value.as_deref().is_some_and(|value| value.trim().is_empty()) {
+                return Err(format!("[[tier]] {label:?}: {field} must be non-empty").into());
+            }
         }
         if tier.timeout_ms == Some(0) {
-            return Err(format!("[[tier]] {name:?}: timeout_ms must be greater than zero").into());
+            return Err(format!("[[tier]] {label:?}: timeout_ms must be greater than zero").into());
         }
-        specs.push(TierSpec {
-            id, executor: tier.executor, transport: tier.transport,
-            request_shape: tier.request_shape, legacy_ordinal: tier.legacy_ordinal,
-            enabled: tier.enabled, endpoint: tier.endpoint, timeout_ms: tier.timeout_ms,
+        decls.push(TierDecl {
+            name,
+            tier: definition,
+            params: Params {
+                computation, model: tier.model, config: tier.config, endpoint: tier.endpoint,
+                timeout_ms: tier.timeout_ms, enabled: tier.enabled,
+            },
         });
     }
-    let rules = specs.iter().filter(|spec| spec.executor == TierExecutor::Rules).count();
-    let fasttext = specs.iter().filter(|spec| spec.executor == TierExecutor::Fasttext).count();
-    if rules > 1 { return Err("only one rules tier may be registered".into()); }
-    if fasttext > 1 { return Err("only one fasttext tier may be registered".into()); }
-    Ok(specs)
+    Ok(decls)
 }
 
-fn find_tier<'a>(specs: &'a [TierSpec], reference: &str) -> Option<&'a TierSpec> {
-    if let Some(spec) = specs.iter().find(|spec| spec.id.as_str() == reference) {
-        return Some(spec);
+fn find_tier<'a>(decls: &'a [TierDecl], legacy: &LegacyTierNumbers, reference: &str) -> Option<&'a TierDecl> {
+    if let Some(decl) = decls.iter().find(|decl| decl.name.as_str() == reference) {
+        return Some(decl);
     }
     reference
         .strip_prefix("tier")
         .and_then(|number| number.parse::<u8>().ok())
-        .and_then(|ordinal| specs.iter().find(|spec| spec.legacy_ordinal == Some(ordinal)))
+        .and_then(|ordinal| legacy.name_of(ordinal))
+        .and_then(|name| decls.iter().find(|decl| &decl.name == name))
 }
 
-fn known_tier_names(specs: &[TierSpec]) -> String {
-    specs.iter().map(|spec| spec.id.as_str()).collect::<Vec<_>>().join(", ")
+/// The compatibility numbering: `[legacy_tiers]` if present; otherwise the
+/// original four-tier numbering when no `[[tier]]` is declared; otherwise none.
+fn legacy_numbers_from(
+    declared: Option<BTreeMap<String, u8>>,
+    decls: &[TierDecl],
+    has_explicit_tier_registry: bool,
+) -> Result<LegacyTierNumbers, Box<dyn Error>> {
+    let Some(declared) = declared else {
+        return Ok(if has_explicit_tier_registry {
+            LegacyTierNumbers::default()
+        } else {
+            LegacyTierNumbers::original_four()
+        });
+    };
+    let mut pairs = Vec::with_capacity(declared.len());
+    for (name, ordinal) in declared {
+        let name = TierName::new(name.clone()).map_err(|error| format!("[legacy_tiers]: {error}"))?;
+        if !decls.iter().any(|decl| decl.name == name) {
+            return Err(format!(
+                "[legacy_tiers]: unknown tier {name}; registered tiers: {}", known_tier_names(decls)
+            ).into());
+        }
+        pairs.push((name, ordinal));
+    }
+    Ok(LegacyTierNumbers::new(pairs).map_err(|error| format!("[legacy_tiers]: {error}"))?)
+}
+
+fn known_tier_names(decls: &[TierDecl]) -> String {
+    decls.iter().map(|decl| decl.name.as_str()).collect::<Vec<_>>().join(", ")
 }
 
 fn default_tag_budget_ms() -> u64 {
@@ -162,7 +185,7 @@ impl Default for PipelineSettings {
 #[serde(deny_unknown_fields)]
 struct RawProfile {
     labels: Option<Vec<String>>,
-    /// Ordered TierId path for this task.
+    /// Ordered path of tier names for this task.
     #[serde(default)]
     cascade: Option<Vec<String>>,
     #[serde(default)]
@@ -200,6 +223,8 @@ struct RawFile {
     #[serde(default)]
     tier: Vec<RawTier>,
     #[serde(default)]
+    legacy_tiers: Option<BTreeMap<String, u8>>,
+    #[serde(default)]
     tier_policy: BTreeMap<String, BTreeMap<String, TierPolicy>>,
 }
 
@@ -207,12 +232,14 @@ struct RawFile {
 pub struct PipelineConfig {
     pub settings: PipelineSettings,
     /// Available configured tiers; vector order carries no scheduling semantics.
-    pub tiers: Vec<TierSpec>,
+    pub tiers: Vec<TierDecl>,
     /// Union DAG formed from all task-specific cascade paths.
     pub cascades: CascadeGraph,
     profiles: BTreeMap<TaskId, TaskProfile>,
     /// Tier policies are a separate registry, not fields on TaskProfile.
     pub tier_policies: TierPolicyMap,
+    /// Compatibility numbering for numbered telemetry and `[router.tierN]`.
+    pub legacy: LegacyTierNumbers,
 }
 
 impl PipelineConfig {
@@ -232,7 +259,7 @@ impl PipelineConfig {
     }
 }
 
-fn validate_policy(task: &str, tier: &TierId, policy: &TierPolicy) -> Result<(), Box<dyn Error>> {
+fn validate_policy(task: &str, tier: &TierName, policy: &TierPolicy) -> Result<(), Box<dyn Error>> {
     for bar in std::iter::once(policy.min_confidence)
         .chain(policy.label_min_confidence.values().copied())
     {
@@ -264,8 +291,9 @@ pub fn parse(contents: &str) -> Result<PipelineConfig, Box<dyn Error>> {
 fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dyn Error>> {
     let raw: RawFile = toml::from_str(contents)?;
     let has_explicit_tier_registry = !raw.tier.is_empty();
-    let tiers = tier_specs_from(raw.tier)?;
-    let registered: std::collections::BTreeSet<TierId> = tiers.iter().map(|spec| spec.id.clone()).collect();
+    let tiers = tier_decls_from(raw.tier)?;
+    let legacy = legacy_numbers_from(raw.legacy_tiers, &tiers, has_explicit_tier_registry)?;
+    let registered: std::collections::BTreeSet<TierName> = tiers.iter().map(|decl| decl.name.clone()).collect();
     let mut profiles = BTreeMap::new();
     let mut task_paths = BTreeMap::new();
 
@@ -273,12 +301,12 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
         let task = TaskId::new(name.clone());
         let path = match profile.cascade {
             Some(names) => names.into_iter().map(|tier_name| {
-                TierId::new(tier_name.clone()).map_err(|error| format!("task.{name}.cascade: {error}"))
+                TierName::new(tier_name.clone()).map_err(|error| format!("task.{name}.cascade: {error}"))
             }).collect::<Result<Vec<_>, _>>()?,
             None if has_explicit_tier_registry => {
                 return Err(format!("task.{name}: cascade is required when [[tier]] entries are configured").into());
             }
-            None => default_tier_specs().into_iter().map(|spec| spec.id).collect(),
+            None => default_tier_decls().into_iter().map(|decl| decl.name).collect(),
         };
         task_paths.insert(task.clone(), path);
 
@@ -328,10 +356,10 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
     let cascades = CascadeGraph::from_task_paths(task_paths, &registered)?;
     let mut tier_policies = TierPolicyMap::new();
     for (tier_key, task_policies) in raw.tier_policy {
-        let spec = find_tier(&tiers, &tier_key).ok_or_else(|| format!(
+        let decl = find_tier(&tiers, &legacy, &tier_key).ok_or_else(|| format!(
             "tier_policy: unknown tier {tier_key:?}; registered tiers: {}", known_tier_names(&tiers)
         ))?;
-        let tier = spec.id.clone();
+        let tier = decl.name.clone();
         let by_task = tier_policies.entry(tier.clone()).or_default();
         for (task_name, policy) in task_policies {
             let task = TaskId::new(task_name.clone());
@@ -356,7 +384,7 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
             }
         }
     }
-    Ok(PipelineConfig { settings: raw.pipeline, tiers, cascades, profiles, tier_policies })
+    Ok(PipelineConfig { settings: raw.pipeline, tiers, cascades, profiles, tier_policies, legacy })
 }
 
 #[cfg(test)]
@@ -381,19 +409,21 @@ mod tests {
             [[tier]]
             name = "modernbert"
             executor = "scorer"
+            computation = "onnx"
             transport = "grpc"
             request_shape = "score_tasks"
             endpoint = "http://127.0.0.1:50052"
             [[tier]]
             name = "harrier"
             executor = "scorer"
+            computation = "onnx"
             transport = "grpc"
             request_shape = "score_tasks"
             endpoint = "http://127.0.0.1:50051"
         "#).unwrap();
-        assert_eq!(cfg.cascades.order().iter().map(TierId::as_str).collect::<Vec<_>>(), ["rules", "modernbert", "harrier"]);
-        assert_eq!(cfg.cascades.tasks_using(&TierId::new("modernbert").unwrap()).unwrap().len(), 2);
-        assert!(cfg.cascades.task_uses(&TaskId::tag(), &TierId::new("harrier").unwrap()));
+        assert_eq!(cfg.cascades.order().iter().map(TierName::as_str).collect::<Vec<_>>(), ["rules", "modernbert", "harrier"]);
+        assert_eq!(cfg.cascades.tasks_using(&TierName::new("modernbert").unwrap()).unwrap().len(), 2);
+        assert!(cfg.cascades.task_uses(&TaskId::tag(), &TierName::new("harrier").unwrap()));
     }
 
     #[test]
@@ -408,12 +438,14 @@ mod tests {
             [[tier]]
             name = "a"
             executor = "scorer"
+            computation = "onnx"
             transport = "grpc"
             request_shape = "score"
             endpoint = "http://127.0.0.1:50051"
             [[tier]]
             name = "b"
             executor = "scorer"
+            computation = "onnx"
             transport = "grpc"
             request_shape = "score"
             endpoint = "http://127.0.0.1:50052"
@@ -429,6 +461,7 @@ mod tests {
             [[tier]]
             name = "zeta"
             executor = "scorer"
+            computation = "onnx"
             transport = "grpc"
             request_shape = "score"
             endpoint = "http://127.0.0.1:50051"
@@ -440,7 +473,7 @@ mod tests {
     fn legacy_config_without_a_named_registry_keeps_the_original_four_tier_path() {
         let cfg = parse("[task.route]\nfallback_label = \"needs_llm\"").unwrap();
         assert_eq!(
-            cfg.cascades.paths()[&TaskId::route()].iter().map(TierId::as_str).collect::<Vec<_>>(),
+            cfg.cascades.paths()[&TaskId::route()].iter().map(TierName::as_str).collect::<Vec<_>>(),
             ["rules", "fasttext", "modernbert", "harrier"]
         );
     }
@@ -485,11 +518,211 @@ mod tests {
     #[test]
     fn shipped_config_references_available_tiers() {
         let cfg = load_or_default("config/tasks.toml").unwrap();
-        let available: std::collections::BTreeSet<_> = cfg.tiers.iter().map(|spec| spec.id.clone()).collect();
+        let available: std::collections::BTreeSet<_> = cfg.tiers.iter().map(|decl| decl.name.clone()).collect();
         for path in cfg.cascades.paths().values() {
             assert!(path.iter().all(|tier| available.contains(tier)));
         }
         assert!(cfg.has_policy(&TaskId::route()));
         assert!(!cfg.cascades.order().is_empty());
+    }
+
+    fn with_tiers(tiers: &str) -> String {
+        format!(
+            r#"
+            [task.route]
+            labels = ["jev_capable", "needs_llm"]
+            fallback_label = "needs_llm"
+            cascade = ["a", "b"]
+            {tiers}
+            "#
+        )
+    }
+
+    #[test]
+    fn two_instances_of_one_tier_declare_their_own_computation_and_model() {
+        let cfg = parse(&with_tiers(r#"
+            [[tier]]
+            name = "a"
+            role = "encoder"
+            computation = "onnx"
+            transport = "grpc"
+            request_shape = "score"
+            model = "modernbert-base"
+            [[tier]]
+            name = "b"
+            role = "encoder"
+            computation = "gguf"
+            transport = "grpc"
+            request_shape = "score"
+            model = "harrier-270m"
+        "#)).unwrap();
+        assert_eq!(cfg.tiers[0].tier, cfg.tiers[1].tier);
+        assert_eq!(cfg.tiers[0].params.computation, Computation::Onnx);
+        assert_eq!(cfg.tiers[1].params.computation, Computation::Gguf);
+        assert_eq!(cfg.tiers[1].params.model.as_deref(), Some("harrier-270m"));
+    }
+
+    #[test]
+    fn several_instances_of_the_in_process_roles_are_allowed() {
+        let cfg = parse(&with_tiers(r#"
+            [[tier]]
+            name = "a"
+            role = "fasttext"
+            transport = "in_process"
+            model = "models/small.bin"
+            [[tier]]
+            name = "b"
+            role = "fasttext"
+            transport = "in_process"
+            model = "models/large.bin"
+        "#)).unwrap();
+        assert_eq!(cfg.tiers.len(), 2);
+        assert_eq!(cfg.tiers[0].params.computation, Computation::FastText);
+    }
+
+    #[test]
+    fn the_older_executor_vocabulary_is_still_read() {
+        let cfg = parse(&with_tiers(r#"
+            [[tier]]
+            name = "a"
+            executor = "rules"
+            transport = "in_process"
+            [[tier]]
+            name = "b"
+            executor = "scorer"
+            computation = "onnx"
+            transport = "grpc"
+            request_shape = "score"
+        "#)).unwrap();
+        assert_eq!(cfg.tiers[0].tier.role, Role::Rules);
+        assert_eq!(cfg.tiers[1].tier.role, Role::Encoder);
+    }
+
+    #[test]
+    fn an_encoder_must_declare_a_computation_that_fits_its_role() {
+        let missing = with_tiers(r#"
+            [[tier]]
+            name = "a"
+            role = "encoder"
+            transport = "grpc"
+            request_shape = "score"
+            [[tier]]
+            name = "b"
+            role = "rules"
+            transport = "in_process"
+        "#);
+        assert!(parse(&missing).is_err_and(|e| e.to_string().contains("must declare `computation`")));
+        let misfit = with_tiers(r#"
+            [[tier]]
+            name = "a"
+            role = "rules"
+            computation = "onnx"
+            transport = "in_process"
+            [[tier]]
+            name = "b"
+            role = "rules"
+            transport = "in_process"
+        "#);
+        assert!(parse(&misfit).is_err_and(|e| e.to_string().contains("cannot run computation")));
+    }
+
+    #[test]
+    fn instance_parameters_are_checked_against_the_role() {
+        let rules_model = with_tiers(r#"
+            [[tier]]
+            name = "a"
+            role = "rules"
+            transport = "in_process"
+            model = "x.bin"
+            [[tier]]
+            name = "b"
+            role = "rules"
+            transport = "in_process"
+        "#);
+        assert!(parse(&rules_model).is_err_and(|e| e.to_string().contains("takes `config`")));
+        let fasttext_config = with_tiers(r#"
+            [[tier]]
+            name = "a"
+            role = "fasttext"
+            transport = "in_process"
+            config = "x.toml"
+            [[tier]]
+            name = "b"
+            role = "rules"
+            transport = "in_process"
+        "#);
+        assert!(parse(&fasttext_config).is_err_and(|e| e.to_string().contains("only valid on a rules tier")));
+        let empty_model = with_tiers(r#"
+            [[tier]]
+            name = "a"
+            role = "fasttext"
+            transport = "in_process"
+            model = "  "
+            [[tier]]
+            name = "b"
+            role = "rules"
+            transport = "in_process"
+        "#);
+        assert!(parse(&empty_model).is_err_and(|e| e.to_string().contains("model must be non-empty")));
+    }
+
+    const TWO_TIERS: &str = r#"
+        [task.route]
+        labels = ["jev_capable", "needs_llm"]
+        fallback_label = "needs_llm"
+        cascade = ["a", "b"]
+        [[tier]]
+        name = "a"
+        role = "rules"
+        transport = "in_process"
+        [[tier]]
+        name = "b"
+        role = "fasttext"
+        transport = "in_process"
+        [tier_policy.a.route]
+        min_confidence = 0.9
+    "#;
+
+    #[test]
+    fn legacy_numbers_live_in_their_own_table_and_not_on_the_tier() {
+        let cfg = parse(&format!("{TWO_TIERS}\n[legacy_tiers]\na = 1\nb = 2\n")).unwrap();
+        let name = |value: &str| TierName::new(value).unwrap();
+        assert_eq!(cfg.legacy.ordinal_of(&name("a")), Some(1));
+        assert_eq!(cfg.legacy.name_of(2), Some(&name("b")));
+        // The old per-tier key no longer exists.
+        let on_the_tier = TWO_TIERS.replace("role = \"rules\"", "role = \"rules\"\n        legacy_ordinal = 1");
+        assert!(parse(&on_the_tier).is_err());
+    }
+
+    #[test]
+    fn legacy_tiers_must_name_declared_tiers_with_unique_positive_numbers() {
+        assert!(parse(&format!("{TWO_TIERS}\n[legacy_tiers]\nmissing = 1\n"))
+            .is_err_and(|e| e.to_string().contains("unknown tier")));
+        assert!(parse(&format!("{TWO_TIERS}\n[legacy_tiers]\na = 1\nb = 1\n")).is_err());
+        assert!(parse(&format!("{TWO_TIERS}\n[legacy_tiers]\na = 0\n")).is_err());
+    }
+
+    #[test]
+    fn a_tiern_policy_key_resolves_through_the_legacy_table() {
+        let cfg = parse(&TWO_TIERS.replace("[tier_policy.a.route]", "[tier_policy.tier1.route]")
+            .replace("min_confidence = 0.9\n    ", "min_confidence = 0.9\n        [legacy_tiers]\n        a = 1\n    ")).unwrap();
+        assert!(cfg.tier_policies.contains_key(&TierName::new("a").unwrap()));
+        // Without the table the alias has nothing to resolve through.
+        assert!(parse(&TWO_TIERS.replace("[tier_policy.a.route]", "[tier_policy.tier1.route]"))
+            .is_err_and(|e| e.to_string().contains("unknown tier")));
+    }
+
+    #[test]
+    fn configuration_without_a_tier_registry_keeps_the_original_numbering() {
+        let cfg = parse("[task.route]\nlabels = [\"jev_capable\", \"needs_llm\"]\nfallback_label = \"needs_llm\"\n").unwrap();
+        assert_eq!(cfg.legacy, LegacyTierNumbers::original_four());
+        let explicit = parse(TWO_TIERS).unwrap();
+        assert_eq!(explicit.legacy, LegacyTierNumbers::default());
+    }
+
+    #[test]
+    fn the_shipped_config_numbers_the_original_four() {
+        let cfg = load_or_default("config/tasks.toml").unwrap();
+        assert_eq!(cfg.legacy, LegacyTierNumbers::original_four());
     }
 }

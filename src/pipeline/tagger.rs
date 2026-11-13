@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use super::registry::TierDirectory;
+use crate::legacy_tiers::LegacyTierNumbers;
 use super::runner::{Resolution, RunOutcome};
 use super::task::{Reading, TaskId};
 use crate::tagging::{CategoryScore, TaskDecisionMetadata, TagError, TagInput, Tagger, TaggerOutput, TaggerVerdict};
@@ -70,7 +70,7 @@ pub struct CascadeTagger<F: Tagger> {
     taxonomy_version: String,
     output_kind: String,
     fallback: F,
-    tiers: Arc<TierDirectory>,
+    legacy: Arc<LegacyTierNumbers>,
 }
 
 impl<F: Tagger> CascadeTagger<F> {
@@ -87,13 +87,13 @@ impl<F: Tagger> CascadeTagger<F> {
             taxonomy_version: taxonomy_version.into(),
             output_kind: output_kind.into(),
             fallback,
-            tiers: Arc::new(TierDirectory::default()),
+            legacy: Arc::new(LegacyTierNumbers::default()),
         }
     }
 
-    /// Lets the tagger record a resolving tier's legacy ordinal next to its name.
-    pub fn with_tier_directory(mut self, tiers: Arc<TierDirectory>) -> Self {
-        self.tiers = tiers;
+    /// Lets the tagger record a resolving tier's legacy number next to its name.
+    pub fn with_legacy_numbers(mut self, legacy: Arc<LegacyTierNumbers>) -> Self {
+        self.legacy = legacy;
         self
     }
 }
@@ -129,7 +129,7 @@ impl<F: Tagger> Tagger for CascadeTagger<F> {
                     decision: Some(TaskDecisionMetadata {
                         task_id: TaskId::tag().as_str().to_string(),
                         output_kind: self.output_kind.clone(),
-                        resolving_tier: self.tiers.legacy_ordinal(tier),
+                        resolving_tier: self.legacy.ordinal_of(tier),
                         resolving_tier_name: Some(tier.to_string()),
                         model_id: Some(model_id.clone()),
                         scores: reading.scores.iter().map(|(category_id, score)| {
@@ -148,7 +148,7 @@ impl<F: Tagger> Tagger for CascadeTagger<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::registry::tid;
+    use crate::pipeline::identity::tname;
     use std::future::Future;
     use crate::pipeline::runner::{RunOutcome, TaskOutcome};
     use crate::pipeline::task::TaskId;
@@ -188,7 +188,7 @@ mod tests {
                 TaskId::tag(),
                 TaskOutcome {
                     resolution: Resolution::Tier {
-                        tier: tid("modernbert"),
+                        tier: tname("modernbert"),
                         model_id: "shared-encoder".into(),
                         reading: Reading {
                             label: "help_desk".into(),
