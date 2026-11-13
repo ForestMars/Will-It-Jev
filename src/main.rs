@@ -13,8 +13,10 @@ use crate::tagging::{ClickHouseRawTable, OvenV1Tagger, TagConfig};
 use pipeline::tagger::{CascadeTagger, JointTagStore};
 use legacy_tiers::LegacyTierNumbers;
 use pipeline::identity::TierName;
-use pipeline::tier::{hex, Params, RequestShape, Role, Tier, TierInstance};
-use pipeline::{CascadeRunner, String, TierRegistry};
+use pipeline::task::{Cascade, Task, TierPolicyMap};
+use pipeline::tier::{hex, Params, Role, Tier, TierInstance};
+use pipeline::TierRegistry;
+use pipeline::CascadeRunner;
 use router::dispatch::DownstreamDispatcher;
 use router::service;
 
@@ -294,43 +296,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pipeline_config =
         pipeline::config::load_or_default(env_or("TASKS_CONFIG", "config/tasks.toml"))?;
-    let route_profile = pipeline_config
-        .profile(&String::from("route"))
-        .ok_or("tasks.toml: missing [task.route] definition")?;
-    if !pipeline_config.has_policy(&String::from("route")) {
-        return Err("tasks.toml: route task has no [tier_policy.<tier>.route] entries".into());
-    }
-    let tier_policies = Arc::new(pipeline_config.tier_policies.clone());
-    // tag_via_cascade is retained as a compatibility alias. Both settings
-    // now mean that sampled tag tasks join the route request's single cascade.
-    let tag_in_request = pipeline_config.settings.tag_in_request
-        || pipeline_config.settings.tag_via_cascade;
-    let tag_profile = if tag_in_request {
-        let profile = pipeline_config.profile(&String::from("tag")).ok_or(
-            "tasks.toml: tag_in_request = true but there is no [task.tag] profile",
-        )?;
-        if !pipeline_config.has_policy(&String::from("tag")) {
-            return Err("tasks.toml: tag_in_request = true but no [tier_policy.<tier>.tag] policy is configured".into());
-        }
-        let has_executable_tag_head = pipeline_config.tiers.iter().any(|(name, tier, params)| {
-            tier.role == Role::Encoder
-                && tier.request_shape == Some(RequestShape::ScoreTasks)
-                && tier_enabled(name, params, &config.router, &pipeline_config.legacy)
-                && pipeline_config.cascades.task_uses(&String::from("tag"), name)
-                && pipeline_config.tier_policies.get(name)
-                    .is_some_and(|by_task| by_task.contains_key(&String::from("tag")))
-        });
-        if !has_executable_tag_head {
-            return Err(r#"tasks.toml: joint tagging requires a tag policy on an enabled encoder tier configured with request_shape = "score_tasks""#.into());
-        }
-        Some(profile)
-    } else {
-        None
-    };
-
-    // ---- Build the available-tier registry -------------------------------
-    // TierRegistry is the complete lookup of available instances by name. Task
-    // cascades independently determine which registered tiers run and in what order.
+    // ---- Build the complete available-tier registry -----------------------
+    // [[tier]] supplies instances; its array order has no execution meaning.
     let mut registry = TierRegistry::new();
     for (name, tier, params) in &pipeline_config.tiers {
         if !tier_enabled(name, params, &config.router, &pipeline_config.legacy) {
@@ -349,20 +316,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if registry.is_empty() {
         return Err("no cascade tier is enabled; enable at least one [[tier]]".into());
     }
-    let execution_graph = pipeline_config.cascades.retain_available(&registry.names())?;
+
+    // Resolve authored TierName references to generated TierIds once, when
+    // constructing the immutable runtime task catalog and execution graph.
+    let configured_tasks = pipeline_config.profiles();
+    let mut runtime_tasks = Vec::with_capacity(configured_tasks.len());
+    let mut task_paths = std::collections::BTreeMap::new();
+    for configured in configured_tasks {
+        let mut tier_ids = Vec::with_capacity(configured.cascade.tiers.len());
+        for name in &configured.cascade.tiers {
+            if let Some(instance) = registry.get(name) {
+                tier_ids.push(*instance.id());
+            } else {
+                tracing::info!(task = %configured.name, tier = %name, "disabled tier omitted from task cascade");
+            }
+        }
+        task_paths.insert(configured.name.clone(), tier_ids.clone());
+        runtime_tasks.push(Task {
+            name: configured.name,
+            cascade: Cascade { tiers: tier_ids },
+            output_kind: configured.output_kind,
+            labels: configured.labels,
+            label_metadata: configured.label_metadata,
+            taxonomy_version: configured.taxonomy_version,
+            fallback: configured.fallback,
+        });
+    }
+
+    // Policies are authored by tier name in TOML but use TierId at runtime.
+    let mut tier_policies = TierPolicyMap::new();
+    for (name, by_task) in &pipeline_config.tier_policies {
+        let Some(instance) = registry.get(name) else {
+            tracing::info!(tier = %name, "policies for a disabled tier are inactive");
+            continue;
+        };
+        tier_policies.insert(*instance.id(), by_task.clone());
+    }
+
+    let execution_graph = pipeline::cascade::CascadeGraph::from_task_paths(task_paths, &registry.ids())?;
     if execution_graph.order().is_empty() {
         return Err("no task cascade contains an enabled tier".into());
     }
     tracing::info!(
-        order = ?execution_graph.order().iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+        order = ?execution_graph.order().iter().map(ToString::to_string).collect::<Vec<_>>(),
         "cascade DAG topological order"
     );
-    // The numbered telemetry columns predate named tiers and describe one rule
-    // file and one fastText model: take them from the first such instance in
-    // execution order.
+
     let artifact_hash = |role: Role| {
         execution_graph.order().iter()
-            .filter_map(|name| registry.get(name))
+            .filter_map(|id| registry.get_by_id(id))
             .find(|tier| tier.tier().role == role)
             .and_then(|tier| tier.artifact_hash().map(|hash| hex(hash)))
             .unwrap_or_else(|| "disabled".to_string())
@@ -371,25 +373,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tier1_toml: artifact_hash(Role::Rules),
         tier2_bin: artifact_hash(Role::FastText),
     };
-    for mismatch in registry.calibration_mismatches(&pipeline_config.tier_policies) {
+
+    for mismatch in registry.calibration_mismatches(&tier_policies) {
         tracing::warn!(
-            tier = %mismatch.tier, task = %mismatch.task,
+            tier = %mismatch.tier, tier_id = %mismatch.tier_id, task = %mismatch.task,
             calibrated_for = %mismatch.calibrated_for, running = %mismatch.running,
             "tier_policy was calibrated for a different instance than the one now running under this name"
         );
     }
-    for profile in pipeline_config.profiles() {
-        if !pipeline_config.has_policy(&profile.name) {
-            continue;
-        }
-        for tier in profile.cascade.tiers.iter().filter(|tier| registry.get(tier).is_some()) {
-            let has_policy = pipeline_config.tier_policies.get(tier)
-                .is_some_and(|by_task| by_task.contains_key(&profile.name));
-            if !has_policy {
-                tracing::warn!(task = %profile.name, %tier, "tier is in the task's cascade but has no tier_policy for it; it will execute without resolving the task");
+
+    for task in &runtime_tasks {
+        for tier_id in &task.cascade.tiers {
+            if !tier_policies.get(tier_id).is_some_and(|by_task| by_task.contains_key(&task.name)) {
+                tracing::warn!(task = %task.name, tier_id = %tier_id, "tier is in the task's cascade but has no resolution policy; it will execute and pass the task onward");
             }
         }
     }
+
+    let route_profile = runtime_tasks.iter().find(|task| task.name == "route").cloned()
+        .ok_or("tasks.toml: missing [task.route] definition")?;
+    if !pipeline_config.has_policy("route") {
+        return Err("tasks.toml: route task has no [tier_policy.<tier>.route] entries".into());
+    }
+
+    let tag_in_request = pipeline_config.settings.tag_in_request
+        || pipeline_config.settings.tag_via_cascade;
+    let tag_profile = if tag_in_request {
+        let profile = runtime_tasks.iter().find(|task| task.name == "tag").cloned().ok_or(
+            "tasks.toml: tag_in_request = true but there is no [task.tag] profile",
+        )?;
+        if !pipeline_config.has_policy("tag") {
+            return Err("tasks.toml: tag_in_request = true but no [tier_policy.<tier>.tag] policy is configured".into());
+        }
+        let has_executable_tag_head = profile.cascade.tiers.iter().any(|id| {
+            registry.get_by_id(id).is_some_and(|instance| {
+                instance.tier().role == Role::Encoder
+                    && tier_policies.get(id).is_some_and(|by_task| by_task.contains_key("tag"))
+            })
+        });
+        if !has_executable_tag_head {
+            return Err("tasks.toml: joint tagging requires a tag policy on an enabled encoder tier".into());
+        }
+        Some(profile)
+    } else {
+        None
+    };
+
+    let tier_policies = Arc::new(tier_policies);
     let cascade = Arc::new(CascadeRunner::new(registry, execution_graph)?);
     let legacy = Arc::new(pipeline_config.legacy.clone());
 
@@ -512,7 +542,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = service::app(service::AppDependencies {
         cascade,
-        task_profiles: pipeline_config.profiles(),
+        task_profiles: runtime_tasks,
         route_profile,
         tier_policies,
         dispatcher,

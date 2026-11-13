@@ -14,4 +14,4 @@ pub mod tier;
 
 pub use registry::TierRegistry;
 pub use runner::CascadeRunner;
-pub use task::TaskId;
+pub use task::Task;
