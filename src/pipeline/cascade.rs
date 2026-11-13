@@ -69,7 +69,7 @@ pub struct CascadeGraph {
 
 impl CascadeGraph {
     /// Resolve configured names against the available registry and assign a
-    /// stable TierId to each graph node.
+    /// stable TierId to each graph node, without adding graph identity to the registry.
     pub fn from_task_paths(
         paths: BTreeMap<String, Vec<TierName>>,
         registry: &TierRegistry,
