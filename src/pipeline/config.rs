@@ -23,7 +23,7 @@ use crate::legacy_tiers::LegacyTierNumbers;
 use super::cascade::CascadeGraph;
 use super::identity::TierName;
 use super::tier::{Computation, Params, RequestShape, Role, Tier, TierDecl, Transport};
-use super::task::{FallbackPolicy, OutputKind, TaskId, TaskLabelMetadata, TaskProfile, TierPolicy, TierPolicyMap};
+use super::task::{Cascade, FallbackPolicy, OutputKind, TaskId, TaskLabelMetadata, TaskProfile, TierPolicy, TierPolicyMap};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -295,7 +295,6 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
     let legacy = legacy_numbers_from(raw.legacy_tiers, &tiers, has_explicit_tier_registry)?;
     let registered: std::collections::BTreeSet<TierName> = tiers.iter().map(|decl| decl.name.clone()).collect();
     let mut profiles = BTreeMap::new();
-    let mut task_paths = BTreeMap::new();
 
     for (name, profile) in raw.task {
         let task = TaskId::new(name.clone());
@@ -308,7 +307,6 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
             }
             None => default_tier_decls().into_iter().map(|decl| decl.name).collect(),
         };
-        task_paths.insert(task.clone(), path);
 
         let (labels, label_metadata, taxonomy_version) = if let Some(taxonomy_path) = &profile.taxonomy {
             let taxonomy_file = base.join(taxonomy_path);
@@ -348,11 +346,12 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
             }
         }
         profiles.insert(task.clone(), TaskProfile {
-            task, output_kind: profile.output_kind, labels, label_metadata,
+            task, cascade: Cascade { tiers: path }, output_kind: profile.output_kind, labels, label_metadata,
             taxonomy_version, fallback,
         });
     }
 
+    let task_paths = profiles.iter().map(|(task, profile)| (task.clone(), profile.cascade.tiers.clone())).collect();
     let cascades = CascadeGraph::from_task_paths(task_paths, &registered)?;
     let mut tier_policies = TierPolicyMap::new();
     for (tier_key, task_policies) in raw.tier_policy {

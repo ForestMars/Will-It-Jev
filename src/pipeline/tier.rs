@@ -821,6 +821,7 @@ mod tests {
         let tier = TierInstance::encoder("route-scorer", RequestShape::ScoreTasks, None, scorer);
         let tasks = [TaskId::route()];
         let profiles = [TaskProfile {
+            cascade: super::task::Cascade::default(),
             task: TaskId::route(),
             output_kind: OutputKind::Binary,
             labels: None,

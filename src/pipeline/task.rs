@@ -179,11 +179,17 @@ pub enum FallbackPolicy {
     Defer,
 }
 
-/// A task's semantic contract. There is intentionally no tier number or
-/// per-tier policy in this structure.
+/// Authored ordered fallback route. Names resolve to generated TierIds when the runtime graph is compiled.
+#[derive(Debug, Clone, Default)]
+pub struct Cascade {
+    pub tiers: Vec<TierName>,
+}
+
+/// A task's output-head contract and its own ordered fallback cascade.
 #[derive(Debug, Clone)]
 pub struct TaskProfile {
     pub task: TaskId,
+    pub cascade: Cascade,
     pub output_kind: OutputKind,
     pub labels: Option<Vec<String>>,
     pub label_metadata: Vec<TaskLabelMetadata>,
@@ -302,6 +308,7 @@ mod tests {
     #[test]
     fn multilabel_resolution_applies_thresholds_independently() {
         let profile = TaskProfile {
+            cascade: Cascade::default(),
             task: TaskId::new("risk_flags"),
             output_kind: OutputKind::Multilabel,
             labels: Some(vec!["security".into(), "privacy".into(), "other".into()]),

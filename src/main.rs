@@ -394,15 +394,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "tier_policy was calibrated for a different instance than the one now running under this name"
         );
     }
-    for (task, path) in pipeline_config.cascades.paths() {
-        if !pipeline_config.has_policy(task) {
+    for profile in pipeline_config.profiles() {
+        if !pipeline_config.has_policy(&profile.task) {
             continue;
         }
-        for tier in path.iter().filter(|tier| registry.get(tier).is_some()) {
+        for tier in profile.cascade.tiers.iter().filter(|tier| registry.get(tier).is_some()) {
             let has_policy = pipeline_config.tier_policies.get(tier)
-                .is_some_and(|by_task| by_task.contains_key(task));
+                .is_some_and(|by_task| by_task.contains_key(&profile.task));
             if !has_policy {
-                tracing::warn!(%task, %tier, "tier is in the task's cascade but has no tier_policy for it; it will never run for that task");
+                tracing::warn!(task = %profile.task, %tier, "tier is in the task's cascade but has no tier_policy for it; it will execute without resolving the task");
             }
         }
     }

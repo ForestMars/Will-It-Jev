@@ -328,6 +328,7 @@ mod tests {
 
     fn route_profile() -> TaskProfile {
         TaskProfile {
+            cascade: super::task::Cascade::default(),
             task: TaskId::route(),
             output_kind: OutputKind::Binary,
             labels: Some(vec![LABEL_JEV.into(), LABEL_LLM.into()]),
