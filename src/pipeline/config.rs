@@ -20,12 +20,11 @@ use serde::Deserialize;
 
 use crate::legacy_tiers::LegacyTierNumbers;
 
-use super::cascade::CascadeGraph;
 use super::identity::TierName;
 use super::tier::{Computation, Params, RequestShape, Role, Tier, Transport};
 
 type TierConfig = (TierName, Tier, Params);
-use super::task::{Cascade, FallbackPolicy, OutputKind, TaskLabelMetadata, Task, TierPolicy, TierPolicyMap};
+use super::task::{Cascade, FallbackPolicy, OutputKind, TaskLabelMetadata, Task, TierPolicy};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -235,26 +234,25 @@ pub struct PipelineConfig {
     pub settings: PipelineSettings,
     /// Available configured tiers; vector order carries no scheduling semantics.
     pub(crate) tiers: Vec<TierConfig>,
-    /// Union DAG formed from all task-specific cascade paths.
-    pub cascades: CascadeGraph,
-    profiles: BTreeMap<String, Task>,
-    /// Tier policies are a separate registry, not fields on Task.
-    pub tier_policies: TierPolicyMap,
+    profiles: BTreeMap<String, Task<TierName>>,
+    /// Configuration policies are authored by tier name and resolve to TierId
+    /// after tier instances have been constructed.
+    pub tier_policies: BTreeMap<TierName, BTreeMap<String, TierPolicy>>,
     /// Compatibility numbering for numbered telemetry and `[router.tierN]`.
     pub legacy: LegacyTierNumbers,
 }
 
 impl PipelineConfig {
-    pub fn profile(&self, task: &String) -> Option<Task> {
+    pub fn profile(&self, task: &str) -> Option<Task<TierName>> {
         self.profiles.get(task).cloned()
     }
 
     /// All configured task contracts, returned in stable task-ID order.
-    pub fn profiles(&self) -> Vec<Task> {
+    pub fn profiles(&self) -> Vec<Task<TierName>> {
         self.profiles.values().cloned().collect()
     }
 
-    pub fn has_policy(&self, task: &String) -> bool {
+    pub fn has_policy(&self, task: &str) -> bool {
         self.tier_policies
             .values()
             .any(|by_task| by_task.contains_key(task))
@@ -353,9 +351,7 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
         });
     }
 
-    let task_paths = profiles.iter().map(|(task, profile)| (task.clone(), profile.cascade.tiers.clone())).collect();
-    let cascades = CascadeGraph::from_task_paths(task_paths, &registered)?;
-    let mut tier_policies = TierPolicyMap::new();
+    let mut tier_policies: BTreeMap<TierName, BTreeMap<String, TierPolicy>> = BTreeMap::new();
     for (tier_key, task_policies) in raw.tier_policy {
         let decl = find_tier(&tiers, &legacy, &tier_key).ok_or_else(|| format!(
             "tier_policy: unknown tier {tier_key:?}; registered tiers: {}", known_tier_names(&tiers)
@@ -367,7 +363,7 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
             let profile = profiles.get(&task).ok_or_else(|| format!(
                 "tier_policy.{tier}.{task_name}: no matching [task.{task_name}] definition"
             ))?;
-            if !cascades.task_uses(&task, &tier) {
+            if !profile.cascade.tiers.contains(&tier) {
                 return Err(format!("tier_policy.{tier}.{task_name}: tier is not in task.{task_name}.cascade").into());
             }
             validate_policy(&task_name, &tier, &policy)?;
@@ -385,7 +381,7 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
             }
         }
     }
-    Ok(PipelineConfig { settings: raw.pipeline, tiers, cascades, profiles, tier_policies, legacy })
+    Ok(PipelineConfig { settings: raw.pipeline, tiers, profiles, tier_policies, legacy })
 }
 
 #[cfg(test)]
@@ -422,9 +418,8 @@ mod tests {
             request_shape = "score_tasks"
             endpoint = "http://127.0.0.1:50051"
         "#).unwrap();
-        assert_eq!(cfg.cascades.order().iter().map(TierName::as_str).collect::<Vec<_>>(), ["rules", "modernbert", "harrier"]);
-        assert_eq!(cfg.cascades.tasks_using(&TierName::new("modernbert").unwrap()).unwrap().len(), 2);
-        assert!(cfg.cascades.task_uses(&String::from("tag"), &TierName::new("harrier").unwrap()));
+        assert_eq!(cfg.profile("route").unwrap().cascade.tiers.iter().map(TierName::as_str).collect::<Vec<_>>(), ["rules", "modernbert", "harrier"]);
+        assert_eq!(cfg.profile("tag").unwrap().cascade.tiers.iter().map(TierName::as_str).collect::<Vec<_>>(), ["modernbert", "harrier"]);
     }
 
     #[test]
@@ -474,7 +469,7 @@ mod tests {
     fn legacy_config_without_a_named_registry_keeps_the_original_four_tier_path() {
         let cfg = parse("[task.route]\nfallback_label = \"needs_llm\"").unwrap();
         assert_eq!(
-            cfg.cascades.paths()[&String::from("route")].iter().map(TierName::as_str).collect::<Vec<_>>(),
+            cfg.profile("route").unwrap().cascade.tiers.iter().map(TierName::as_str).collect::<Vec<_>>(),
             ["rules", "fasttext", "modernbert", "harrier"]
         );
     }
@@ -506,7 +501,7 @@ mod tests {
             "[task.tag]\ntaxonomy = \"../taskonomies/help_desk.json\"\noutput_kind = \"multiclass\"\nfallback = \"defer\"",
             Path::new("config"),
         ).unwrap();
-        let tag = cfg.profile(&String::from("tag")).unwrap();
+        let tag = cfg.profile("tag").unwrap();
         assert_eq!(tag.output_kind, OutputKind::Multiclass);
         assert_eq!(tag.labels.as_ref().unwrap().len(), 20);
         assert_eq!(tag.taxonomy_version.as_deref(), Some("1.1.0"));
@@ -520,11 +515,11 @@ mod tests {
     fn shipped_config_references_available_tiers() {
         let cfg = load_or_default("config/tasks.toml").unwrap();
         let available: std::collections::BTreeSet<_> = cfg.tiers.iter().map(|tier| tier.0.clone()).collect();
-        for path in cfg.cascades.paths().values() {
-            assert!(path.iter().all(|tier| available.contains(tier)));
+        for task in cfg.profiles() {
+            assert!(task.cascade.tiers.iter().all(|tier| available.contains(tier)));
         }
         assert!(cfg.has_policy(&String::from("route")));
-        assert!(!cfg.cascades.order().is_empty());
+        assert!(!cfg.profiles().is_empty());
     }
 
     fn with_tiers(tiers: &str) -> String {
