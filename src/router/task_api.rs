@@ -246,7 +246,7 @@ async fn execute_task_request(
         return Ok(json!({
             "run_id": run_id,
             "status": "complete",
-            "tasks": all_task_results(&outcome, &state.cascade.directory()),
+            "tasks": all_task_results(&outcome, &state.cascade.graph()),
         }));
     }
 
@@ -271,7 +271,7 @@ async fn execute_task_request(
         "run_id": run_id,
         "status": "partial",
         "required_tasks": required_names,
-        "tasks": selected_task_results(&required_outcome, &required_ids, &state.cascade.directory()),
+        "tasks": selected_task_results(&required_outcome, &required_ids, &state.cascade.graph()),
         "pending_tasks": pending_names,
     }))
 }
@@ -287,7 +287,7 @@ fn all_task_results(outcome: &RunOutcome, tiers: &CascadeGraph) -> Value {
 fn selected_task_results(
     outcome: &RunOutcome,
     selected: &BTreeSet<String>,
-    tiers: &TierDirectory,
+    tiers: &CascadeGraph,
 ) -> Value {
     let mut tasks = Map::new();
     for task_id in selected {
@@ -300,7 +300,7 @@ fn selected_task_results(
 
 /// `tier` is the tier's name; `position` is its zero-based place in the
 /// execution order, for clients that want to show the order.
-fn task_outcome_json(outcome: &TaskOutcome, tiers: &TierDirectory) -> Value {
+fn task_outcome_json(outcome: &TaskOutcome, tiers: &CascadeGraph) -> Value {
     let resolution = match &outcome.resolution {
         Resolution::Tier { tier_id, tier, model_id, reading } => json!({
             "kind": "tier",

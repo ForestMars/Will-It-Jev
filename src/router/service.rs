@@ -498,7 +498,7 @@ fn backend_for_label(label: &str) -> Backend {
 /// Every tier that ran for the route task, by name, in execution order. This is
 /// the complete per-tier record; it covers tiers that have no legacy number and
 /// so never appear in the numbered fields below.
-fn tier_outcome_records(trace: &[TierTrace], tiers: &TierDirectory) -> Vec<TierOutcomeRecord> {
+fn tier_outcome_records(trace: &[TierTrace], tiers: &CascadeGraph) -> Vec<TierOutcomeRecord> {
     trace
         .iter()
         .map(|entry| {
