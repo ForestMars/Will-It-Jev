@@ -53,7 +53,7 @@ struct RawTier {
     timeout_ms: Option<u64>,
 }
 
-/// The available tier instances. Their vector order has no scheduling meaning.
+/// Available tier declarations. Their vector order has no scheduling meaning.
 fn default_tier_configs() -> Vec<TierConfig> {
     [
         ("rules", Role::Rules, Transport::InProcess, None, None),
