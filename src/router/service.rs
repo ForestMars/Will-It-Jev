@@ -701,7 +701,7 @@ mod tests {
     fn route_profile() -> Task {
         Task {
             cascade: crate::pipeline::task::Cascade::default(),
-            task: String::from("route"),
+            name: String::from("route"),
             output_kind: OutputKind::Binary,
             labels: Some(vec![LABEL_JEV.into(), LABEL_LLM.into()]),
             label_metadata: Vec::new(),

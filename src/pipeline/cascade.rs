@@ -3,7 +3,6 @@ use std::error::Error;
 use std::fmt;
 
 use super::identity::TierName;
-use super::task::String;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CascadeGraphError {

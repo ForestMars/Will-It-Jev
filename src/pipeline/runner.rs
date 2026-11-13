@@ -151,96 +151,148 @@ impl CascadeRunner {
         budget: Duration,
         mut required_tx: Option<(BTreeSet<String>, oneshot::Sender<RunOutcome>)>,
     ) -> RunOutcome {
+        use tokio::task::JoinSet;
+
         let start = Instant::now();
-        let mut active: BTreeSet<String> = profiles.iter().map(|p| p.task.clone()).collect();
-        debug_assert_eq!(active.len(), profiles.len(), "duplicate task ids in profiles");
+        let mut active: BTreeSet<String> = profiles.iter().map(|profile| profile.name.clone()).collect();
+        debug_assert_eq!(active.len(), profiles.len(), "duplicate task names in profiles");
 
         let mut resolved: BTreeMap<String, Resolution> = BTreeMap::new();
         let mut traces: BTreeMap<String, Vec<TierTrace>> = BTreeMap::new();
         let mut tier_calls = Vec::new();
+        let requested: BTreeSet<String> = active.clone();
+        let plan = self.graph.plan(&requested);
+        let profile_by_name: BTreeMap<&str, &Task> =
+            profiles.iter().map(|profile| (profile.name.as_str(), profile)).collect();
+        let profiles = Arc::new(profiles.to_vec());
+        let prompt = Arc::<str>::from(prompt.to_owned());
 
-        for tier in &self.tiers {
-            let tier_id = tier.name();
-            if active.is_empty() || start.elapsed() >= budget {
-                break;
+        // Each task has its own next fallback transition. Independent task routes
+        // may be in flight concurrently, even when their graph nodes share a later
+        // tier. Tasks ready at the same tier are batched into one invocation.
+        let mut ready: BTreeMap<TierName, BTreeSet<String>> = BTreeMap::new();
+        for (task, entry) in &plan.task_entries {
+            if active.contains(task) {
+                ready.entry(entry.clone()).or_default().insert(task.clone());
             }
+        }
+        let mut inflight: JoinSet<(TierName, Vec<String>, Duration, super::tier::TierOutput)> = JoinSet::new();
 
-            let by_task = policies.get(tier_id);
-            let wanted: Vec<&Task> = profiles
-                .iter()
-                .filter(|profile| {
-                    active.contains(&profile.name)
-                        && self.graph.task_uses(&profile.name, tier_id)
-                })
-                .collect();
-            if wanted.is_empty() {
-                continue;
-            }
-
-            let ids: Vec<String> = wanted.iter().map(|profile| profile.name.clone()).collect();
-            let call_started = Instant::now();
-            debug!(
-                tier = %tier_id,
-                model = %tier.model_label(),
-                task_count = ids.len(),
-                "executing inference tier"
-            );
-            let output = tier
-                .evaluate(&TierContext {
-                    prompt,
-                    tasks: &ids,
-                    task_profiles: profiles,
-                    budget: budget.saturating_sub(start.elapsed()),
-                })
-                .await;
-            tier_calls.push(TierCall {
-                tier: tier_id.clone(),
-                tasks: ids,
-                took: call_started.elapsed(),
-            });
-
-            for profile in wanted {
-                let reading = output
-                    .readings
-                    .get(&profile.name)
-                    .cloned()
-                    .unwrap_or(TierReading::Unsupported);
-                let decision = match by_task.and_then(|map| map.get(&profile.name)) {
-                    Some(policy) => profile.decide(policy, &reading),
-                    None => Decision::Pass { reason: "no_policy", top_guess: None, score: 0.0 },
-                };
-                debug!(task = %profile.name, tier = %tier_id, ?decision, "task decision");
-
-                if let Decision::Resolve(resolved_reading) = &decision {
-                    resolved.insert(
-                        profile.name.clone(),
-                        Resolution::Tier {
-                            tier: tier_id.clone(),
-                            model_id: output.model_id.clone(),
-                            reading: resolved_reading.clone(),
-                        },
-                    );
-                    active.remove(&profile.name);
-                }
-
-                traces.entry(profile.name.clone()).or_default().push(TierTrace {
-                    tier: tier_id.clone(),
-                    model_id: output.model_id.clone(),
-                    reading,
-                    decision,
-                });
-            }
-
-            if let Some((required, _)) = required_tx.as_ref() {
-                if required.iter().all(|task| resolved.contains_key(task)) {
-                    if let Some((_, sender)) = required_tx.take() {
-                        let _ = sender.send(build_outcome(profiles, &resolved, &traces, &tier_calls));
-                    }
-                }
+        if required_tx.as_ref().is_some_and(|(required, _)| required.is_empty()) {
+            if let Some((_, sender)) = required_tx.take() {
+                let _ = sender.send(build_outcome(&profiles, &resolved, &traces, &tier_calls));
             }
         }
 
-        let outcome = build_outcome(profiles, &resolved, &traces, &tier_calls);
+        loop {
+            // Dispatch every tier with currently ready tasks. A task that reaches
+            // the same tier later may form a subsequent batch; it never waits for
+            // an unrelated predecessor from another task's route.
+            let batches = std::mem::take(&mut ready);
+            for (tier_name, task_set) in batches {
+                if start.elapsed() >= budget { break; }
+                let Some(tier) = self.registry.get(&tier_name) else {
+                    for task in task_set {
+                        active.remove(&task);
+                    }
+                    continue;
+                };
+                let task_ids: Vec<String> = task_set.into_iter()
+                    .filter(|task| active.contains(task))
+                    .collect();
+                if task_ids.is_empty() { continue; }
+                let remaining = budget.saturating_sub(start.elapsed());
+                let prompt = Arc::clone(&prompt);
+                let all_profiles = Arc::clone(&profiles);
+                let call_tier = tier_name.clone();
+                inflight.spawn(async move {
+                    let call_started = Instant::now();
+                    let output = tier.evaluate(&TierContext {
+                        prompt: &prompt,
+                        tasks: &task_ids,
+                        task_profiles: &all_profiles,
+                        budget: remaining,
+                    }).await;
+                    (call_tier, task_ids, call_started.elapsed(), output)
+                });
+            }
+
+            if inflight.is_empty() { break; }
+            let remaining = budget.saturating_sub(start.elapsed());
+            if remaining.is_zero() { inflight.abort_all(); break; }
+            let Some(joined) = tokio::time::timeout(remaining, inflight.join_next()).await.ok().flatten() else {
+                inflight.abort_all();
+                break;
+            };
+            let mut completed = vec![joined];
+            while let Some(next) = inflight.try_join_next() {
+                completed.push(next);
+            }
+
+            for joined in completed {
+                let (tier_name, task_ids, took, output) = match joined {
+                    Ok(result) => result,
+                    Err(error) => {
+                        tracing::error!(%error, "tier execution task failed");
+                        continue;
+                    }
+                };
+                tier_calls.push(TierCall { tier: tier_name.clone(), tasks: task_ids.clone(), took });
+                let by_task = policies.get(&tier_name);
+
+                for task_name in task_ids {
+                    if !active.contains(&task_name) { continue; }
+                    let Some(profile) = profile_by_name.get(task_name.as_str()).copied() else {
+                        active.remove(&task_name);
+                        continue;
+                    };
+                    let reading = output.readings.get(&task_name).cloned().unwrap_or(TierReading::Unsupported);
+                    let decision = match by_task.and_then(|map| map.get(&task_name)) {
+                        Some(policy) => profile.decide(policy, &reading),
+                        None => Decision::Pass { reason: "no_policy", top_guess: None, score: 0.0 },
+                    };
+                    debug!(task = %task_name, tier = %tier_name, ?decision, "task decision");
+
+                    if let Decision::Resolve(resolved_reading) = &decision {
+                        resolved.insert(task_name.clone(), Resolution::Tier {
+                            tier: tier_name.clone(),
+                            model_id: output.model_id.clone(),
+                            reading: resolved_reading.clone(),
+                        });
+                        active.remove(&task_name);
+                    } else if let Some(next) = self.graph.next(&task_name, &tier_name).cloned() {
+                        if plan.required_nodes.contains(&next) {
+                            ready.entry(next).or_default().insert(task_name.clone());
+                        }
+                    } else {
+                        // The task exhausted its declared cascade without resolving.
+                        active.remove(&task_name);
+                    }
+
+                    traces.entry(task_name.clone()).or_default().push(TierTrace {
+                        tier: tier_name.clone(),
+                        model_id: output.model_id.clone(),
+                        reading,
+                        decision,
+                    });
+                }
+            }
+
+            if let Some((required, _)) = required_tx.as_ref() {
+                if required.iter().all(|task| resolved.contains_key(task) || !active.contains(task)) {
+                    if let Some((_, sender)) = required_tx.take() {
+                        let _ = sender.send(build_outcome(&profiles, &resolved, &traces, &tier_calls));
+                    }
+                }
+            }
+
+            if active.is_empty() || start.elapsed() >= budget {
+                inflight.abort_all();
+                break;
+            }
+        }
+
+        let outcome = build_outcome(&profiles, &resolved, &traces, &tier_calls);
         if let Some((_, sender)) = required_tx.take() {
             let _ = sender.send(outcome.clone());
         }
@@ -328,7 +380,7 @@ mod tests {
     fn route_profile() -> Task {
         Task {
             cascade: super::task::Cascade::default(),
-            task: String::from("route"),
+            name: String::from("route"),
             output_kind: OutputKind::Binary,
             labels: Some(vec![LABEL_JEV.into(), LABEL_LLM.into()]),
             label_metadata: Vec::new(),
@@ -340,7 +392,7 @@ mod tests {
     fn tag_profile(labels: Option<Vec<String>>) -> Task {
         Task {
             cascade: super::task::Cascade::default(),
-            task: String::from("tag"),
+            name: String::from("tag"),
             output_kind: OutputKind::Multiclass,
             labels,
             label_metadata: Vec::new(),

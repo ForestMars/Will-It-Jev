@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 
 use crate::legacy_tiers::LegacyTierNumbers;
 use super::runner::{Resolution, RunOutcome};
-use super::task::{Reading, String};
+use super::task::Reading;
 use crate::tagging::{CategoryScore, TaskDecisionMetadata, TagError, TagInput, Tagger, TaggerOutput, TaggerVerdict};
 
 struct JointEntry {
@@ -151,7 +151,6 @@ mod tests {
     use crate::pipeline::identity::tname;
     use std::future::Future;
     use crate::pipeline::runner::{RunOutcome, TaskOutcome};
-    use crate::pipeline::task::String;
     use crate::pipeline::runner::Resolution;
     use crate::tagging::{Tagger, TaggerVerdict};
     use std::sync::atomic::{AtomicUsize, Ordering};

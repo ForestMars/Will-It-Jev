@@ -23,7 +23,7 @@ use crate::legacy_tiers::LegacyTierNumbers;
 use super::cascade::CascadeGraph;
 use super::identity::TierName;
 use super::tier::{Computation, Params, RequestShape, Role, Tier, TierDecl, Transport};
-use super::task::{Cascade, FallbackPolicy, OutputKind, String, TaskLabelMetadata, Task, TierPolicy, TierPolicyMap};
+use super::task::{Cascade, FallbackPolicy, OutputKind, TaskLabelMetadata, Task, TierPolicy, TierPolicyMap};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]

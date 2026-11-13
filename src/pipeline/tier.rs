@@ -27,7 +27,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::identity::{TierId, TierName};
-use super::task::{OutputKind, Reading, String, Task, TierReading, LABEL_JEV, LABEL_LLM};
+use super::task::{OutputKind, Reading, Task, TierReading, LABEL_JEV, LABEL_LLM};
 use crate::router::tier1_runner::{Tier1Automaton, Tier1Engine};
 use crate::router::tier2_runner::{Tier2Outcome, Tier2Route, Tier2Runner};
 use crate::router::tier3_runner::{TasksError, Tier3Runner};
@@ -790,7 +790,7 @@ mod tests {
         let profiles = [
             Task {
                 cascade: super::task::Cascade::default(),
-                task: String::from("route"),
+                name: String::from("route"),
                 output_kind: OutputKind::Binary,
                 labels: None,
                 label_metadata: Vec::new(),
@@ -799,7 +799,7 @@ mod tests {
             },
             Task {
                 cascade: super::task::Cascade::default(),
-                task: String::from("tag"),
+                name: String::from("tag"),
                 output_kind: OutputKind::Multiclass,
                 labels: None,
                 label_metadata: Vec::new(),
@@ -824,7 +824,7 @@ mod tests {
         let tasks = [String::from("route")];
         let profiles = [Task {
             cascade: super::task::Cascade::default(),
-            task: String::from("route"),
+            name: String::from("route"),
             output_kind: OutputKind::Binary,
             labels: None,
             label_metadata: Vec::new(),
@@ -852,7 +852,7 @@ mod tests {
         let tasks = [String::from("route")];
         let profiles = [Task {
             cascade: super::task::Cascade::default(),
-            task: String::from("route"),
+            name: String::from("route"),
             output_kind: OutputKind::Binary,
             labels: None,
             label_metadata: Vec::new(),

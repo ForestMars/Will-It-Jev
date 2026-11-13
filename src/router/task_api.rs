@@ -404,7 +404,7 @@ mod tests {
     fn profile(task: &str, kind: OutputKind, labels: &[&str]) -> Task {
         Task {
             cascade: crate::pipeline::task::Cascade::default(),
-            task: String::new(task),
+            task: task.to_string(),
             output_kind: kind,
             labels: Some(labels.iter().map(|label| (*label).to_string()).collect()),
             label_metadata: Vec::new(),
