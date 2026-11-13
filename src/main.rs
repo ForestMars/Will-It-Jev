@@ -12,7 +12,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use crate::tagging::{ClickHouseRawTable, OvenV1Tagger, TagConfig};
 use pipeline::tagger::{CascadeTagger, JointTagStore};
 use legacy_tiers::LegacyTierNumbers;
-use pipeline::identity::TierName;
+use pipeline::tier_types::TierName;
 use pipeline::task::{Cascade, Task, TierPolicyMap};
 use pipeline::tier::{hex, Params, Role, Tier, TierInstance};
 use pipeline::TierRegistry;

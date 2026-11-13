@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use super::identity::TierId;
+use super::tier_types::TierId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CascadeGraphError {

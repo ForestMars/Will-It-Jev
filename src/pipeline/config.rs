@@ -20,7 +20,7 @@ use serde::Deserialize;
 
 use crate::legacy_tiers::LegacyTierNumbers;
 
-use super::identity::TierName;
+use super::tier_types::TierName;
 use super::tier::{ModelFormat, Params, RequestShape, Role, Tier, Transport};
 
 type TierConfig = (TierName, Tier, Params);

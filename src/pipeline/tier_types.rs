@@ -1,16 +1,15 @@
-// src/pipeline/identity.rs
+// src/pipeline/tier_types.rs
 //
-// Identity of a tier instance, in three distinct types:
+// Shared tier-domain value types used by configuration and execution:
 //
-//   TierName  what people call it. Authored by the user in configuration, unique,
-//             renameable. Task paths and policies are written in names.
-//   TierId    what it is. Generated, never authored: a digest of the properties
-//             that determine an instance's behavior (see `TierInstance::derive_id`).
-//             Calibration is recorded against it, so swapping a model behind an
-//             unchanged name is visible.
-//   Slot      where it sits. An index into the cascade, assigned when the cascade
-//             is compiled. It is an address, not an identity: it changes when the
-//             cascade changes and is never persisted.
+//   TierName  authored configuration name. Task cascades and tier-policy keys
+//             refer to tiers by name; the runtime resolves names through the registry.
+//   TierId    stable generated identifier derived from behavior-determining instance
+//             properties (see `TierInstance::derive_id`). Configuration can record
+//             it in `calibrated_for`; policies, the registry, graph, and execution
+//             traces also use it. A changed model therefore produces a changed id.
+//   Slot      positional address in the compiled execution directory. It is derived
+//             from graph order, changes when that order changes, and is not persisted.
 
 use std::error::Error;
 use std::fmt;
@@ -28,20 +27,20 @@ const MAX_TIER_NAME_LEN: usize = 32;
 pub struct TierName(String);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IdentityError(String);
+pub struct TierTypeError(String);
 
-impl fmt::Display for IdentityError {
+impl fmt::Display for TierTypeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-impl Error for IdentityError {}
+impl Error for TierTypeError {}
 
 impl TierName {
     /// A tier name is 1 to 32 characters: a lowercase ASCII letter followed by
     /// lowercase letters, digits, `_` or `-`.
-    pub fn new(name: impl Into<String>) -> Result<Self, IdentityError> {
+    pub fn new(name: impl Into<String>) -> Result<Self, TierTypeError> {
         let name = name.into();
         let mut chars = name.chars();
         let valid = !name.is_empty()
@@ -49,18 +48,18 @@ impl TierName {
             && chars.next().is_some_and(|c| c.is_ascii_lowercase())
             && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
         if !valid {
-            return Err(IdentityError(format!(
+            return Err(TierTypeError(format!(
                 "invalid tier name {name:?}: use 1 to {MAX_TIER_NAME_LEN} characters, starting with a \
                  lowercase letter, then lowercase letters, digits, '_' or '-'"
             )));
         }
         if name == FALLBACK_TIER_NAME {
-            return Err(IdentityError(format!(
+            return Err(TierTypeError(format!(
                 "tier name {FALLBACK_TIER_NAME:?} is reserved for task fallbacks"
             )));
         }
         if name.strip_prefix("tier").is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())) {
-            return Err(IdentityError(format!(
+            return Err(TierTypeError(format!(
                 "tier name {name:?} is reserved: `tierN` is the alias for a tier numbered in [legacy_tiers]"
             )));
         }
@@ -73,7 +72,7 @@ impl TierName {
 }
 
 impl TryFrom<String> for TierName {
-    type Error = IdentityError;
+    type Error = TierTypeError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
         Self::new(value)
@@ -136,8 +135,8 @@ impl TierId {
         Self(bytes)
     }
 
-    pub fn parse(hex: &str) -> Result<Self, IdentityError> {
-        let bad = || IdentityError(format!("invalid tier id {hex:?}: expected {} hex characters", Self::LEN * 2));
+    pub fn parse(hex: &str) -> Result<Self, TierTypeError> {
+        let bad = || TierTypeError(format!("invalid tier id {hex:?}: expected {} hex characters", Self::LEN * 2));
         if hex.len() != Self::LEN * 2 || !hex.is_ascii() {
             return Err(bad());
         }

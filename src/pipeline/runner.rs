@@ -14,7 +14,7 @@ use tokio::task::JoinHandle;
 use tracing::debug;
 
 use super::cascade::CascadeGraph;
-use super::identity::{Slot, TierId, TierName};
+use super::tier_types::{Slot, TierId, TierName};
 use super::registry::{TierDirectory, TierRegistry};
 use super::task::{
     Decision, FallbackPolicy, Reading, Task, TierPolicyMap, TierReading,
@@ -329,7 +329,7 @@ fn build_outcome(
 mod tests {
     use super::*;
     use crate::pipeline::cascade::CascadeGraph;
-    use crate::pipeline::identity::tname;
+    use crate::pipeline::tier_types::tname;
     use crate::pipeline::registry::TierRegistry;
     use crate::pipeline::task::{OutputKind, TierPolicy, LABEL_JEV, LABEL_LLM};
     use crate::pipeline::tier::{FakeEvaluate, TierOutput};

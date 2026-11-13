@@ -8,7 +8,7 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-use super::identity::{Slot, TierId, TierName};
+use super::tier_types::{Slot, TierId, TierName};
 use super::task::TierPolicyMap;
 use super::tier::TierInstance;
 
@@ -170,7 +170,7 @@ impl TierDirectory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::identity::tname;
+    use crate::pipeline::tier_types::tname;
     use crate::pipeline::tier::{FakeEvaluate, TierContext, TierOutput};
     use async_trait::async_trait;
 
