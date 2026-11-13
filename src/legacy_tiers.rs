@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::pipeline::identity::TierName;
+use crate::pipeline::tier::TierName;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LegacyTierNumbers {
@@ -58,7 +58,7 @@ impl LegacyTierNumbers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::identity::tname;
+    use crate::pipeline::tier::tname;
 
     #[test]
     fn a_name_and_a_number_look_each_other_up() {

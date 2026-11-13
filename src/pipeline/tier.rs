@@ -7,7 +7,7 @@
 //   Params        what distinguishes one instance of a Tier from another: the
 //                 model format and model, rule file, endpoint, timeout.
 //   TierInstance  a Tier plus resolved instance parameters, loaded artifacts, and runner,
-//                 TierId generated. It keeps everything it was built from.
+//                 Its graph identity is assigned when CascadeGraph is compiled.
 //
 // A tier returns raw readings for the task IDs it can serve; all task-specific
 // acceptance policy lives outside this module.
@@ -24,7 +24,54 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use super::identity::{TierId, TierName};
+use super::cascade::TierId;
+
+const MAX_TIER_NAME_LEN: usize = 32;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
+#[serde(try_from = "String")]
+pub struct TierName(String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TierNameError(String);
+
+impl std::fmt::Display for TierNameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
+}
+impl Error for TierNameError {}
+
+impl TierName {
+    pub fn new(name: impl Into<String>) -> Result<Self, TierNameError> {
+        let name = name.into();
+        let mut chars = name.chars();
+        let valid = !name.is_empty() && name.len() <= MAX_TIER_NAME_LEN
+            && chars.next().is_some_and(|c| c.is_ascii_lowercase())
+            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+        if !valid {
+            return Err(TierNameError(format!("invalid tier name {name:?}: use 1 to {MAX_TIER_NAME_LEN} characters, starting with a lowercase letter, then lowercase letters, digits, '_' or '-'")));
+        }
+        if name == "fallback" {
+            return Err(TierNameError("tier name \"fallback\" is reserved for task fallbacks".into()));
+        }
+        if name.strip_prefix("tier").is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())) {
+            return Err(TierNameError(format!("tier name {name:?} is reserved: tierN is the alias for a tier numbered in [legacy_tiers]")));
+        }
+        Ok(Self(name))
+    }
+    pub fn as_str(&self) -> &str { &self.0 }
+}
+
+impl TryFrom<String> for TierName {
+    type Error = TierNameError;
+    fn try_from(value: String) -> Result<Self, Self::Error> { Self::new(value) }
+}
+impl std::fmt::Display for TierName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
+}
+
+#[cfg(test)]
+pub fn tname(name: &str) -> TierName { TierName::new(name).expect("test tier name must be valid") }
+
 use super::task::{OutputKind, Reading, Task, TierReading, LABEL_JEV, LABEL_LLM};
 use crate::router::tier1_runner::{Tier1Automaton, Tier1Engine};
 use crate::router::tier2_runner::{Tier2Outcome, Tier2Route, Tier2Runner};
@@ -248,10 +295,9 @@ pub fn hex(bytes: &[u8]) -> String {
 
 // ---- instance --------------------------------------------------------------
 
-/// A Tier plus the parameters that distinguish this instance, loaded and ready to
-/// evaluate. The execution graph is an ordered `Vec` of these.
+/// A configured Tier plus resolved parameters and a ready-to-use runner. The
+/// execution graph assigns its TierId when it compiles task paths.
 pub struct TierInstance {
-    id: TierId,
     name: TierName,
     tier: Tier,
     params: Params,
@@ -303,7 +349,6 @@ impl TierInstance {
         artifact_hash: Option<[u8; 32]>,
     ) -> Self {
         Self {
-            id: Self::derive_id(&name, &tier, &params, artifact_hash.as_ref()),
             name, tier, params, artifact_hash, runner,
             task_scorers: BTreeMap::new(),
             request_shape_unimplemented: AtomicBool::new(false),
@@ -315,7 +360,7 @@ impl TierInstance {
     /// behaviorally significant model-format/model/artifact inputs. Endpoint,
     /// transport, invocation protocol, timeout and enabled state are deployment
     /// details and do not invalidate calibration.
-    pub fn derive_id(
+    pub(crate) fn derive_id(
         name: &TierName,
         tier: &Tier,
         params: &Params,
@@ -331,12 +376,14 @@ impl TierInstance {
         field("tier_name", name.as_str());
         field("role", tier.role.as_str());
         field("model_format", params.model_format.map(ModelFormat::as_str).unwrap_or(""));
-        field("model", params.model.as_deref().unwrap_or(""));
+        // File-backed tiers identify the loaded artifact by content hash, never by path.
+        // Encoder tiers identify the externally served model by its declared model name.
+        let model = if tier.role == Role::Encoder { params.model.as_deref().unwrap_or("") } else { "" };
+        field("model", model);
         field("artifact", &artifact_hash.map(|hash| hex(hash)).unwrap_or_default());
         TierId::from_digest(&digest.finalize())
     }
 
-    pub fn id(&self) -> &TierId { &self.id }
     pub fn name(&self) -> &TierName { &self.name }
     pub fn tier(&self) -> &Tier { &self.tier }
     pub fn params(&self) -> &Params { &self.params }
@@ -510,8 +557,7 @@ impl TierInstance {
 
 #[cfg(test)]
 impl TierInstance {
-    /// An instance whose executor is a test double. The model is the name, so
-    /// instances built from different names have different ids.
+    /// An instance whose executor is a test double.
     pub fn fake(name: &str, fake: Arc<dyn FakeEvaluate>) -> Self {
         Self::fake_with_model(name, name, fake)
     }
@@ -680,6 +726,17 @@ mod tests {
         TierInstance::build(entry.0, entry.1, entry.2)
     }
 
+    #[test]
+    fn tier_names_are_validated() {
+        for valid in ["rules", "fasttext", "modernbert", "harrier", "oryn-2", "a", "prefilter_v2"] {
+            assert!(TierName::new(valid).is_ok(), "{valid} should be valid");
+        }
+        for invalid in ["", "Rules", "2fast", "has space", "x.y", "fallback", "tier3"] {
+            assert!(TierName::new(invalid).is_err(), "{invalid:?} should be rejected");
+        }
+        assert!(TierName::new("a".repeat(33)).is_err());
+    }
+
     #[tokio::test]
     async fn an_instance_keeps_everything_it_was_built_from() {
         let entry = encoder_config("enc-a", ModelFormat::Onnx, Some("model-a"), "http://127.0.0.1:9");
@@ -690,22 +747,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn two_instances_of_one_tier_differ_by_their_parameters_and_so_by_id() {
+    async fn two_instances_of_one_tier_retain_distinct_parameters() {
         let onnx = build_entry(encoder_config("enc-a", ModelFormat::Onnx, Some("modernbert"), "http://127.0.0.1:9")).unwrap();
         let gguf = build_entry(encoder_config("enc-b", ModelFormat::Gguf, Some("harrier"), "http://127.0.0.1:9")).unwrap();
         assert_eq!(onnx.tier(), gguf.tier());
-        assert_ne!(onnx.id(), gguf.id());
+        assert_ne!(onnx.params().model_format, gguf.params().model_format);
     }
 
     #[tokio::test]
-    async fn id_includes_the_tier_name_and_model_but_not_the_endpoint() {
+    async fn instance_retains_name_model_and_deployment_endpoint() {
         let base = build_entry(encoder_config("enc-a", ModelFormat::Onnx, Some("m"), "http://127.0.0.1:9")).unwrap();
         let renamed = build_entry(encoder_config("renamed", ModelFormat::Onnx, Some("m"), "http://127.0.0.1:9")).unwrap();
         let moved = build_entry(encoder_config("enc-a", ModelFormat::Onnx, Some("m"), "http://127.0.0.2:9")).unwrap();
         let swapped = build_entry(encoder_config("enc-a", ModelFormat::Onnx, Some("oryn"), "http://127.0.0.1:9")).unwrap();
-        assert_ne!(base.id(), renamed.id());
-        assert_eq!(base.id(), moved.id());
-        assert_ne!(base.id(), swapped.id());
+        assert_ne!(base.name(), renamed.name());
+        assert_ne!(base.params().endpoint, moved.params().endpoint);
+        assert_ne!(base.params().model, swapped.params().model);
     }
 
     #[test]
@@ -725,7 +782,7 @@ mod tests {
     }
 
     #[test]
-    fn rule_file_location_is_not_part_of_the_id_but_content_is() {
+    fn rule_file_location_does_not_change_the_loaded_artifact_hash() {
         let dir = std::env::temp_dir().join(format!("tier-id-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let original = std::fs::read_to_string("config/tier1.toml").unwrap();
@@ -735,7 +792,6 @@ mod tests {
         let same_a = build_entry(rules_config("rules-a", a.to_str())).unwrap();
         let same_b = build_entry(rules_config("rules-a", b.to_str())).unwrap();
         // Different path, identical content: location is not identity.
-        assert_eq!(same_a.id(), same_b.id());
         assert_eq!(same_a.artifact_hash(), same_b.artifact_hash());
         std::fs::remove_dir_all(&dir).ok();
     }

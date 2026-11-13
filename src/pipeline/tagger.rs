@@ -149,7 +149,8 @@ impl<F: Tagger> Tagger for CascadeTagger<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::identity::{tname, TierId};
+    use crate::pipeline::cascade::TierId;
+    use crate::pipeline::tier::tname;
     use std::future::Future;
     use crate::pipeline::runner::{RunOutcome, TaskOutcome};
     use crate::pipeline::runner::Resolution;
