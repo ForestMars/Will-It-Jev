@@ -418,7 +418,7 @@ mod tests {
     #[tokio::test]
     async fn generic_api_runs_three_arbitrary_tasks_and_returns_required_subset_first() {
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let profiles = vec![
+        let mut profiles = vec![
             profile("customer_intent", OutputKind::Multiclass, &["billing", "account"]),
             profile("urgency", OutputKind::Ordinal, &["low", "medium", "high"]),
             profile("fraud_risk", OutputKind::Multilabel, &["account_takeover", "payment_abuse"]),
@@ -445,16 +445,19 @@ mod tests {
             Arc::new(TierInstance::fake("rules", Arc::new(tier1))),
             Arc::new(TierInstance::fake("modernbert", Arc::new(tier2))),
         ]);
-        let paths: BTreeMap<String, Vec<TierName>> = [
-            (String::from("customer_intent"), vec![tname("rules")]),
-            (String::from("urgency"), vec![tname("modernbert")]),
-            (String::from("fraud_risk"), vec![tname("modernbert")]),
-        ].into();
-        let graph = CascadeGraph::from_task_paths(paths, &registry.names()).unwrap();
+        let rules_id = *registry.get(&tname("rules")).unwrap().id();
+        let modernbert_id = *registry.get(&tname("modernbert")).unwrap().id();
+        profiles[0].cascade.tiers = vec![rules_id];
+        profiles[1].cascade.tiers = vec![modernbert_id];
+        profiles[2].cascade.tiers = vec![modernbert_id];
+        let paths: BTreeMap<String, Vec<TierId>> = profiles.iter()
+            .map(|profile| (profile.name.clone(), profile.cascade.tiers.clone()))
+            .collect();
+        let graph = CascadeGraph::from_task_paths(paths, &registry.ids()).unwrap();
         let cascade = Arc::new(CascadeRunner::new(registry, graph).unwrap());
         let policies: TierPolicyMap = [
-            (tname("rules"), [(String::from("customer_intent"), TierPolicy::new(0.90))].into()),
-            (tname("modernbert"), [
+            (rules_id, [(String::from("customer_intent"), TierPolicy::new(0.90))].into()),
+            (modernbert_id, [
                 (String::from("urgency"), TierPolicy::new(0.80)),
                 (String::from("fraud_risk"), TierPolicy::new(0.80)),
             ].into()),
@@ -501,6 +504,7 @@ mod tests {
         assert_eq!(
             complete.tasks[&String::from("urgency")].resolution,
             Resolution::Tier {
+                tier_id: modernbert_id,
                 tier: tname("modernbert"),
                 model_id: "fixture-tier-modernbert".into(),
                 reading: Reading::new("high", 0.91),
