@@ -76,18 +76,25 @@ cascade = ["modernbert", "harrier"]
 
 [[tier]]
 name = "modernbert"
-executor = "scorer"
+role = "encoder"
+computation = "onnx"
 transport = "grpc"
 request_shape = "score_tasks"
 endpoint = "http://127.0.0.1:50052"
 timeout_ms = 500
 ```
 
-A new task normally adds a head and a path through already-registered TierIds; it does not add another encoder execution. When a required capability is absent, register a new TierId with its executor, transport and request shape, then reference that ID in the task's cascade. `executor` selects the computation, `transport` describes how the router reaches it, and `request_shape` selects the scorer RPC contract. These are separate configuration fields.
+A new task normally adds a head and a path through already-registered tiers; it does not add another encoder execution. When a required capability is absent, declare a new `[[tier]]` and reference its name in the task's cascade.
+
+Three identifiers are kept apart. A **name** is what you call an instance; you write it in configuration and may change it. A **`TierId`** is generated from what determines the instance's behavior (its role, transport, request shape, computation, model, rule file, and the hash of the file it loaded), never authored; it excludes the name, endpoint, timeout and `enabled`, so renaming an instance or moving a sidecar changes nothing, while swapping the model behind a name does. A **`Slot`** is an instance's position in the compiled cascade: an address, not an identity, never persisted.
+
+A **Tier** is the reusable definition (`role`, `transport`, `request_shape`); an instance adds the parameters that distinguish it (`computation`, `model`, `config`, `endpoint`, `timeout_ms`). Several instances of one Tier coexist, for example one encoder over ONNX and another over GGUF. Two declarations with identical behavior-determining content are one instance and are rejected, so declare what differs, typically `model`. `model` is the model an instance runs (a file for `fasttext`; for an `encoder`, the name the sidecar should report), and the `model_id` in traces comes from it, never from the name. `TIER1_CONFIG` and `FASTTEXT_MODEL` only supply a value for an instance that declares none.
+
+The original four tiers were once numbered 1 to 4, and those numbers survive at the edges: the numbered telemetry fields, `[router.tierN]` settings, the numbered environment variables and `tierN` aliases in `[tier_policy.*]` keys. The `[legacy_tiers]` table in `tasks.toml` is the only place a name and a number meet. It is read at load and handed to the code that writes those compatibility surfaces; no tier, instance, registry or cascade type carries a number. Configuration with no `[[tier]]` entries keeps the original numbering.
 
 When no explicit `[[tier]]` registry exists, legacy configuration retains the original four-tier path. Once a named registry is declared, every task must declare its own `cascade`; the router never infers execution order from registry entries.
 
-The graph derives a deterministic topological order. Position in the directory is an execution/telemetry projection of that order, not a TierId and not the registry's insertion order. Legacy ordinals remain only for old `tierN` aliases and numbered telemetry projections. The complete `tier_outcomes` array remains name-keyed in execution order; existing numbered fields remain compatibility projections. Tiers 5 and 6 are downstream execution backends, not cascade nodes.
+The graph derives a deterministic topological order. A `Slot` is an execution/telemetry projection of that order, not an identity and not the registry's insertion order. Legacy ordinals remain only for old `tierN` aliases and numbered telemetry projections. The complete `tier_outcomes` array remains name-keyed in execution order; existing numbered fields remain compatibility projections. Tiers 5 and 6 are downstream execution backends, not cascade nodes.
 
 ---
 

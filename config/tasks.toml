@@ -19,37 +19,66 @@ taxonomy = "../taskonomies/help_desk.json"
 fallback = "defer"
 cascade = ["modernbert", "harrier"]
 
-# The registry catalogs available TierIds. It does not define execution order.
-# executor selects the computation; transport describes how the router reaches
-# it; request_shape selects the scorer RPC contract.
+# Each [[tier]] is one instance, addressed by the `name` you give it. The
+# router generates the instance's identity (a TierId) from what determines its
+# behavior, so a name can change without changing what the instance is. The
+# list catalogs available instances; it does not define execution order.
+#
+#   role         what the tier is for: rules | fasttext | encoder
+#   transport    how the router reaches it: in_process | grpc
+#   request_shape  encoder only: the RPC contract, score | score_tasks
+#   computation  how this instance realizes its role: automaton | fasttext
+#                (implied for rules/fasttext), onnx | gguf (required for an
+#                encoder; the sidecar's runtime)
+#   model        fasttext: model file. encoder: the model name the sidecar
+#                should report (a different model_id is logged once)
+#   config       rules: rule file
+#
+# `model` / `config` fall back to FASTTEXT_MODEL / TIER1_CONFIG for an instance
+# that declares none. `executor` is accepted as an alias of `role`, and
+# `scorer` as an alias of `encoder`.
 
 [[tier]]
 name = "rules"
-executor = "rules"
+role = "rules"
 transport = "in_process"
-legacy_ordinal = 1
 
 [[tier]]
 name = "fasttext"
-executor = "fasttext"
+role = "fasttext"
 transport = "in_process"
-legacy_ordinal = 2
 
 [[tier]]
 name = "modernbert"
-executor = "scorer"
+role = "encoder"
+computation = "onnx"
 transport = "grpc"
 request_shape = "score"
-legacy_ordinal = 3
 
 [[tier]]
 name = "harrier"
-executor = "scorer"
+role = "encoder"
+computation = "gguf"
 transport = "grpc"
 request_shape = "score"
-legacy_ordinal = 4
 
-# Calibration belongs to a TierId + TaskId pair.
+# Compatibility only. Before tiers had names the original four were numbered;
+# the numbered telemetry fields (tier1_outcome .. tier4_outcome,
+# cascade_decision_tier, resolving_tier), the [router.tierN] settings in
+# router.toml, the numbered environment variables and `tierN` aliases in
+# [tier_policy.*] keys still use those numbers. This table is the only place a
+# name and a number meet; no tier, instance or cascade type carries it.
+[legacy_tiers]
+rules = 1
+fasttext = 2
+modernbert = 3
+harrier = 4
+
+# Calibration belongs to a tier name + task pair. A policy may record the
+# instance it was fitted on with `calibrated_for = "<TierId, 32 hex>"`; the
+# router warns at boot if the instance now running under that name differs.
+# `authority = "observe"` records a tier's reading for a task without ever
+# resolving it, for heads that are logged rather than routed.
 [tier_policy.rules.route]
 min_confidence = 0.78
 strict = true

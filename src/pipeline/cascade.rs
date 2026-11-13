@@ -2,14 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use super::registry::TierId;
+use super::identity::TierName;
 use super::task::TaskId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CascadeGraphError {
-    UnknownTier { task: TaskId, tier: TierId },
-    DuplicateTier { task: TaskId, tier: TierId },
-    Cycle { tiers: Vec<TierId> },
+    UnknownTier { task: TaskId, tier: TierName },
+    DuplicateTier { task: TaskId, tier: TierName },
+    Cycle { tiers: Vec<TierName> },
 }
 
 impl fmt::Display for CascadeGraphError {
@@ -34,20 +34,20 @@ impl Error for CascadeGraphError {}
 /// that still need a reading at that node.
 #[derive(Debug, Clone, Default)]
 pub struct CascadeGraph {
-    paths: BTreeMap<TaskId, Vec<TierId>>,
-    order: Vec<TierId>,
-    tasks_by_tier: BTreeMap<TierId, BTreeSet<TaskId>>,
+    paths: BTreeMap<TaskId, Vec<TierName>>,
+    order: Vec<TierName>,
+    tasks_by_tier: BTreeMap<TierName, BTreeSet<TaskId>>,
 }
 
 impl CascadeGraph {
     pub fn from_task_paths(
-        paths: BTreeMap<TaskId, Vec<TierId>>,
-        registered: &BTreeSet<TierId>,
+        paths: BTreeMap<TaskId, Vec<TierName>>,
+        registered: &BTreeSet<TierName>,
     ) -> Result<Self, CascadeGraphError> {
-        let mut successors: BTreeMap<TierId, BTreeSet<TierId>> = BTreeMap::new();
-        let mut indegree: BTreeMap<TierId, usize> = BTreeMap::new();
-        let mut tasks_by_tier: BTreeMap<TierId, BTreeSet<TaskId>> = BTreeMap::new();
-        let mut first_seen: BTreeMap<TierId, usize> = BTreeMap::new();
+        let mut successors: BTreeMap<TierName, BTreeSet<TierName>> = BTreeMap::new();
+        let mut indegree: BTreeMap<TierName, usize> = BTreeMap::new();
+        let mut tasks_by_tier: BTreeMap<TierName, BTreeSet<TaskId>> = BTreeMap::new();
+        let mut first_seen: BTreeMap<TierName, usize> = BTreeMap::new();
         let mut next_rank = 0usize;
 
         for (task, path) in &paths {
@@ -76,8 +76,8 @@ impl CascadeGraph {
 
         // Preserve first appearance in the configured task paths whenever
         // dependency edges leave nodes unordered. This is deterministic and
-        // avoids making lexical TierId order an accidental scheduling policy.
-        let mut ready: BTreeSet<(usize, TierId)> = indegree.iter()
+        // avoids making lexical TierName order an accidental scheduling policy.
+        let mut ready: BTreeSet<(usize, TierName)> = indegree.iter()
             .filter_map(|(tier, degree)| (*degree == 0).then_some((
                 *first_seen.get(tier).expect("registered graph node has a rank"),
                 tier.clone(),
@@ -112,7 +112,7 @@ impl CascadeGraph {
 
     /// Remove disabled/unavailable TierIds from each path and rebuild the DAG.
     /// Relative order among remaining TierIds is preserved.
-    pub fn retain_available(&self, available: &BTreeSet<TierId>) -> Result<Self, CascadeGraphError> {
+    pub fn retain_available(&self, available: &BTreeSet<TierName>) -> Result<Self, CascadeGraphError> {
         let paths = self.paths.iter().map(|(task, path)| (
             task.clone(),
             path.iter().filter(|tier| available.contains(*tier)).cloned().collect(),
@@ -120,14 +120,14 @@ impl CascadeGraph {
         Self::from_task_paths(paths, available)
     }
 
-    pub fn order(&self) -> &[TierId] { &self.order }
-    pub fn paths(&self) -> &BTreeMap<TaskId, Vec<TierId>> { &self.paths }
+    pub fn order(&self) -> &[TierName] { &self.order }
+    pub fn paths(&self) -> &BTreeMap<TaskId, Vec<TierName>> { &self.paths }
 
-    pub fn task_uses(&self, task: &TaskId, tier: &TierId) -> bool {
+    pub fn task_uses(&self, task: &TaskId, tier: &TierName) -> bool {
         self.tasks_by_tier.get(tier).is_some_and(|tasks| tasks.contains(task))
     }
 
-    pub fn tasks_using(&self, tier: &TierId) -> Option<&BTreeSet<TaskId>> {
+    pub fn tasks_using(&self, tier: &TierName) -> Option<&BTreeSet<TaskId>> {
         self.tasks_by_tier.get(tier)
     }
 }
@@ -135,7 +135,7 @@ impl CascadeGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn id(s: &str) -> TierId { TierId::new(s).unwrap() }
+    fn id(s: &str) -> TierName { TierName::new(s).unwrap() }
     fn task(s: &str) -> TaskId { TaskId::new(s) }
 
     #[test]
