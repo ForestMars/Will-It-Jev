@@ -279,7 +279,7 @@ pub fn parse(contents: &str) -> Result<PipelineConfig, Box<dyn Error>> {
     parse_with_base(contents, Path::new("."))
 }
 
-fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dyn Error>> {
+// Keep authored cascade paths as TierNames here. Availability, duplicate-path, and cycle validation belongs to CascadeGraph construction.\nfn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dyn Error>> {
     let raw: RawFile = toml::from_str(contents)?;
     let has_explicit_tier_registry = !raw.tier.is_empty();
     let tiers = tier_configs_from(raw.tier)?;
