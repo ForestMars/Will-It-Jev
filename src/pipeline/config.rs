@@ -545,7 +545,7 @@ mod tests {
         assert_eq!(cfg.tiers[0].1, cfg.tiers[1].1);
         assert_eq!(cfg.tiers[0].2.model_format, Some(ModelFormat::Onnx));
         assert_eq!(cfg.tiers[1].2.model_format, Some(ModelFormat::Gguf));
-        assert_eq!(cfg.tiers[1].params.model.as_deref(), Some("harrier-270m"));
+        assert_eq!(cfg.tiers[1].2.model.as_deref(), Some("harrier-270m"));
     }
 
     #[test]
@@ -563,7 +563,7 @@ mod tests {
             model = "models/large.bin"
         "#)).unwrap();
         assert_eq!(cfg.tiers.len(), 2);
-        assert_eq!(cfg.tiers[0].params.model_format, None);
+        assert_eq!(cfg.tiers[0].2.model_format, None);
     }
 
     #[test]
@@ -580,8 +580,8 @@ mod tests {
             transport = "grpc"
             request_shape = "score"
         "#)).unwrap();
-        assert_eq!(cfg.tiers[0].tier.role, Role::Rules);
-        assert_eq!(cfg.tiers[1].tier.role, Role::Encoder);
+        assert_eq!(cfg.tiers[0].1.role, Role::Rules);
+        assert_eq!(cfg.tiers[1].1.role, Role::Encoder);
     }
 
     #[test]

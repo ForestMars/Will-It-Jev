@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn an_observing_policy_records_the_reading_and_never_resolves() {
-        let profile = Task {
+        let profile: Task = Task {
             cascade: crate::pipeline::task::Cascade::default(),
             name: String::from("urgency"),
             output_kind: OutputKind::Multiclass,
@@ -345,7 +345,7 @@ mod tests {
 
     #[test]
     fn unsupported_task_is_not_an_ordinary_model_abstention() {
-        let profile = Task {
+        let profile: Task = Task {
             cascade: crate::pipeline::task::Cascade::default(),
             name: String::from("tag"),
             output_kind: OutputKind::Multiclass,
@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn task_profile_contains_no_tier_calibration() {
-        let profile = Task {
+        let profile: Task = Task {
             cascade: crate::pipeline::task::Cascade::default(),
             name: String::from("route"),
             output_kind: OutputKind::Binary,
@@ -376,7 +376,7 @@ mod tests {
 
     #[test]
     fn policy_is_supplied_independently_of_task_definition() {
-        let profile = Task {
+        let profile: Task = Task {
             cascade: crate::pipeline::task::Cascade::default(),
             name: String::from("route"),
             output_kind: OutputKind::Binary,
@@ -400,7 +400,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_labels_and_non_finite_confidence() {
-        let profile = Task {
+        let profile: Task = Task {
             cascade: crate::pipeline::task::Cascade::default(),
             name: String::from("route"),
             output_kind: OutputKind::Binary,

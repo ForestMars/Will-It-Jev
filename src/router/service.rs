@@ -693,10 +693,13 @@ mod tests {
     /// rules, prefilter, modernbert in that execution order.
     fn directory() -> TierDirectory {
         let mut registry = TierRegistry::new();
+        let mut order = Vec::new();
         for name in ["rules", "prefilter", "modernbert"] {
-            registry.register(Arc::new(TierInstance::fake(name, Arc::new(NamedTier)))).unwrap();
+            let instance = Arc::new(TierInstance::fake(name, Arc::new(NamedTier)));
+            order.push(*instance.id());
+            registry.register(instance).unwrap();
         }
-        TierDirectory::from_order(&registry, &[tname("rules"), tname("prefilter"), tname("modernbert")])
+        TierDirectory::from_order(&registry, &order)
     }
 
     /// rules is 1 and modernbert is 3; prefilter has no legacy number.
