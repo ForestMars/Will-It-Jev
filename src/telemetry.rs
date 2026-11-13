@@ -73,9 +73,6 @@ pub struct TierOutcomeRecord {
     pub tier: String,
     /// Zero-based execution position in the tier registry.
     pub position: usize,
-    /// The 1..=4 number the original tiers carried, when this tier has one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub legacy_ordinal: Option<u8>,
     pub model_id: String,
     /// `scored`, `abstain` or `unsupported`.
     pub status: String,

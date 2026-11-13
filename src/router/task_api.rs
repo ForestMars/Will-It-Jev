@@ -25,6 +25,7 @@ use uuid::Uuid;
 
 use crate::pipeline::{
     cascade::CascadeGraph,
+    identity::Slot,
     registry::TierDirectory,
     runner::{CascadeRunner, Resolution, RunOutcome, TaskOutcome},
     task::{Decision, TaskId, TaskProfile, TierPolicyMap, TierReading},
@@ -305,7 +306,7 @@ fn task_outcome_json(outcome: &TaskOutcome, tiers: &TierDirectory) -> Value {
         Resolution::Tier { tier, model_id, reading } => json!({
             "kind": "tier",
             "tier": tier.as_str(),
-            "position": tiers.position(tier),
+            "position": tiers.slot(tier).map(Slot::index),
             "model_id": model_id,
             "label": reading.label,
             "confidence": reading.confidence,
@@ -348,7 +349,7 @@ fn task_outcome_json(outcome: &TaskOutcome, tiers: &TierDirectory) -> Value {
         };
         json!({
             "tier": entry.tier.as_str(),
-            "position": tiers.position(&entry.tier),
+            "position": tiers.slot(&entry.tier).map(Slot::index),
             "model_id": entry.model_id,
             "reading": reading,
             "decision": decision,
@@ -361,9 +362,10 @@ fn task_outcome_json(outcome: &TaskOutcome, tiers: &TierDirectory) -> Value {
 mod tests {
     use super::*;
     use crate::pipeline::{
-        registry::{tid, TierId, TierRegistry},
+        identity::{tname, TierName},
+        registry::TierRegistry,
         task::{FallbackPolicy, OutputKind, Reading, TierPolicy},
-        tier::{Tier, TierContext, TierOutput},
+        tier::{FakeEvaluate, TierContext, TierInstance, TierOutput},
     };
     use async_trait::async_trait;
     use std::collections::BTreeMap;
@@ -372,20 +374,17 @@ mod tests {
     type CallLog = Arc<Mutex<Vec<(String, Vec<String>)>>>;
 
     struct FixtureTier {
-        id: TierId,
+        name: String,
         delay: Duration,
         readings: BTreeMap<TaskId, TierReading>,
         calls: CallLog,
     }
 
     #[async_trait]
-    impl Tier for FixtureTier {
-        fn id(&self) -> &TierId { &self.id }
-        fn name(&self) -> &str { "fixture" }
-
+    impl FakeEvaluate for FixtureTier {
         async fn evaluate(&self, context: &TierContext<'_>) -> TierOutput {
             self.calls.lock().unwrap().push((
-                self.id.to_string(),
+                self.name.clone(),
                 context.tasks.iter().map(|task| task.as_str().to_string()).collect(),
             ));
             sleep(self.delay).await;
@@ -396,7 +395,7 @@ mod tests {
                 )
             }).collect();
             TierOutput {
-                model_id: format!("fixture-tier-{}", self.id),
+                model_id: format!("fixture-tier-{}", self.name),
                 readings,
             }
         }
@@ -422,7 +421,7 @@ mod tests {
             profile("fraud_risk", OutputKind::Multilabel, &["account_takeover", "payment_abuse"]),
         ];
         let tier1 = FixtureTier {
-            id: tid("rules"),
+            name: "rules".into(),
             delay: Duration::ZERO,
             readings: [(
                 TaskId::new("customer_intent"),
@@ -431,7 +430,7 @@ mod tests {
             calls: calls.clone(),
         };
         let tier2 = FixtureTier {
-            id: tid("modernbert"),
+            name: "modernbert".into(),
             delay: Duration::from_millis(300),
             readings: [
                 (TaskId::new("urgency"), TierReading::Scored(Reading::new("high", 0.91))),
@@ -439,17 +438,20 @@ mod tests {
             ].into(),
             calls: calls.clone(),
         };
-        let registry = TierRegistry::of(vec![Arc::new(tier1), Arc::new(tier2)]);
-        let paths: BTreeMap<TaskId, Vec<TierId>> = [
-            (TaskId::new("customer_intent"), vec![tid("rules")]),
-            (TaskId::new("urgency"), vec![tid("modernbert")]),
-            (TaskId::new("fraud_risk"), vec![tid("modernbert")]),
+        let registry = TierRegistry::of(vec![
+            Arc::new(TierInstance::fake("rules", Arc::new(tier1))),
+            Arc::new(TierInstance::fake("modernbert", Arc::new(tier2))),
+        ]);
+        let paths: BTreeMap<TaskId, Vec<TierName>> = [
+            (TaskId::new("customer_intent"), vec![tname("rules")]),
+            (TaskId::new("urgency"), vec![tname("modernbert")]),
+            (TaskId::new("fraud_risk"), vec![tname("modernbert")]),
         ].into();
-        let graph = CascadeGraph::from_task_paths(paths, &registry.ids()).unwrap();
+        let graph = CascadeGraph::from_task_paths(paths, &registry.names()).unwrap();
         let cascade = Arc::new(CascadeRunner::new(registry, graph).unwrap());
         let policies: TierPolicyMap = [
-            (tid("rules"), [(TaskId::new("customer_intent"), TierPolicy::new(0.90))].into()),
-            (tid("modernbert"), [
+            (tname("rules"), [(TaskId::new("customer_intent"), TierPolicy::new(0.90))].into()),
+            (tname("modernbert"), [
                 (TaskId::new("urgency"), TierPolicy::new(0.80)),
                 (TaskId::new("fraud_risk"), TierPolicy::new(0.80)),
             ].into()),
@@ -496,7 +498,7 @@ mod tests {
         assert_eq!(
             complete.tasks[&TaskId::new("urgency")].resolution,
             Resolution::Tier {
-                tier: tid("modernbert"),
+                tier: tname("modernbert"),
                 model_id: "fixture-tier-modernbert".into(),
                 reading: Reading::new("high", 0.91),
             }

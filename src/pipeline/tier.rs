@@ -1,21 +1,188 @@
 // src/pipeline/tier.rs
 //
-// Execution-tier adapters. A tier returns raw readings for the task IDs it can
-// serve; all task-specific acceptance policy lives outside this module.
+// The tier ontology, and the code that evaluates it.
+//
+//   Tier          the reusable definition: a role, how it is reached, and, for an
+//                 encoder, which RPC contract it speaks. No instance parameters.
+//   Params        what distinguishes one instance of a Tier from another: the
+//                 computation it runs, its model, rule file, endpoint, timeout.
+//   TierDecl      a name, a Tier and Params as declared in configuration, before
+//                 anything is loaded.
+//   TierInstance  a TierDecl brought to life: artifacts loaded, runner connected,
+//                 TierId generated. It keeps everything it was built from.
+//
+// A tier returns raw readings for the task IDs it can serve; all task-specific
+// acceptance policy lives outside this module.
 
 use std::collections::BTreeMap;
+use std::error::Error;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
 use async_trait::async_trait;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
-use super::config::TierRequestShape;
-use super::registry::TierId;
+use super::identity::{TierId, TierName};
 use super::task::{OutputKind, Reading, TaskId, TaskProfile, TierReading, LABEL_JEV, LABEL_LLM};
-use crate::router::tier1_runner::Tier1Engine;
+use crate::router::tier1_runner::{Tier1Automaton, Tier1Engine};
 use crate::router::tier2_runner::{Tier2Outcome, Tier2Route, Tier2Runner};
 use crate::router::tier3_runner::{TasksError, Tier3Runner};
+
+// ---- definition ------------------------------------------------------------
+
+/// What a tier is for. `Encoder` is the tier that fronts a neural encoder served
+/// by a sidecar; the same definition supports many instances, each running its
+/// own model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum Role {
+    #[serde(rename = "rules")]
+    Rules,
+    #[serde(rename = "fasttext")]
+    FastText,
+    #[serde(rename = "encoder", alias = "scorer")]
+    Encoder,
+}
+
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rules => "rules",
+            Self::FastText => "fasttext",
+            Self::Encoder => "encoder",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Transport {
+    InProcess,
+    Grpc,
+}
+
+impl Transport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InProcess => "in_process",
+            Self::Grpc => "grpc",
+        }
+    }
+}
+
+/// The RPC contract an encoder speaks: one route score, or one head per task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestShape {
+    Score,
+    ScoreTasks,
+}
+
+impl RequestShape {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Score => "score",
+            Self::ScoreTasks => "score_tasks",
+        }
+    }
+}
+
+/// How an instance realizes its Tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum Computation {
+    #[serde(rename = "automaton")]
+    Automaton,
+    #[serde(rename = "fasttext")]
+    FastText,
+    #[serde(rename = "onnx")]
+    Onnx,
+    #[serde(rename = "gguf")]
+    Gguf,
+}
+
+impl Computation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Automaton => "automaton",
+            Self::FastText => "fasttext",
+            Self::Onnx => "onnx",
+            Self::Gguf => "gguf",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tier {
+    pub role: Role,
+    pub transport: Transport,
+    /// Encoder over gRPC only.
+    pub request_shape: Option<RequestShape>,
+}
+
+impl Tier {
+    /// A definition is coherent when its role, transport and request shape agree.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match (self.role, self.transport, self.request_shape) {
+            (Role::Rules | Role::FastText, Transport::InProcess, None) => Ok(()),
+            (Role::Rules | Role::FastText, _, _) => {
+                Err("rules and fasttext require transport = \"in_process\" and no request_shape")
+            }
+            (Role::Encoder, Transport::Grpc, Some(_)) => Ok(()),
+            (Role::Encoder, _, _) => {
+                Err("encoder requires transport = \"grpc\" and request_shape = \"score\" or \"score_tasks\"")
+            }
+        }
+    }
+
+    pub fn accepts(&self, computation: Computation) -> bool {
+        matches!(
+            (self.role, computation),
+            (Role::Rules, Computation::Automaton)
+                | (Role::FastText, Computation::FastText)
+                | (Role::Encoder, Computation::Onnx | Computation::Gguf)
+        )
+    }
+
+    /// The computation a role implies when configuration does not state one.
+    pub fn implied_computation(&self) -> Option<Computation> {
+        match self.role {
+            Role::Rules => Some(Computation::Automaton),
+            Role::FastText => Some(Computation::FastText),
+            Role::Encoder => None,
+        }
+    }
+}
+
+// ---- declaration -----------------------------------------------------------
+
+/// What distinguishes one instance of a Tier from another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Params {
+    pub computation: Computation,
+    /// fasttext: path to the model file. encoder: the model name the sidecar is
+    /// expected to report; a different `model_id` in a response is logged once.
+    pub model: Option<String>,
+    /// Rules only: path to the rule file.
+    pub config: Option<String>,
+    /// Encoder only.
+    pub endpoint: Option<String>,
+    /// Encoder only.
+    pub timeout_ms: Option<u64>,
+    pub enabled: Option<bool>,
+}
+
+/// An instance as declared in configuration: nothing loaded, nothing connected.
+#[derive(Debug, Clone)]
+pub struct TierDecl {
+    pub name: TierName,
+    pub tier: Tier,
+    pub params: Params,
+}
+
+// ---- evaluation contract ---------------------------------------------------
 
 pub struct TierContext<'a> {
     pub prompt: &'a str,
@@ -49,16 +216,21 @@ impl TierOutput {
     }
 }
 
+
+/// Test double for a computation. Production code has no open extension point:
+/// the set of runners is closed.
+#[cfg(test)]
 #[async_trait]
-pub trait Tier: Send + Sync {
-    /// Stable name of this tier. It identifies the tier in policies, traces and
-    /// telemetry; it says nothing about where the tier runs. Execution order is
-    /// owned by the task-specific `CascadeGraph`.
-    fn id(&self) -> &TierId;
-    /// Label recorded as `model_id` when the tier reports without a model of its own.
-    fn name(&self) -> &str;
-    /// A tier without a compatible head reports the task as unsupported.
+pub trait FakeEvaluate: Send + Sync {
     async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput;
+}
+
+enum Runner {
+    Rules(Arc<Tier1Engine>),
+    FastText(Arc<Tier2Runner>),
+    Grpc(Tier3Runner),
+    #[cfg(test)]
+    Fake(Arc<dyn FakeEvaluate>),
 }
 
 fn unsupported_all(ctx: &TierContext<'_>, model_id: &str) -> TierOutput {
@@ -96,17 +268,125 @@ fn route_only(ctx: &TierContext<'_>, model_id: &str, route: TierReading) -> Tier
     }
 }
 
-/// Pattern-rule tier (Aho-Corasick plus fuzzy matching).
-pub struct RulesTier {
-    id: TierId,
-    engine: Arc<Tier1Engine>,
-    task_scorers: BTreeMap<TaskId, Arc<dyn TaskScorer>>,
+
+fn sha256_file(path: &str) -> Result<[u8; 32], std::io::Error> {
+    Ok(Sha256::digest(std::fs::read(path)?).into())
 }
 
-impl RulesTier {
-    #[allow(dead_code)]
-    pub fn new(id: TierId, engine: Arc<Tier1Engine>) -> Self {
-        Self { id, engine, task_scorers: BTreeMap::new() }
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+// ---- instance --------------------------------------------------------------
+
+/// A Tier plus the parameters that distinguish this instance, loaded and ready to
+/// evaluate. The execution graph is an ordered `Vec` of these.
+pub struct TierInstance {
+    id: TierId,
+    name: TierName,
+    tier: Tier,
+    params: Params,
+    artifact_hash: Option<[u8; 32]>,
+    runner: Runner,
+    task_scorers: BTreeMap<TaskId, Arc<dyn TaskScorer>>,
+    request_shape_unimplemented: AtomicBool,
+    model_mismatch_reported: AtomicBool,
+}
+
+impl TierInstance {
+    /// Load what the declaration points at and connect the runner. `params` must
+    /// already be resolved: every value the tier needs is on it.
+    pub fn build(decl: TierDecl) -> Result<Self, Box<dyn Error>> {
+        let TierDecl { name, tier, params } = decl;
+        tier.validate().map_err(|reason| format!("tier {name}: {reason}"))?;
+        if !tier.accepts(params.computation) {
+            return Err(format!(
+                "tier {name}: a {} tier cannot run computation {:?}",
+                tier.role.as_str(), params.computation.as_str()
+            ).into());
+        }
+        let (runner, artifact_hash) = match tier.role {
+            Role::Rules => {
+                let path = params.config.as_deref()
+                    .ok_or_else(|| format!("tier {name}: rules tier has no `config` path"))?;
+                let hash = sha256_file(path)?;
+                let engine = Arc::new(Tier1Engine::new(Tier1Automaton::from_toml_file(path)?)?);
+                (Runner::Rules(engine), Some(hash))
+            }
+            Role::FastText => {
+                let path = params.model.as_deref()
+                    .ok_or_else(|| format!("tier {name}: fasttext tier has no `model` path"))?;
+                let hash = sha256_file(path)?;
+                (Runner::FastText(Arc::new(Tier2Runner::new(path)?)), Some(hash))
+            }
+            Role::Encoder => {
+                let endpoint = params.endpoint.clone()
+                    .ok_or_else(|| format!("tier {name}: encoder tier has no endpoint"))?;
+                let timeout_ms = params.timeout_ms
+                    .ok_or_else(|| format!("tier {name}: encoder tier has no timeout_ms"))?;
+                (Runner::Grpc(Tier3Runner::new(endpoint, Duration::from_millis(timeout_ms))?), None)
+            }
+        };
+        Ok(Self::assemble(name, tier, params, runner, artifact_hash))
+    }
+
+    fn assemble(
+        name: TierName,
+        tier: Tier,
+        params: Params,
+        runner: Runner,
+        artifact_hash: Option<[u8; 32]>,
+    ) -> Self {
+        Self {
+            id: Self::derive_id(&tier, &params, artifact_hash.as_ref()),
+            name, tier, params, artifact_hash, runner,
+            task_scorers: BTreeMap::new(),
+            request_shape_unimplemented: AtomicBool::new(false),
+            model_mismatch_reported: AtomicBool::new(false),
+        }
+    }
+
+    /// The identity of an instance is a digest of what determines its behavior:
+    /// its definition, computation, model, rule file and the content of the file
+    /// it loaded. It excludes the name, endpoint, timeout and `enabled`:
+    /// renaming an instance or moving a sidecar to another host must not change
+    /// what it is, nor invalidate calibration recorded against it.
+    pub fn derive_id(tier: &Tier, params: &Params, artifact_hash: Option<&[u8; 32]>) -> TierId {
+        let mut digest = Sha256::new();
+        let mut field = |key: &str, value: &str| {
+            digest.update(key.as_bytes());
+            digest.update(b"=");
+            digest.update(value.as_bytes());
+            digest.update(b"\0");
+        };
+        field("role", tier.role.as_str());
+        field("transport", tier.transport.as_str());
+        field("request_shape", tier.request_shape.map_or("", RequestShape::as_str));
+        field("computation", params.computation.as_str());
+        field("model", params.model.as_deref().unwrap_or(""));
+        field("config", params.config.as_deref().unwrap_or(""));
+        field("artifact", &artifact_hash.map(|hash| hex(hash)).unwrap_or_default());
+        TierId::from_digest(&digest.finalize())
+    }
+
+    pub fn id(&self) -> &TierId { &self.id }
+    pub fn name(&self) -> &TierName { &self.name }
+    pub fn tier(&self) -> &Tier { &self.tier }
+    pub fn params(&self) -> &Params { &self.params }
+    pub fn artifact_hash(&self) -> Option<&[u8; 32]> { self.artifact_hash.as_ref() }
+
+    /// Label recorded as `model_id` when the instance has no better answer, for
+    /// example when a sidecar call fails. It comes from the model, never from the
+    /// name: names are free to change.
+    pub fn model_label(&self) -> String {
+        match self.tier.role {
+            Role::Rules => "heuristic".to_string(),
+            Role::FastText => self.params.model.as_deref()
+                .and_then(|path| Path::new(path).file_name())
+                .map(|file| file.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "fasttext".to_string()),
+            Role::Encoder => self.params.model.clone().unwrap_or_else(|| "unknown".to_string()),
+        }
     }
 
     #[allow(dead_code)]
@@ -114,22 +394,33 @@ impl RulesTier {
         self.task_scorers.insert(task, scorer);
         self
     }
-}
 
-#[async_trait]
-impl Tier for RulesTier {
-    fn id(&self) -> &TierId {
-        &self.id
+    /// A tier without a compatible head reports the task as unsupported.
+    pub async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
+        match &self.runner {
+            Runner::Rules(engine) => self.evaluate_rules(engine, ctx),
+            Runner::FastText(runner) => self.evaluate_fasttext(runner, ctx),
+            Runner::Grpc(runner) => self.evaluate_grpc(runner, ctx).await,
+            #[cfg(test)]
+            Runner::Fake(fake) => fake.evaluate(ctx).await,
+        }
     }
 
-    fn name(&self) -> &str {
-        "heuristic"
+    /// Tasks other than route are served by an in-process scorer if one is wired.
+    fn other_tasks(&self, ctx: &TierContext<'_>, readings: &mut BTreeMap<TaskId, TierReading>) {
+        for task in ctx.tasks.iter().filter(|task| task.as_str() != TaskId::route().as_str()) {
+            let reading = self.task_scorers.get(task)
+                .and_then(|scorer| ctx.task_profiles.iter().find(|profile| profile.task.as_str() == task.as_str())
+                    .map(|profile| scorer.score(ctx.prompt, profile)))
+                .unwrap_or(TierReading::Unsupported);
+            readings.insert(task.clone(), reading);
+        }
     }
 
-    async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
+    fn evaluate_rules(&self, engine: &Tier1Engine, ctx: &TierContext<'_>) -> TierOutput {
         let mut readings = BTreeMap::new();
         if ctx.tasks.contains(&TaskId::route()) {
-            let result = self.engine.classify(ctx.prompt);
+            let result = engine.classify(ctx.prompt);
             let p_jev = if result.confidence.is_finite() {
                 result.confidence.clamp(0.0, 1.0)
             } else {
@@ -149,34 +440,136 @@ impl Tier for RulesTier {
                 ],
             }));
         }
-        for task in ctx.tasks.iter().filter(|task| task.as_str() != TaskId::route().as_str()) {
-            let reading = self.task_scorers.get(task)
-                .and_then(|scorer| ctx.task_profiles.iter().find(|profile| profile.task.as_str() == task.as_str())
-                    .map(|profile| scorer.score(ctx.prompt, profile)))
-                .unwrap_or(TierReading::Unsupported);
-            readings.insert(task.clone(), reading);
+        self.other_tasks(ctx, &mut readings);
+        TierOutput { model_id: self.model_label(), readings }
+    }
+
+    fn evaluate_fasttext(&self, runner: &Tier2Runner, ctx: &TierContext<'_>) -> TierOutput {
+        let mut readings = BTreeMap::new();
+        if ctx.tasks.contains(&TaskId::route()) {
+            readings.insert(TaskId::route(), tier2_reading(&runner.evaluate(ctx.prompt)));
         }
-        TierOutput { model_id: self.name().to_string(), readings }
+        self.other_tasks(ctx, &mut readings);
+        TierOutput { model_id: self.model_label(), readings }
+    }
+
+    /// A sidecar serves whatever model it loaded. If the instance declares a model
+    /// and the sidecar reports another, say so once.
+    fn check_reported_model(&self, reported: &str) {
+        if let Some(expected) = self.params.model.as_deref() {
+            if expected != reported && !self.model_mismatch_reported.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    tier = %self.name, expected, reported,
+                    "sidecar reported a different model than the instance declares"
+                );
+            }
+        }
+    }
+
+    async fn route_via_score(&self, runner: &Tier3Runner, ctx: &TierContext<'_>) -> TierOutput {
+        match runner.score_raw(ctx.prompt, ctx.budget).await {
+            Err(reason) => TierOutput::abstain_all(self.model_label(), ctx.tasks, reason),
+            Ok(raw) => {
+                self.check_reported_model(&raw.model_id);
+                route_only(
+                    ctx,
+                    &raw.model_id,
+                    TierReading::Scored(Reading::new(raw.label, raw.confidence)),
+                )
+            }
+        }
+    }
+
+    async fn evaluate_grpc(&self, runner: &Tier3Runner, ctx: &TierContext<'_>) -> TierOutput {
+        match self.tier.request_shape {
+            Some(RequestShape::ScoreTasks) => {}
+            _ => {
+                return if ctx.tasks.contains(&TaskId::route()) {
+                    self.route_via_score(runner, ctx).await
+                } else {
+                    unsupported_all(ctx, &self.model_label())
+                };
+            }
+        }
+        if self.request_shape_unimplemented.load(Ordering::Relaxed) {
+            return TierOutput::abstain_all(self.model_label(), ctx.tasks, "score_tasks_unimplemented");
+        }
+        let requested_profiles: Vec<TaskProfile> = ctx.tasks.iter()
+            .filter_map(|task| ctx.task_profiles.iter()
+                .find(|profile| profile.task.as_str() == task.as_str()).cloned())
+            .collect();
+        match runner.score_tasks(ctx.prompt, &requested_profiles, ctx.budget).await {
+            Ok(response) => {
+                self.check_reported_model(&response.model_id);
+                let readings = ctx.tasks.iter().map(|task| {
+                    let reading = response.results.iter()
+                        .find(|result| result.task == task.as_str())
+                        .map(|result| {
+                            let expected = ctx.task_profiles.iter()
+                                .find(|profile| profile.task.as_str() == task.as_str())
+                                .map(|profile| match profile.output_kind {
+                                    OutputKind::Binary => 1,
+                                    OutputKind::Multiclass => 2,
+                                    OutputKind::Multilabel => 3,
+                                    OutputKind::Ordinal => 4,
+                                });
+                            // Zero is the proto3 default; accept it for older sidecars.
+                            let kind_matches = expected
+                                .is_none_or(|kind| result.output_kind == 0 || result.output_kind == kind);
+                            if !kind_matches { return TierReading::Unsupported; }
+                            TierReading::Scored(Reading {
+                                label: result.label.clone(),
+                                confidence: result.confidence,
+                                scores: result.scores.iter()
+                                    .map(|score| (score.label.clone(), score.score))
+                                    .collect(),
+                            })
+                        })
+                        .unwrap_or(TierReading::Unsupported);
+                    (task.clone(), reading)
+                }).collect();
+                TierOutput { model_id: response.model_id, readings }
+            }
+            Err(TasksError::Fault(reason)) => {
+                TierOutput::abstain_all(self.model_label(), ctx.tasks, reason)
+            }
+            Err(TasksError::Unimplemented) => {
+                self.request_shape_unimplemented.store(true, Ordering::Relaxed);
+                TierOutput::abstain_all(self.model_label(), ctx.tasks, "score_tasks_unimplemented")
+            }
+        }
     }
 }
 
-/// fastText classifier tier.
-pub struct FastTextTier {
-    id: TierId,
-    runner: Arc<Tier2Runner>,
-    task_scorers: BTreeMap<TaskId, Arc<dyn TaskScorer>>,
-}
-
-impl FastTextTier {
-    #[allow(dead_code)]
-    pub fn new(id: TierId, runner: Arc<Tier2Runner>) -> Self {
-        Self { id, runner, task_scorers: BTreeMap::new() }
+#[cfg(test)]
+impl TierInstance {
+    /// An instance whose computation is a test double. The model is the name, so
+    /// instances built from different names have different ids.
+    pub fn fake(name: &str, fake: Arc<dyn FakeEvaluate>) -> Self {
+        Self::fake_with_model(name, name, fake)
     }
 
-    #[allow(dead_code)]
-    pub fn with_task_scorer(mut self, task: TaskId, scorer: Arc<dyn TaskScorer>) -> Self {
-        self.task_scorers.insert(task, scorer);
-        self
+    pub fn fake_with_model(name: &str, model: &str, fake: Arc<dyn FakeEvaluate>) -> Self {
+        let tier = Tier { role: Role::Rules, transport: Transport::InProcess, request_shape: None };
+        let params = Params {
+            computation: Computation::Automaton, model: Some(model.to_string()), config: None,
+            endpoint: None, timeout_ms: None, enabled: None,
+        };
+        Self::assemble(
+            TierName::new(name).expect("test tier name must be valid"), tier, params, Runner::Fake(fake), None,
+        )
+    }
+
+    /// An encoder instance over an already-constructed gRPC runner.
+    pub fn encoder(name: &str, shape: RequestShape, model: Option<&str>, runner: Tier3Runner) -> Self {
+        let tier = Tier { role: Role::Encoder, transport: Transport::Grpc, request_shape: Some(shape) };
+        let params = Params {
+            computation: Computation::Onnx, model: model.map(str::to_string), config: None,
+            endpoint: Some("http://127.0.0.1:9".into()), timeout_ms: Some(250), enabled: None,
+        };
+        Self::assemble(
+            TierName::new(name).expect("test tier name must be valid"), tier, params, Runner::Grpc(runner), None,
+        )
     }
 }
 
@@ -203,136 +596,6 @@ pub fn tier2_reading(outcome: &Tier2Outcome) -> TierReading {
     }
 }
 
-#[async_trait]
-impl Tier for FastTextTier {
-    fn id(&self) -> &TierId {
-        &self.id
-    }
-
-    fn name(&self) -> &str {
-        "fasttext"
-    }
-
-    async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
-        let mut readings = BTreeMap::new();
-        if ctx.tasks.contains(&TaskId::route()) {
-            let outcome = self.runner.evaluate(ctx.prompt);
-            readings.insert(TaskId::route(), tier2_reading(&outcome));
-        }
-        for task in ctx.tasks.iter().filter(|task| task.as_str() != TaskId::route().as_str()) {
-            let reading = self.task_scorers.get(task)
-                .and_then(|scorer| ctx.task_profiles.iter().find(|profile| profile.task.as_str() == task.as_str())
-                    .map(|profile| scorer.score(ctx.prompt, profile)))
-                .unwrap_or(TierReading::Unsupported);
-            readings.insert(task.clone(), reading);
-        }
-        TierOutput { model_id: self.name().to_string(), readings }
-    }
-}
-
-/// Generic adapter for any gRPC sidecar implementing the scorer protocol. Every
-/// sidecar-backed tier (ModernBERT, Harrier, Oryn, ...) is an instance of this
-/// type with its own name and endpoint; the Rust transport and output contract
-/// are identical, so adding one needs configuration, not code.
-pub struct GrpcScoringTier {
-    id: TierId,
-    runner: Tier3Runner,
-    request_shape: TierRequestShape,
-    request_shape_unimplemented: AtomicBool,
-}
-
-impl GrpcScoringTier {
-    pub fn new(id: TierId, runner: Tier3Runner, request_shape: TierRequestShape) -> Self {
-        Self {
-            id,
-            runner,
-            request_shape,
-            request_shape_unimplemented: AtomicBool::new(false),
-        }
-    }
-
-    async fn route_via_score(&self, ctx: &TierContext<'_>) -> TierOutput {
-        match self.runner.score_raw(ctx.prompt, ctx.budget).await {
-            Err(reason) => TierOutput::abstain_all(self.id.as_str(), ctx.tasks, reason),
-            Ok(raw) => route_only(
-                ctx,
-                &raw.model_id,
-                TierReading::Scored(Reading::new(raw.label, raw.confidence)),
-            ),
-        }
-    }
-}
-
-#[async_trait]
-impl Tier for GrpcScoringTier {
-    fn id(&self) -> &TierId {
-        &self.id
-    }
-
-    fn name(&self) -> &str {
-        self.id.as_str()
-    }
-
-    async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
-        match self.request_shape {
-            TierRequestShape::Score => {
-                if ctx.tasks.contains(&TaskId::route()) {
-                    self.route_via_score(ctx).await
-                } else {
-                    unsupported_all(ctx, self.id.as_str())
-                }
-            }
-            TierRequestShape::ScoreTasks => {
-                if self.request_shape_unimplemented.load(Ordering::Relaxed) {
-                    return TierOutput::abstain_all(self.id.as_str(), ctx.tasks, "score_tasks_unimplemented");
-                }
-                let requested_profiles: Vec<TaskProfile> = ctx.tasks.iter()
-                    .filter_map(|task| ctx.task_profiles.iter()
-                        .find(|profile| profile.task.as_str() == task.as_str()).cloned())
-                    .collect();
-                match self.runner.score_tasks(ctx.prompt, &requested_profiles, ctx.budget).await {
-                    Ok(response) => {
-                        let readings = ctx.tasks.iter().map(|task| {
-                            let reading = response.results.iter()
-                                .find(|result| result.task == task.as_str())
-                                .map(|result| {
-                                    let expected = ctx.task_profiles.iter()
-                                        .find(|profile| profile.task.as_str() == task.as_str())
-                                        .map(|profile| match profile.output_kind {
-                                            OutputKind::Binary => 1,
-                                            OutputKind::Multiclass => 2,
-                                            OutputKind::Multilabel => 3,
-                                            OutputKind::Ordinal => 4,
-                                        });
-                                    // Zero is the proto3 default; accept it for older sidecars.
-                                    let kind_matches = expected
-                                        .is_none_or(|kind| result.output_kind == 0 || result.output_kind == kind);
-                                    if !kind_matches { return TierReading::Unsupported; }
-                                    TierReading::Scored(Reading {
-                                        label: result.label.clone(),
-                                        confidence: result.confidence,
-                                        scores: result.scores.iter()
-                                            .map(|score| (score.label.clone(), score.score))
-                                            .collect(),
-                                    })
-                                })
-                                .unwrap_or(TierReading::Unsupported);
-                            (task.clone(), reading)
-                        }).collect();
-                        TierOutput { model_id: response.model_id, readings }
-                    }
-                    Err(TasksError::Fault(reason)) => {
-                        TierOutput::abstain_all(self.id.as_str(), ctx.tasks, reason)
-                    }
-                    Err(TasksError::Unimplemented) => {
-                        self.request_shape_unimplemented.store(true, Ordering::Relaxed);
-                        TierOutput::abstain_all(self.id.as_str(), ctx.tasks, "score_tasks_unimplemented")
-                    }
-                }
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -424,12 +687,105 @@ mod tests {
         format!("http://{address}")
     }
 
+    fn encoder_decl(name: &str, computation: Computation, model: Option<&str>, endpoint: &str) -> TierDecl {
+        TierDecl {
+            name: TierName::new(name).unwrap(),
+            tier: Tier { role: Role::Encoder, transport: Transport::Grpc, request_shape: Some(RequestShape::Score) },
+            params: Params {
+                computation, model: model.map(str::to_string), config: None,
+                endpoint: Some(endpoint.to_string()), timeout_ms: Some(250), enabled: None,
+            },
+        }
+    }
+
+    fn rules_decl(name: &str, config: Option<&str>) -> TierDecl {
+        TierDecl {
+            name: TierName::new(name).unwrap(),
+            tier: Tier { role: Role::Rules, transport: Transport::InProcess, request_shape: None },
+            params: Params {
+                computation: Computation::Automaton, model: None, config: config.map(str::to_string),
+                endpoint: None, timeout_ms: None, enabled: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn an_instance_keeps_everything_it_was_built_from() {
+        let decl = encoder_decl("enc-a", Computation::Onnx, Some("model-a"), "http://127.0.0.1:9");
+        let instance = TierInstance::build(decl.clone()).unwrap();
+        assert_eq!(instance.name(), &decl.name);
+        assert_eq!(instance.tier(), &decl.tier);
+        assert_eq!(instance.params(), &decl.params);
+    }
+
+    #[tokio::test]
+    async fn two_instances_of_one_tier_differ_by_their_parameters_and_so_by_id() {
+        let onnx = TierInstance::build(encoder_decl("enc-a", Computation::Onnx, Some("modernbert"), "http://127.0.0.1:9")).unwrap();
+        let gguf = TierInstance::build(encoder_decl("enc-b", Computation::Gguf, Some("harrier"), "http://127.0.0.1:9")).unwrap();
+        assert_eq!(onnx.tier(), gguf.tier());
+        assert_ne!(onnx.id(), gguf.id());
+    }
+
+    #[tokio::test]
+    async fn id_follows_the_model_not_the_name_or_the_endpoint() {
+        let base = TierInstance::build(encoder_decl("enc-a", Computation::Onnx, Some("m"), "http://127.0.0.1:9")).unwrap();
+        let renamed = TierInstance::build(encoder_decl("renamed", Computation::Onnx, Some("m"), "http://127.0.0.1:9")).unwrap();
+        let moved = TierInstance::build(encoder_decl("enc-a", Computation::Onnx, Some("m"), "http://127.0.0.2:9")).unwrap();
+        let swapped = TierInstance::build(encoder_decl("enc-a", Computation::Onnx, Some("oryn"), "http://127.0.0.1:9")).unwrap();
+        assert_eq!(base.id(), renamed.id());
+        assert_eq!(base.id(), moved.id());
+        assert_ne!(base.id(), swapped.id());
+    }
+
+    #[test]
+    fn a_computation_that_does_not_fit_the_role_is_rejected() {
+        let mut decl = rules_decl("rules-a", Some("config/tier1.toml"));
+        decl.params.computation = Computation::Onnx;
+        let error = TierInstance::build(decl).err().expect("must fail");
+        assert!(error.to_string().contains("cannot run computation"));
+    }
+
+    #[test]
+    fn a_rules_instance_loads_its_rule_file_and_hashes_it() {
+        let instance = TierInstance::build(rules_decl("rules-a", Some("config/tier1.toml"))).unwrap();
+        assert!(instance.artifact_hash().is_some());
+        let missing = TierInstance::build(rules_decl("rules-b", None)).err().expect("must fail");
+        assert!(missing.to_string().contains("no `config` path"));
+    }
+
+    #[test]
+    fn the_rule_file_path_is_part_of_the_id_and_its_hash_is_kept() {
+        let dir = std::env::temp_dir().join(format!("tier-id-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = std::fs::read_to_string("config/tier1.toml").unwrap();
+        let (a, b) = (dir.join("a.toml"), dir.join("b.toml"));
+        std::fs::write(&a, &original).unwrap();
+        std::fs::write(&b, &original).unwrap();
+        let same_a = TierInstance::build(rules_decl("rules-a", a.to_str())).unwrap();
+        let same_b = TierInstance::build(rules_decl("rules-b", b.to_str())).unwrap();
+        // Different path, identical content: the config path is part of the identity.
+        assert_ne!(same_a.id(), same_b.id());
+        assert_eq!(same_a.artifact_hash(), same_b.artifact_hash());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_failed_sidecar_call_is_labelled_by_model_not_by_name() {
+        let instance = TierInstance::build(encoder_decl("enc-a", Computation::Onnx, Some("model-a"), "http://127.0.0.1:9")).unwrap();
+        let tasks = [TaskId::route()];
+        let output = instance
+            .evaluate(&TierContext { prompt: "test", tasks: &tasks, task_profiles: &[], budget: Duration::from_millis(500) })
+            .await;
+        assert_eq!(output.model_id, "model-a");
+        assert!(matches!(output.readings[&TaskId::route()], TierReading::Abstain(_)));
+    }
+
     #[tokio::test]
     async fn joint_sidecar_scores_multiple_tasks_in_one_rpc() {
         let sidecar = TestSidecar { joint: true, ..Default::default() };
         let calls = sidecar.tasks_calls.clone();
         let scorer = Tier3Runner::new(endpoint(sidecar).await, Duration::from_secs(2)).unwrap();
-        let tier = GrpcScoringTier::new(crate::pipeline::registry::tid("alternate"), scorer, TierRequestShape::ScoreTasks);
+        let tier = TierInstance::encoder("alternate", RequestShape::ScoreTasks, None, scorer);
         let tasks = [TaskId::route(), TaskId::tag()];
         let profiles = [
             TaskProfile {
@@ -462,11 +818,7 @@ mod tests {
         let task_calls = sidecar.tasks_calls.clone();
         let score_calls = sidecar.score_calls.clone();
         let scorer = Tier3Runner::new(endpoint(sidecar).await, Duration::from_secs(2)).unwrap();
-        let tier = GrpcScoringTier::new(
-            crate::pipeline::registry::tid("route-scorer"),
-            scorer,
-            TierRequestShape::ScoreTasks,
-        );
+        let tier = TierInstance::encoder("route-scorer", RequestShape::ScoreTasks, None, scorer);
         let tasks = [TaskId::route()];
         let profiles = [TaskProfile {
             task: TaskId::route(),
@@ -493,11 +845,7 @@ mod tests {
         let task_calls = sidecar.tasks_calls.clone();
         let score_calls = sidecar.score_calls.clone();
         let scorer = Tier3Runner::new(endpoint(sidecar).await, Duration::from_secs(2)).unwrap();
-        let tier = GrpcScoringTier::new(
-            crate::pipeline::registry::tid("no-joint"),
-            scorer,
-            TierRequestShape::ScoreTasks,
-        );
+        let tier = TierInstance::encoder("no-joint", RequestShape::ScoreTasks, None, scorer);
         let tasks = [TaskId::route()];
         let profiles = [TaskProfile {
             task: TaskId::route(),

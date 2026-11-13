@@ -9,7 +9,7 @@ use std::fmt;
 
 use serde::Deserialize;
 
-use super::registry::TierId;
+use super::identity::{TierId, TierName};
 
 pub const LABEL_JEV: &str = "jev_capable";
 pub const LABEL_LLM: &str = "needs_llm";
@@ -116,6 +116,22 @@ pub struct TierPolicy {
     pub never_resolve: BTreeSet<String>,
     #[serde(default)]
     pub strict: bool,
+    /// `observe` records the tier's reading for the task and never resolves it:
+    /// for heads whose output is logged as metadata (taxonomy, urgency), not routed.
+    #[serde(default)]
+    pub authority: Authority,
+    /// The instance these bars were fitted on. If the instance now running under
+    /// this tier's name has a different id, the bars may no longer be valid.
+    #[serde(default)]
+    pub calibrated_for: Option<TierId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Authority {
+    #[default]
+    Resolve,
+    Observe,
 }
 
 #[cfg(test)]
@@ -126,7 +142,14 @@ impl TierPolicy {
             label_min_confidence: BTreeMap::new(),
             never_resolve: BTreeSet::new(),
             strict: false,
+            authority: Authority::Resolve,
+            calibrated_for: None,
         }
+    }
+
+    pub fn observe(mut self) -> Self {
+        self.authority = Authority::Observe;
+        self
     }
 
     pub fn with_label(mut self, label: &str, min: f32) -> Self {
@@ -148,7 +171,7 @@ impl TierPolicy {
 /// Execution calibration indexed independently from task definitions:
 /// tier name -> task id -> resolution policy. Execution order is not encoded
 /// here; it belongs to the `TierRegistry`.
-pub type TierPolicyMap = BTreeMap<TierId, BTreeMap<TaskId, TierPolicy>>;
+pub type TierPolicyMap = BTreeMap<TierName, BTreeMap<TaskId, TierPolicy>>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FallbackPolicy {
@@ -204,6 +227,10 @@ impl TaskProfile {
             {
                 return pass("unknown_label", None, confidence);
             }
+        }
+
+        if policy.authority == Authority::Observe {
+            return pass("observe_only", guess, confidence);
         }
 
         if self.output_kind != OutputKind::Multilabel
@@ -297,6 +324,40 @@ mod tests {
             Decision::Resolve(Reading { label, confidence, .. })
                 if label == "privacy" && (confidence - 0.84).abs() < 1e-6
         ));
+    }
+
+    #[test]
+    fn an_observing_policy_records_the_reading_and_never_resolves() {
+        let profile = TaskProfile {
+            task: TaskId::new("urgency"),
+            output_kind: OutputKind::Multiclass,
+            labels: None,
+            label_metadata: Vec::new(),
+            taxonomy_version: None,
+            fallback: FallbackPolicy::Defer,
+        };
+        let reading = scored("high", 0.99);
+        assert!(matches!(
+            profile.decide(&TierPolicy::new(0.5), &reading),
+            Decision::Resolve(_)
+        ));
+        assert!(matches!(
+            profile.decide(&TierPolicy::new(0.5).observe(), &reading),
+            Decision::Pass { reason: "observe_only", .. }
+        ));
+    }
+
+    #[test]
+    fn a_policy_can_name_the_instance_it_was_calibrated_for() {
+        let toml = r#"
+            min_confidence = 0.9
+            authority = "observe"
+            calibrated_for = "00112233445566778899aabbccddeeff"
+        "#;
+        let policy: TierPolicy = toml::from_str(toml).unwrap();
+        assert_eq!(policy.authority, Authority::Observe);
+        assert_eq!(policy.calibrated_for.map(|id| id.to_string()).as_deref(), Some("00112233445566778899aabbccddeeff"));
+        assert!(toml::from_str::<TierPolicy>("min_confidence = 0.9\ncalibrated_for = \"nope\"").is_err());
     }
 
     #[test]
