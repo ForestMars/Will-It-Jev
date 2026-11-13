@@ -789,6 +789,7 @@ mod tests {
         let tasks = [TaskId::route(), TaskId::tag()];
         let profiles = [
             TaskProfile {
+                cascade: super::task::Cascade::default(),
                 task: TaskId::route(),
                 output_kind: OutputKind::Binary,
                 labels: None,
@@ -797,6 +798,7 @@ mod tests {
                 fallback: super::super::task::FallbackPolicy::Defer,
             },
             TaskProfile {
+                cascade: super::task::Cascade::default(),
                 task: TaskId::tag(),
                 output_kind: OutputKind::Multiclass,
                 labels: None,
@@ -849,6 +851,7 @@ mod tests {
         let tier = TierInstance::encoder("no-joint", RequestShape::ScoreTasks, None, scorer);
         let tasks = [TaskId::route()];
         let profiles = [TaskProfile {
+            cascade: super::task::Cascade::default(),
             task: TaskId::route(),
             output_kind: OutputKind::Binary,
             labels: None,

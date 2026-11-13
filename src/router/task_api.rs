@@ -403,6 +403,7 @@ mod tests {
 
     fn profile(task: &str, kind: OutputKind, labels: &[&str]) -> TaskProfile {
         TaskProfile {
+            cascade: crate::pipeline::task::Cascade::default(),
             task: TaskId::new(task),
             output_kind: kind,
             labels: Some(labels.iter().map(|label| (*label).to_string()).collect()),

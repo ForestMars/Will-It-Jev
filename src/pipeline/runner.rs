@@ -171,7 +171,6 @@ impl CascadeRunner {
                 .filter(|profile| {
                     active.contains(&profile.task)
                         && self.graph.task_uses(&profile.task, tier_id)
-                        && by_task.is_some_and(|map| map.contains_key(&profile.task))
                 })
                 .collect();
             if wanted.is_empty() {
@@ -206,10 +205,10 @@ impl CascadeRunner {
                     .get(&profile.task)
                     .cloned()
                     .unwrap_or(TierReading::Unsupported);
-                let policy = by_task
-                    .and_then(|map| map.get(&profile.task))
-                    .expect("wanted task must have a tier policy");
-                let decision = profile.decide(policy, &reading);
+                let decision = match by_task.and_then(|map| map.get(&profile.task)) {
+                    Some(policy) => profile.decide(policy, &reading),
+                    None => Decision::Pass { reason: "no_policy", top_guess: None, score: 0.0 },
+                };
                 debug!(task = %profile.task, tier = %tier_id, ?decision, "task decision");
 
                 if let Decision::Resolve(resolved_reading) = &decision {
@@ -340,6 +339,7 @@ mod tests {
 
     fn tag_profile(labels: Option<Vec<String>>) -> TaskProfile {
         TaskProfile {
+            cascade: super::task::Cascade::default(),
             task: TaskId::tag(),
             output_kind: OutputKind::Multiclass,
             labels,
