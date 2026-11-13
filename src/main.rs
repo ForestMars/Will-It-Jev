@@ -307,7 +307,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let resolved = resolve_instance_params(name, tier, params, &config.router, &pipeline_config.legacy)?;
         let instance = TierInstance::build(name.clone(), tier.clone(), resolved)?;
         tracing::info!(
-            tier = %instance.name(), id = %instance.id(), role = instance.tier().role.as_str(),
+            tier = %instance.name(), role = instance.tier().role.as_str(),
             model_format = ?instance.params().model_format.map(|format| format.as_str()), model = %instance.model_label(),
             "tier instance built"
         );
@@ -317,43 +317,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("no cascade tier is enabled; enable at least one [[tier]]".into());
     }
 
-    // Resolve authored TierName references to generated TierIds once, when
-    // constructing the immutable runtime task catalog and execution graph.
+    // The graph resolves authored TierNames against the complete available
+    // registry and assigns TierIds only to instances used by its task paths.
     let configured_tasks = pipeline_config.profiles();
-    let mut runtime_tasks = Vec::with_capacity(configured_tasks.len());
     let mut task_paths = std::collections::BTreeMap::new();
-    for configured in configured_tasks {
-        let mut tier_ids = Vec::with_capacity(configured.cascade.tiers.len());
+    for configured in &configured_tasks {
+        let mut path = Vec::with_capacity(configured.cascade.tiers.len());
         for name in &configured.cascade.tiers {
-            if let Some(instance) = registry.get(name) {
-                tier_ids.push(*instance.id());
+            if registry.get(name).is_some() {
+                path.push(name.clone());
             } else {
                 tracing::info!(task = %configured.name, tier = %name, "disabled tier omitted from task cascade");
             }
         }
-        task_paths.insert(configured.name.clone(), tier_ids.clone());
-        runtime_tasks.push(Task {
-            name: configured.name,
-            cascade: Cascade { tiers: tier_ids },
-            output_kind: configured.output_kind,
-            labels: configured.labels,
-            label_metadata: configured.label_metadata,
-            taxonomy_version: configured.taxonomy_version,
-            fallback: configured.fallback,
-        });
+        task_paths.insert(configured.name.clone(), path);
     }
+    let execution_graph = pipeline::cascade::CascadeGraph::from_task_paths(task_paths, &registry)?;
 
-    // Policies are authored by tier name in TOML but use TierId at runtime.
+    let runtime_tasks: Vec<Task> = configured_tasks.into_iter().map(|configured| Task {
+        name: configured.name.clone(),
+        cascade: Cascade { tiers: execution_graph.task_path(&configured.name) },
+        output_kind: configured.output_kind,
+        labels: configured.labels,
+        label_metadata: configured.label_metadata,
+        taxonomy_version: configured.taxonomy_version,
+        fallback: configured.fallback,
+    }).collect();
+
+    // Policies are authored by TierName and become TierId-keyed only after the
+    // graph has resolved the corresponding node.
     let mut tier_policies = TierPolicyMap::new();
     for (name, by_task) in &pipeline_config.tier_policies {
-        let Some(instance) = registry.get(name) else {
-            tracing::info!(tier = %name, "policies for a disabled tier are inactive");
-            continue;
-        };
-        tier_policies.insert(*instance.id(), by_task.clone());
+        if let Some(id) = execution_graph.id_for_name(name) {
+            tier_policies.insert(id, by_task.clone());
+        } else {
+            tracing::info!(tier = %name, "policies for a disabled or unused tier are inactive");
+        }
     }
-
-    let execution_graph = pipeline::cascade::CascadeGraph::from_task_paths(task_paths, &registry.ids())?;
     if execution_graph.order().is_empty() {
         return Err("no task cascade contains an enabled tier".into());
     }
@@ -364,7 +364,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let artifact_hash = |role: Role| {
         execution_graph.order().iter()
-            .filter_map(|id| registry.get_by_id(id))
+            .filter_map(|id| execution_graph.tier_name(id).and_then(|name| registry.get(name)))
             .find(|tier| tier.tier().role == role)
             .and_then(|tier| tier.artifact_hash().map(|hash| hex(hash)))
             .unwrap_or_else(|| "disabled".to_string())
@@ -374,12 +374,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tier2_bin: artifact_hash(Role::FastText),
     };
 
-    for mismatch in registry.calibration_mismatches(&tier_policies) {
-        tracing::warn!(
-            tier = %mismatch.tier, tier_id = %mismatch.tier_id, task = %mismatch.task,
-            calibrated_for = %mismatch.calibrated_for, running = %mismatch.running,
-            "tier_policy was calibrated for a different instance than the one now running under this name"
-        );
+    for (tier_id, by_task) in &tier_policies {
+        let Some(name) = execution_graph.tier_name(tier_id) else { continue };
+        for (task, policy) in by_task {
+            if let Some(calibrated_for) = policy.calibrated_for {
+                if calibrated_for != *tier_id {
+                    tracing::warn!(
+                        tier = %name, tier_id = %tier_id, task = %task,
+                        calibrated_for = %calibrated_for, running = %tier_id,
+                        "tier_policy was calibrated for a different instance than the one now running under this name"
+                    );
+                }
+            }
+        }
     }
 
     for task in &runtime_tasks {
@@ -406,7 +413,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("tasks.toml: tag_in_request = true but no [tier_policy.<tier>.tag] policy is configured".into());
         }
         let has_executable_tag_head = profile.cascade.tiers.iter().any(|id| {
-            registry.get_by_id(id).is_some_and(|instance| {
+            execution_graph.tier_name(id).and_then(|name| registry.get(name)).is_some_and(|instance| {
                 instance.tier().role == Role::Encoder
                     && tier_policies.get(id).is_some_and(|by_task| by_task.contains_key("tag"))
             })

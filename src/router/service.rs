@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::legacy_tiers::LegacyTierNumbers;
 use crate::pipeline::tier_types::{Slot, TierId, FALLBACK_TIER_NAME};
-use crate::pipeline::registry::TierDirectory;
+use crate::pipeline::cascade::CascadeGraph;
 use crate::pipeline::runner::{CascadeRunner, Resolution, RunOutcome, TierTrace};
 use crate::pipeline::tagger::JointTagStore;
 use crate::pipeline::task::{
@@ -73,7 +73,7 @@ pub struct AppState {
     tag_sample_prob: f32,
     joint_tag_ttl: Duration,
     budget: Duration,
-    tiers: Arc<TierDirectory>,
+    tiers: Arc<CascadeGraph>,
     legacy: Arc<LegacyTierNumbers>,
 }
 
@@ -101,7 +101,7 @@ pub fn app(dependencies: AppDependencies) -> Router {
         dependencies.budget,
     );
     let state = AppState {
-        tiers: dependencies.cascade.directory(),
+        tiers: dependencies.cascade.graph(),
         legacy: dependencies.legacy,
         cascade: dependencies.cascade,
         route_profile: dependencies.route_profile,
@@ -353,7 +353,7 @@ fn route_record(
     request_id: String,
     prompt: &str,
     hashes: &Hashes,
-    tiers: &TierDirectory,
+    tiers: &CascadeGraph,
     legacy: &LegacyTierNumbers,
     profiles: &[Task],
     outcome: &RunOutcome,
@@ -691,15 +691,13 @@ mod tests {
     }
 
     /// rules, prefilter, modernbert in that execution order.
-    fn directory() -> TierDirectory {
+    fn graph() -> CascadeGraph {
         let mut registry = TierRegistry::new();
-        let mut order = Vec::new();
         for name in ["rules", "prefilter", "modernbert"] {
-            let instance = Arc::new(TierInstance::fake(name, Arc::new(NamedTier)));
-            order.push(*instance.id());
-            registry.register(instance).unwrap();
+            registry.register(Arc::new(TierInstance::fake(name, Arc::new(NamedTier)))).unwrap();
         }
-        TierDirectory::from_order(&registry, &order)
+        let paths = [("route".to_string(), vec![tname("rules"), tname("prefilter"), tname("modernbert")])].into();
+        CascadeGraph::from_task_paths(paths, &registry).unwrap()
     }
 
     /// rules is 1 and modernbert is 3; prefilter has no legacy number.
@@ -720,7 +718,7 @@ mod tests {
     }
 
     fn test_tier_id(name: &str) -> TierId {
-        directory().info_by_name(&tname(name)).expect("test tier exists").id
+        graph().id_for_name(&tname(name)).expect("test tier exists")
     }
 
     fn trace(tier: &str, reading: TierReading, decision: Decision) -> TierTrace {
@@ -741,7 +739,7 @@ mod tests {
             "11111111-1111-4111-8111-111111111111".into(),
             "prompt",
             &hashes,
-            &directory(),
+            &graph(),
             &legacy(),
             &[route_profile()],
             &outcome,

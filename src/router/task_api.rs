@@ -26,7 +26,6 @@ use uuid::Uuid;
 use crate::pipeline::{
     cascade::CascadeGraph,
     tier_types::Slot,
-    registry::TierDirectory,
     runner::{CascadeRunner, Resolution, RunOutcome, TaskOutcome},
     task::{Decision, Task, TierPolicyMap, TierReading},
 };
@@ -174,7 +173,7 @@ async fn get_task_run(
             Json(json!({
                 "run_id": run_id,
                 "status": "complete",
-                "tasks": all_task_results(&outcome, &state.cascade.directory()),
+                "tasks": all_task_results(&outcome, &state.cascade.graph()),
             })),
         ).into_response(),
         Ok(TaskRunLookup::Failed(error)) | Err(error) => (
@@ -277,7 +276,7 @@ async fn execute_task_request(
     }))
 }
 
-fn all_task_results(outcome: &RunOutcome, tiers: &TierDirectory) -> Value {
+fn all_task_results(outcome: &RunOutcome, tiers: &CascadeGraph) -> Value {
     let mut tasks = Map::new();
     for (task_id, task_outcome) in &outcome.tasks {
         tasks.insert(task_id.as_str().to_string(), task_outcome_json(task_outcome, tiers));
@@ -445,15 +444,17 @@ mod tests {
             Arc::new(TierInstance::fake("rules", Arc::new(tier1))),
             Arc::new(TierInstance::fake("modernbert", Arc::new(tier2))),
         ]);
-        let rules_id = *registry.get(&tname("rules")).unwrap().id();
-        let modernbert_id = *registry.get(&tname("modernbert")).unwrap().id();
-        profiles[0].cascade.tiers = vec![rules_id];
-        profiles[1].cascade.tiers = vec![modernbert_id];
-        profiles[2].cascade.tiers = vec![modernbert_id];
-        let paths: BTreeMap<String, Vec<TierId>> = profiles.iter()
-            .map(|profile| (profile.name.clone(), profile.cascade.tiers.clone()))
-            .collect();
-        let graph = CascadeGraph::from_task_paths(paths, &registry.ids()).unwrap();
+        let paths: BTreeMap<String, Vec<TierName>> = [
+            ("customer_intent".to_string(), vec![tname("rules")]),
+            ("urgency".to_string(), vec![tname("modernbert")]),
+            ("fraud_risk".to_string(), vec![tname("modernbert")]),
+        ].into();
+        let graph = CascadeGraph::from_task_paths(paths, &registry).unwrap();
+        let rules_id = graph.id_for_name(&tname("rules")).unwrap();
+        let modernbert_id = graph.id_for_name(&tname("modernbert")).unwrap();
+        profiles[0].cascade.tiers = graph.task_path("customer_intent");
+        profiles[1].cascade.tiers = graph.task_path("urgency");
+        profiles[2].cascade.tiers = graph.task_path("fraud_risk");
         let cascade = Arc::new(CascadeRunner::new(registry, graph).unwrap());
         let policies: TierPolicyMap = [
             (rules_id, [(String::from("customer_intent"), TierPolicy::new(0.90))].into()),

@@ -15,7 +15,7 @@ use tracing::debug;
 
 use super::cascade::CascadeGraph;
 use super::tier_types::{Slot, TierId, TierName};
-use super::registry::{TierDirectory, TierRegistry};
+use super::registry::TierRegistry;
 use super::task::{
     Decision, FallbackPolicy, Reading, Task, TierPolicyMap, TierReading,
 };
@@ -79,9 +79,8 @@ pub struct CascadeRunner {
     registry: TierRegistry,
     /// The graph's deterministic topological execution projection. An instance's
     /// position in this vector is its `Slot`.
-    tiers: Vec<Arc<TierInstance>>,
+    tiers: BTreeMap<TierId, Arc<TierInstance>>,
     graph: Arc<CascadeGraph>,
-    directory: Arc<TierDirectory>,
 }
 
 /// Required-task completion and full cascade completion are separate signals from one run.
@@ -93,13 +92,17 @@ pub struct SplitRun {
 impl CascadeRunner {
     /// Bind the available TierRegistry to a validated task-cascade DAG.
     pub fn new(registry: TierRegistry, graph: CascadeGraph) -> Result<Self, CascadeRunnerBuildError> {
-        let mut tiers = Vec::with_capacity(graph.order().len());
+        let mut tiers = BTreeMap::new();
         for id in graph.order() {
-            let tier = registry.get_by_id(id).ok_or_else(|| CascadeRunnerBuildError::MissingTier(*id))?;
-            tiers.push(tier);
+            let name = graph.tier_name(id).ok_or_else(|| CascadeRunnerBuildError::MissingTier(*id))?;
+            let tier = registry.get(name).ok_or_else(|| CascadeRunnerBuildError::MissingTier(*id))?;
+            let actual = TierInstance::derive_id(tier.name(), tier.tier(), tier.params(), tier.artifact_hash());
+            if actual != *id {
+                return Err(CascadeRunnerBuildError::MissingTier(*id));
+            }
+            tiers.insert(*id, tier);
         }
-        let directory = Arc::new(TierDirectory::from_order(&registry, graph.order()));
-        Ok(Self { registry, tiers, graph: Arc::new(graph), directory })
+        Ok(Self { registry, tiers, graph: Arc::new(graph) })
     }
 
     /// Complete registry of available tier instances, including unused entries.
@@ -107,14 +110,14 @@ impl CascadeRunner {
         &self.registry
     }
 
-    /// Ids and slots, by name, for tiers in the execution DAG.
-    pub fn directory(&self) -> Arc<TierDirectory> {
-        Arc::clone(&self.directory)
+    /// The immutable execution graph, including its derived slot projection.
+    pub fn graph(&self) -> Arc<CascadeGraph> {
+        Arc::clone(&self.graph)
     }
 
     #[allow(dead_code)]
     pub fn slot_of(&self, id: &TierId) -> Option<Slot> {
-        self.directory.slot(id)
+        self.graph.slot(id)
     }
 
     /// `profiles` describe tasks. `policies` independently determine which
@@ -194,7 +197,7 @@ impl CascadeRunner {
             let batches = std::mem::take(&mut ready);
             for (tier_id, task_set) in batches {
                 if start.elapsed() >= budget { break; }
-                let Some(tier) = self.registry.get_by_id(&tier_id) else {
+                let Some(tier) = self.tiers.get(&tier_id).cloned() else {
                     for task in task_set {
                         active.remove(&task);
                     }
@@ -347,15 +350,16 @@ mod tests {
     }
 
     fn tier_id(name: &str) -> TierId {
-        *TierInstance::fake(name, Arc::new(IdentityOnly)).id()
+        let instance = TierInstance::fake(name, Arc::new(IdentityOnly));
+        TierInstance::derive_id(instance.name(), instance.tier(), instance.params(), instance.artifact_hash())
     }
 
     fn test_graph(registry: &TierRegistry, paths: &[(&str, &[&str])]) -> CascadeGraph {
-        let paths: BTreeMap<String, Vec<TierId>> = paths.iter().map(|(task, names)| (
+        let paths: BTreeMap<String, Vec<TierName>> = paths.iter().map(|(task, names)| (
             (*task).to_string(),
-            names.iter().map(|name| *registry.get(&tname(name)).expect("test tier is registered").id()).collect()
+            names.iter().map(|name| tname(name)).collect()
         )).collect();
-        CascadeGraph::from_task_paths(paths, &registry.ids()).unwrap()
+        CascadeGraph::from_task_paths(paths, registry).unwrap()
     }
 
     fn test_runner(tiers: Vec<Arc<TierInstance>>, paths: &[(&str, &[&str])]) -> CascadeRunner {
@@ -579,7 +583,7 @@ mod tests {
         assert!(resolved_at(&outcome.tasks[&String::from("route")].resolution, "prefilter"));
         let order: Vec<String> = calls.lock().unwrap().iter().map(|(name, _)| name.clone()).collect();
         assert_eq!(order, ["fasttext", "prefilter"], "modernbert must not run once prefilter resolves");
-        assert_eq!(after.directory().slot(&tier_id("prefilter")).map(Slot::index), Some(1));
+        assert_eq!(after.graph().slot(&tier_id("prefilter")).map(Slot::index), Some(1));
     }
 
     #[tokio::test]
@@ -594,8 +598,8 @@ mod tests {
         let graph = test_graph(&registry, &[("route", &["rules", "modernbert"])]);
         let runner = CascadeRunner::new(registry, graph).unwrap();
         assert!(runner.registry().get(&tname("harrier")).is_some());
-        let harrier_id = *runner.registry().get(&tname("harrier")).unwrap().id();
-        assert_eq!(runner.directory().slot(&harrier_id).map(Slot::index), None);
+        let harrier_id = tier_id("harrier");
+        assert_eq!(runner.graph().slot(&harrier_id).map(Slot::index), None);
     }
 
     #[tokio::test]

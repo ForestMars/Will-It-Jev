@@ -251,7 +251,6 @@ pub fn hex(bytes: &[u8]) -> String {
 /// A Tier plus the parameters that distinguish this instance, loaded and ready to
 /// evaluate. The execution graph is an ordered `Vec` of these.
 pub struct TierInstance {
-    id: TierId,
     name: TierName,
     tier: Tier,
     params: Params,
@@ -303,7 +302,6 @@ impl TierInstance {
         artifact_hash: Option<[u8; 32]>,
     ) -> Self {
         Self {
-            id: Self::derive_id(&name, &tier, &params, artifact_hash.as_ref()),
             name, tier, params, artifact_hash, runner,
             task_scorers: BTreeMap::new(),
             request_shape_unimplemented: AtomicBool::new(false),
@@ -336,7 +334,6 @@ impl TierInstance {
         TierId::from_digest(&digest.finalize())
     }
 
-    pub fn id(&self) -> &TierId { &self.id }
     pub fn name(&self) -> &TierName { &self.name }
     pub fn tier(&self) -> &Tier { &self.tier }
     pub fn params(&self) -> &Params { &self.params }
@@ -694,7 +691,7 @@ mod tests {
         let onnx = build_entry(encoder_config("enc-a", ModelFormat::Onnx, Some("modernbert"), "http://127.0.0.1:9")).unwrap();
         let gguf = build_entry(encoder_config("enc-b", ModelFormat::Gguf, Some("harrier"), "http://127.0.0.1:9")).unwrap();
         assert_eq!(onnx.tier(), gguf.tier());
-        assert_ne!(onnx.id(), gguf.id());
+        assert_ne!(instance_id(&onnx), instance_id(&gguf));
     }
 
     #[tokio::test]
@@ -703,9 +700,9 @@ mod tests {
         let renamed = build_entry(encoder_config("renamed", ModelFormat::Onnx, Some("m"), "http://127.0.0.1:9")).unwrap();
         let moved = build_entry(encoder_config("enc-a", ModelFormat::Onnx, Some("m"), "http://127.0.0.2:9")).unwrap();
         let swapped = build_entry(encoder_config("enc-a", ModelFormat::Onnx, Some("oryn"), "http://127.0.0.1:9")).unwrap();
-        assert_ne!(base.id(), renamed.id());
-        assert_eq!(base.id(), moved.id());
-        assert_ne!(base.id(), swapped.id());
+        assert_ne!(instance_id(&base), instance_id(&renamed));
+        assert_eq!(instance_id(&base), instance_id(&moved));
+        assert_ne!(instance_id(&base), instance_id(&swapped));
     }
 
     #[test]
@@ -735,7 +732,7 @@ mod tests {
         let same_a = build_entry(rules_config("rules-a", a.to_str())).unwrap();
         let same_b = build_entry(rules_config("rules-a", b.to_str())).unwrap();
         // Different path, identical content: location is not identity.
-        assert_eq!(same_a.id(), same_b.id());
+        assert_eq!(instance_id(&same_a), instance_id(&same_b));
         assert_eq!(same_a.artifact_hash(), same_b.artifact_hash());
         std::fs::remove_dir_all(&dir).ok();
     }
