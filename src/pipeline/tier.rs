@@ -6,9 +6,7 @@
 //                 encoder, which RPC contract it speaks. No instance parameters.
 //   Params        what distinguishes one instance of a Tier from another: the
 //                 computation it runs, its model, rule file, endpoint, timeout.
-//   TierDecl      a name, a Tier and Params as declared in configuration, before
-//                 anything is loaded.
-//   TierInstance  a TierDecl brought to life: artifacts loaded, runner connected,
+//   TierInstance  a Tier plus resolved instance parameters, loaded artifacts, and runner,
 //                 TierId generated. It keeps everything it was built from.
 //
 // A tier returns raw readings for the task IDs it can serve; all task-specific
@@ -174,14 +172,6 @@ pub struct Params {
     pub enabled: Option<bool>,
 }
 
-/// An instance as declared in configuration: nothing loaded, nothing connected.
-#[derive(Debug, Clone)]
-pub struct TierDecl {
-    pub name: TierName,
-    pub tier: Tier,
-    pub params: Params,
-}
-
 // ---- evaluation contract ---------------------------------------------------
 
 pub struct TierContext<'a> {
@@ -296,8 +286,7 @@ pub struct TierInstance {
 impl TierInstance {
     /// Load what the declaration points at and connect the runner. `params` must
     /// already be resolved: every value the tier needs is on it.
-    pub fn build(decl: TierDecl) -> Result<Self, Box<dyn Error>> {
-        let TierDecl { name, tier, params } = decl;
+    pub fn build(name: TierName, tier: Tier, params: Params) -> Result<Self, Box<dyn Error>> {
         tier.validate().map_err(|reason| format!("tier {name}: {reason}"))?;
         if !tier.accepts(params.computation) {
             return Err(format!(
@@ -689,91 +678,95 @@ mod tests {
         format!("http://{address}")
     }
 
-    fn encoder_decl(name: &str, computation: Computation, model: Option<&str>, endpoint: &str) -> TierDecl {
-        TierDecl {
-            name: TierName::new(name).unwrap(),
-            tier: Tier { role: Role::Encoder, transport: Transport::Grpc, request_shape: Some(RequestShape::Score) },
-            params: Params {
+    fn encoder_config(name: &str, computation: Computation, model: Option<&str>, endpoint: &str) -> (TierName, Tier, Params) {
+        (
+            TierName::new(name).unwrap(),
+            Tier { role: Role::Encoder, transport: Transport::Grpc, request_shape: Some(RequestShape::Score) },
+            Params {
                 computation, model: model.map(str::to_string), config: None,
                 endpoint: Some(endpoint.to_string()), timeout_ms: Some(250), enabled: None,
             },
-        }
+        )
     }
 
-    fn rules_decl(name: &str, config: Option<&str>) -> TierDecl {
-        TierDecl {
-            name: TierName::new(name).unwrap(),
-            tier: Tier { role: Role::Rules, transport: Transport::InProcess, request_shape: None },
-            params: Params {
+    fn rules_config(name: &str, config: Option<&str>) -> (TierName, Tier, Params) {
+        (
+            TierName::new(name).unwrap(),
+            Tier { role: Role::Rules, transport: Transport::InProcess, request_shape: None },
+            Params {
                 computation: Computation::Automaton, model: None, config: config.map(str::to_string),
                 endpoint: None, timeout_ms: None, enabled: None,
             },
-        }
+        )
+    }
+
+    fn build_entry(entry: (TierName, Tier, Params)) -> Result<TierInstance, Box<dyn Error>> {
+        TierInstance::build(entry.0, entry.1, entry.2)
     }
 
     #[tokio::test]
     async fn an_instance_keeps_everything_it_was_built_from() {
-        let decl = encoder_decl("enc-a", Computation::Onnx, Some("model-a"), "http://127.0.0.1:9");
-        let instance = TierInstance::build(decl.clone()).unwrap();
-        assert_eq!(instance.name(), &decl.name);
-        assert_eq!(instance.tier(), &decl.tier);
-        assert_eq!(instance.params(), &decl.params);
+        let entry = encoder_config("enc-a", Computation::Onnx, Some("model-a"), "http://127.0.0.1:9");
+        let instance = build_entry(entry.clone()).unwrap();
+        assert_eq!(instance.name(), &entry.0);
+        assert_eq!(instance.tier(), &entry.1);
+        assert_eq!(instance.params(), &entry.2);
     }
 
     #[tokio::test]
     async fn two_instances_of_one_tier_differ_by_their_parameters_and_so_by_id() {
-        let onnx = TierInstance::build(encoder_decl("enc-a", Computation::Onnx, Some("modernbert"), "http://127.0.0.1:9")).unwrap();
-        let gguf = TierInstance::build(encoder_decl("enc-b", Computation::Gguf, Some("harrier"), "http://127.0.0.1:9")).unwrap();
+        let onnx = build_entry(encoder_config("enc-a", Computation::Onnx, Some("modernbert"), "http://127.0.0.1:9")).unwrap();
+        let gguf = build_entry(encoder_config("enc-b", Computation::Gguf, Some("harrier"), "http://127.0.0.1:9")).unwrap();
         assert_eq!(onnx.tier(), gguf.tier());
         assert_ne!(onnx.id(), gguf.id());
     }
 
     #[tokio::test]
-    async fn id_follows_the_model_not_the_name_or_the_endpoint() {
-        let base = TierInstance::build(encoder_decl("enc-a", Computation::Onnx, Some("m"), "http://127.0.0.1:9")).unwrap();
-        let renamed = TierInstance::build(encoder_decl("renamed", Computation::Onnx, Some("m"), "http://127.0.0.1:9")).unwrap();
-        let moved = TierInstance::build(encoder_decl("enc-a", Computation::Onnx, Some("m"), "http://127.0.0.2:9")).unwrap();
-        let swapped = TierInstance::build(encoder_decl("enc-a", Computation::Onnx, Some("oryn"), "http://127.0.0.1:9")).unwrap();
-        assert_eq!(base.id(), renamed.id());
+    async fn id_includes_the_tier_name_and_model_but_not_the_endpoint() {
+        let base = build_entry(encoder_config("enc-a", Computation::Onnx, Some("m"), "http://127.0.0.1:9")).unwrap();
+        let renamed = build_entry(encoder_config("renamed", Computation::Onnx, Some("m"), "http://127.0.0.1:9")).unwrap();
+        let moved = build_entry(encoder_config("enc-a", Computation::Onnx, Some("m"), "http://127.0.0.2:9")).unwrap();
+        let swapped = build_entry(encoder_config("enc-a", Computation::Onnx, Some("oryn"), "http://127.0.0.1:9")).unwrap();
+        assert_ne!(base.id(), renamed.id());
         assert_eq!(base.id(), moved.id());
         assert_ne!(base.id(), swapped.id());
     }
 
     #[test]
     fn a_computation_that_does_not_fit_the_role_is_rejected() {
-        let mut decl = rules_decl("rules-a", Some("config/tier1.toml"));
-        decl.params.computation = Computation::Onnx;
-        let error = TierInstance::build(decl).err().expect("must fail");
+        let (name, tier, mut params) = rules_config("rules-a", Some("config/tier1.toml"));
+        params.computation = Computation::Onnx;
+        let error = TierInstance::build(name, tier, params).err().expect("must fail");
         assert!(error.to_string().contains("cannot run computation"));
     }
 
     #[test]
     fn a_rules_instance_loads_its_rule_file_and_hashes_it() {
-        let instance = TierInstance::build(rules_decl("rules-a", Some("config/tier1.toml"))).unwrap();
+        let instance = build_entry(rules_config("rules-a", Some("config/tier1.toml"))).unwrap();
         assert!(instance.artifact_hash().is_some());
-        let missing = TierInstance::build(rules_decl("rules-b", None)).err().expect("must fail");
+        let missing = build_entry(rules_config("rules-b", None)).err().expect("must fail");
         assert!(missing.to_string().contains("no `config` path"));
     }
 
     #[test]
-    fn the_rule_file_path_is_part_of_the_id_and_its_hash_is_kept() {
+    fn rule_file_location_is_not_part_of_the_id_but_content_is() {
         let dir = std::env::temp_dir().join(format!("tier-id-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let original = std::fs::read_to_string("config/tier1.toml").unwrap();
         let (a, b) = (dir.join("a.toml"), dir.join("b.toml"));
         std::fs::write(&a, &original).unwrap();
         std::fs::write(&b, &original).unwrap();
-        let same_a = TierInstance::build(rules_decl("rules-a", a.to_str())).unwrap();
-        let same_b = TierInstance::build(rules_decl("rules-b", b.to_str())).unwrap();
-        // Different path, identical content: the config path is part of the identity.
-        assert_ne!(same_a.id(), same_b.id());
+        let same_a = build_entry(rules_config("rules-a", a.to_str())).unwrap();
+        let same_b = build_entry(rules_config("rules-a", b.to_str())).unwrap();
+        // Different path, identical content: location is not identity.
+        assert_eq!(same_a.id(), same_b.id());
         assert_eq!(same_a.artifact_hash(), same_b.artifact_hash());
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
     async fn a_failed_sidecar_call_is_labelled_by_model_not_by_name() {
-        let instance = TierInstance::build(encoder_decl("enc-a", Computation::Onnx, Some("model-a"), "http://127.0.0.1:9")).unwrap();
+        let instance = build_entry(encoder_config("enc-a", Computation::Onnx, Some("model-a"), "http://127.0.0.1:9")).unwrap();
         let tasks = [String::from("route")];
         let output = instance
             .evaluate(&TierContext { prompt: "test", tasks: &tasks, task_profiles: &[], budget: Duration::from_millis(500) })
