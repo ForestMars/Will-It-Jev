@@ -12,7 +12,8 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use crate::tagging::{ClickHouseRawTable, OvenV1Tagger, TagConfig};
 use pipeline::tagger::{CascadeTagger, JointTagStore};
 use legacy_tiers::LegacyTierNumbers;
-use pipeline::tier::{hex, RequestShape, Role, TierDecl, TierInstance};
+use pipeline::identity::TierName;
+use pipeline::tier::{hex, Params, RequestShape, Role, Tier, TierInstance};
 use pipeline::{CascadeRunner, String, TierRegistry};
 use router::dispatch::DownstreamDispatcher;
 use router::service;
@@ -41,49 +42,35 @@ fn env_or(name: &str, default: &str) -> String {
 
 /// A tier is enabled by its own `enabled`, else by the `[router.tierN]` block of
 /// the legacy ordinal it carries, else it is on.
-fn tier_enabled(decl: &TierDecl, router: &config::RouterConfig, legacy: &LegacyTierNumbers) -> bool {
-    decl.params.enabled
+fn tier_enabled(name: &TierName, params: &Params, router: &config::RouterConfig, legacy: &LegacyTierNumbers) -> bool {
+    params.enabled
         .or_else(|| {
-            legacy.ordinal_of(&decl.name)
+            legacy.ordinal_of(name)
                 .and_then(|ordinal| router.legacy_tier(ordinal))
                 .map(|tier| tier.enabled)
         })
         .unwrap_or(true)
 }
 
-/// Endpoint and per-call timeout for a gRPC tier. The original two sidecar
-/// tiers keep their historical environment variables; every other tier uses
-/// `TIER_<NAME>_ENDPOINT` and `TIER_<NAME>_MAX_CALL_MS`.
+/// Endpoint and per-call timeout for a gRPC tier. The original sidecars keep
+/// their historical environment variables; other names use TIER_<NAME>_*.
 fn grpc_settings(
-    decl: &TierDecl,
+    name: &TierName,
+    params: &Params,
     router: &config::RouterConfig,
     numbers: &LegacyTierNumbers,
 ) -> Result<(String, Duration), Box<dyn std::error::Error>> {
-    let ordinal = numbers.ordinal_of(&decl.name);
+    let ordinal = numbers.ordinal_of(name);
     let legacy = ordinal.and_then(|ordinal| router.legacy_tier(ordinal));
-    let endpoint = decl.params
-        .endpoint
-        .as_deref()
+    let endpoint = params.endpoint.as_deref()
         .or_else(|| legacy.and_then(|tier| tier.endpoint.as_deref()));
-    let timeout_ms = decl.params.timeout_ms.or_else(|| legacy.and_then(|tier| tier.timeout_ms));
-    let upper = decl.name.as_str().to_ascii_uppercase().replace('-', "_");
+    let timeout_ms = params.timeout_ms.or_else(|| legacy.and_then(|tier| tier.timeout_ms));
+    let upper = name.as_str().to_ascii_uppercase().replace('-', "_");
     let (endpoint_env, endpoint_aliases, timeout_env): (String, &[&str], String) =
         match ordinal {
-            Some(3) => (
-                "TIER3_SCORER_ENDPOINT".into(),
-                &["MODERNBERT_ENDPOINT"],
-                "TIER3_MAX_CALL_MS".into(),
-            ),
-            Some(4) => (
-                "TIER4_SCORER_ENDPOINT".into(),
-                &["TIER4_HARRIER_ENDPOINT", "TIER3_ENDPOINT"],
-                "TIER4_MAX_CALL_MS".into(),
-            ),
-            _ => (
-                format!("TIER_{upper}_ENDPOINT"),
-                &[],
-                format!("TIER_{upper}_MAX_CALL_MS"),
-            ),
+            Some(3) => ("TIER3_SCORER_ENDPOINT".into(), &["MODERNBERT_ENDPOINT"], "TIER3_MAX_CALL_MS".into()),
+            Some(4) => ("TIER4_SCORER_ENDPOINT".into(), &["TIER4_HARRIER_ENDPOINT", "TIER3_ENDPOINT"], "TIER4_MAX_CALL_MS".into()),
+            _ => (format!("TIER_{upper}_ENDPOINT"), &[], format!("TIER_{upper}_MAX_CALL_MS")),
         };
     Ok((
         configured_endpoint(&endpoint_env, endpoint_aliases, endpoint)?,
@@ -91,45 +78,41 @@ fn grpc_settings(
     ))
 }
 
-/// Fill in everything an instance needs that its declaration does not state, so
-/// the instance is built from, and keeps, its final parameters.
-///
-/// * rules `config` and fasttext `model`: the instance's own value wins. The
-///   process-wide `TIER1_CONFIG` / `FASTTEXT_MODEL` only supply a value for an
-///   instance that declares none, so several instances never collapse into one.
-/// * encoder `endpoint` and `timeout_ms`: per-instance environment variables
-///   override the declaration, which overrides the legacy `[router.tierN]` block.
-fn resolve_decl(
-    decl: &TierDecl,
+/// Resolve deployment-specific values after parsing, without introducing a
+/// declaration/domain type between Tier configuration and TierInstance.
+fn resolve_instance_params(
+    name: &TierName,
+    tier: &Tier,
+    params: &Params,
     router: &config::RouterConfig,
     legacy: &LegacyTierNumbers,
-) -> Result<TierDecl, Box<dyn std::error::Error>> {
-    let mut decl = decl.clone();
-    match decl.tier.role {
+) -> Result<Params, Box<dyn std::error::Error>> {
+    let mut resolved = params.clone();
+    match tier.role {
         Role::Rules => {
-            if decl.params.config.is_none() {
-                decl.params.config = Some(env_or("TIER1_CONFIG", "config/tier1.toml"));
+            if resolved.config.is_none() {
+                resolved.config = Some(env_or("TIER1_CONFIG", "config/tier1.toml"));
             }
         }
         Role::FastText => {
-            if decl.params.model.is_none() {
-                decl.params.model = Some(
+            if resolved.model.is_none() {
+                resolved.model = Some(
                     std::env::var("FASTTEXT_MODEL").unwrap_or_else(|_| default_fasttext_model_path()),
                 );
             }
-            if decl.params.model.as_deref() == Some("models/tier2.bin")
+            if resolved.model.as_deref() == Some("models/tier2.bin")
                 && !std::path::Path::new("models/tier2_small.bin").exists()
             {
-                tracing::warn!(tier = %decl.name, model_path = "models/tier2.bin", "using legacy fastText tier-2 model; prefer models/tier2_small.bin when available");
+                tracing::warn!(tier = %name, model_path = "models/tier2.bin", "using legacy fastText tier-2 model; prefer models/tier2_small.bin when available");
             }
         }
         Role::Encoder => {
-            let (endpoint, timeout) = grpc_settings(&decl, router, legacy)?;
-            decl.params.endpoint = Some(endpoint);
-            decl.params.timeout_ms = Some(u64::try_from(timeout.as_millis())?);
+            let (endpoint, timeout) = grpc_settings(name, &resolved, router, legacy)?;
+            resolved.endpoint = Some(endpoint);
+            resolved.timeout_ms = Some(u64::try_from(timeout.as_millis())?);
         }
     }
-    Ok(decl)
+    Ok(resolved)
 }
 
 fn configured_endpoint(
@@ -329,12 +312,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !pipeline_config.has_policy(&String::from("tag")) {
             return Err("tasks.toml: tag_in_request = true but no [tier_policy.<tier>.tag] policy is configured".into());
         }
-        let has_executable_tag_head = pipeline_config.tiers.iter().any(|decl| {
-            decl.tier.role == Role::Encoder
-                && decl.tier.request_shape == Some(RequestShape::ScoreTasks)
-                && tier_enabled(decl, &config.router, &pipeline_config.legacy)
-                && pipeline_config.cascades.task_uses(&String::from("tag"), &decl.name)
-                && pipeline_config.tier_policies.get(&decl.name)
+        let has_executable_tag_head = pipeline_config.tiers.iter().any(|(name, tier, params)| {
+            tier.role == Role::Encoder
+                && tier.request_shape == Some(RequestShape::ScoreTasks)
+                && tier_enabled(name, params, &config.router, &pipeline_config.legacy)
+                && pipeline_config.cascades.task_uses(&String::from("tag"), name)
+                && pipeline_config.tier_policies.get(name)
                     .is_some_and(|by_task| by_task.contains_key(&String::from("tag")))
         });
         if !has_executable_tag_head {
@@ -349,12 +332,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TierRegistry is the complete lookup of available instances by name. Task
     // cascades independently determine which registered tiers run and in what order.
     let mut registry = TierRegistry::new();
-    for decl in &pipeline_config.tiers {
-        if !tier_enabled(decl, &config.router, &pipeline_config.legacy) {
-            tracing::info!(tier = %decl.name, "tier disabled by configuration");
+    for (name, tier, params) in &pipeline_config.tiers {
+        if !tier_enabled(name, params, &config.router, &pipeline_config.legacy) {
+            tracing::info!(tier = %name, "tier disabled by configuration");
             continue;
         }
-        let instance = TierInstance::build(resolve_decl(decl, &config.router, &pipeline_config.legacy)?)?;
+        let resolved = resolve_instance_params(name, tier, params, &config.router, &pipeline_config.legacy)?;
+        let instance = TierInstance::build(name.clone(), tier.clone(), resolved)?;
         tracing::info!(
             tier = %instance.name(), id = %instance.id(), role = instance.tier().role.as_str(),
             computation = instance.params().computation.as_str(), model = %instance.model_label(),
