@@ -79,7 +79,7 @@ fn tier_configs_from(raw: Vec<RawTier>) -> Result<Vec<TierConfig>, Box<dyn Error
         if tiers.iter().any(|existing| existing.0 == name) {
             return Err(format!("[[tier]] {label:?} is defined twice").into());
         }
-        let definition = Tier { role: tier.role, transport: tier.transport, request_shape: tier.request_shape };
+        let definition = Tier { role: tier.executor, transport: tier.transport, request_shape: tier.request_shape };
         definition.validate().map_err(|reason| format!("[[tier]] {label:?}: {reason}"))?;
         let computation = match (tier.computation, definition.implied_computation()) {
             (Some(computation), _) | (None, Some(computation)) => computation,
