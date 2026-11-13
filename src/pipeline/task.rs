@@ -142,7 +142,7 @@ impl TierPolicy {
 /// Execution calibration indexed independently from task definitions:
 /// tier name -> task id -> resolution policy. Execution order is not encoded
 /// here; it belongs to the `TierRegistry`.
-pub type TierPolicyMap = BTreeMap<TierName, BTreeMap<String, TierPolicy>>;
+pub type TierPolicyMap = BTreeMap<TierId, BTreeMap<String, TierPolicy>>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FallbackPolicy {
@@ -152,15 +152,15 @@ pub enum FallbackPolicy {
 
 /// Authored ordered fallback route. Names resolve to generated TierIds when the runtime graph is compiled.
 #[derive(Debug, Clone, Default)]
-pub struct Cascade {
-    pub tiers: Vec<TierName>,
+pub struct Cascade<T = TierId> {
+    pub tiers: Vec<T>,
 }
 
 /// A task's output-head contract and its own ordered fallback cascade.
 #[derive(Debug, Clone)]
-pub struct Task {
+pub struct Task<TierRef = TierId> {
     pub name: String,
-    pub cascade: Cascade,
+    pub cascade: Cascade<TierRef>,
     pub output_kind: OutputKind,
     pub labels: Option<Vec<String>>,
     pub label_metadata: Vec<TaskLabelMetadata>,
@@ -178,7 +178,7 @@ pub enum Decision {
     },
 }
 
-impl Task {
+impl<TierRef> Task<TierRef> {
 
     pub fn decide(&self, policy: &TierPolicy, reading: &TierReading) -> Decision {
         let reading = match reading {
