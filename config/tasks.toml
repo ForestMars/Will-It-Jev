@@ -27,9 +27,8 @@ cascade = ["modernbert", "harrier"]
 #   executor     which executor handles the tier: rules | fasttext | encoder
 #   transport    how the router reaches it: in_process | grpc
 #   request_shape  encoder only: the RPC contract, score | score_tasks
-#   computation  how this instance realizes its role: automaton | fasttext
-#                (implied for rules/fasttext), onnx | gguf (required for an
-#                encoder; the sidecar's runtime)
+#   model_format  encoder model artifact representation: onnx | gguf
+#                 (required for encoders; does not select an inference runtime)
 #   model        fasttext: model file. encoder: the model name the sidecar
 #                should report (a different model_id is logged once)
 #   config       rules: rule file
@@ -50,14 +49,14 @@ transport = "in_process"
 [[tier]]
 name = "modernbert"
 executor = "encoder"
-computation = "onnx"
+model_format = "onnx"
 transport = "grpc"
 request_shape = "score"
 
 [[tier]]
 name = "harrier"
 executor = "encoder"
-computation = "gguf"
+model_format = "gguf"
 transport = "grpc"
 request_shape = "score"
 

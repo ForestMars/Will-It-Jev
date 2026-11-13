@@ -77,7 +77,7 @@ cascade = ["modernbert", "harrier"]
 [[tier]]
 name = "modernbert"
 role = "encoder"
-computation = "onnx"
+model_format = "onnx"
 transport = "grpc"
 request_shape = "score_tasks"
 endpoint = "http://127.0.0.1:50052"
@@ -86,9 +86,9 @@ timeout_ms = 500
 
 A new task normally adds a head and a path through already-registered tiers; it does not add another encoder execution. When a required capability is absent, declare a new `[[tier]]` and reference its name in the task's cascade.
 
-Three identifiers are kept apart. A **name** is what you call an instance; you write it in configuration and may change it. A **`TierId`** is generated from what determines the instance's behavior (its role, transport, request shape, computation, model, rule file, and the hash of the file it loaded), never authored; it excludes the name, endpoint, timeout and `enabled`, so renaming an instance or moving a sidecar changes nothing, while swapping the model behind a name does. A **`Slot`** is an instance's position in the compiled cascade: an address, not an identity, never persisted.
+Three identifiers are kept apart. A **name** is what you call an instance; you write it in configuration and may change it. A **`TierId`** is generated from what determines the instance's behavior (its role, model format, model, rule file, and the hash of the file it loaded), never authored; it excludes the name, endpoint, timeout and `enabled`, so renaming an instance or moving a sidecar changes nothing, while swapping the model behind a name does. A **`Slot`** is an instance's position in the compiled cascade: an address, not an identity, never persisted.
 
-A **Tier** is the reusable definition (`role`, `transport`, `request_shape`); an instance adds the parameters that distinguish it (`computation`, `model`, `config`, `endpoint`, `timeout_ms`). Several instances of one Tier coexist, for example one encoder over ONNX and another over GGUF. Two declarations with identical behavior-determining content are one instance and are rejected, so declare what differs, typically `model`. `model` is the model an instance runs (a file for `fasttext`; for an `encoder`, the name the sidecar should report), and the `model_id` in traces comes from it, never from the name. `TIER1_CONFIG` and `FASTTEXT_MODEL` only supply a value for an instance that declares none.
+A **Tier** is the reusable definition (`role`, `transport`, `request_shape`); an instance adds the parameters that distinguish it (`model_format`, `model`, `config`, `endpoint`, `timeout_ms`). `model_format` identifies only the encoder artifact representation (`onnx` or `gguf`); it does not choose an inference runtime. Several instances of one Tier coexist, for example one encoder over ONNX and another over GGUF. Two declarations with identical behavior-determining content are one instance and are rejected, so declare what differs, typically `model`. `model` is the model an instance runs (a file for `fasttext`; for an `encoder`, the name the sidecar should report), and the `model_id` in traces comes from it, never from the name. `TIER1_CONFIG` and `FASTTEXT_MODEL` only supply a value for an instance that declares none.
 
 The original four tiers were once numbered 1 to 4, and those numbers survive at the edges: the numbered telemetry fields, `[router.tierN]` settings, the numbered environment variables and `tierN` aliases in `[tier_policy.*]` keys. The `[legacy_tiers]` table in `tasks.toml` is the only place a name and a number meet. It is read at load and handed to the code that writes those compatibility surfaces; no tier, instance, registry or cascade type carries a number. Configuration with no `[[tier]]` entries keeps the original numbering.
 

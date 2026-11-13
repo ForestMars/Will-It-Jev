@@ -308,7 +308,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let instance = TierInstance::build(name.clone(), tier.clone(), resolved)?;
         tracing::info!(
             tier = %instance.name(), id = %instance.id(), role = instance.tier().role.as_str(),
-            computation = instance.params().computation.as_str(), model = %instance.model_label(),
+            model_format = ?instance.params().model_format.map(|format| format.as_str()), model = %instance.model_label(),
             "tier instance built"
         );
         registry.register(Arc::new(instance))?;

@@ -21,7 +21,7 @@ use serde::Deserialize;
 use crate::legacy_tiers::LegacyTierNumbers;
 
 use super::identity::TierName;
-use super::tier::{Computation, Params, RequestShape, Role, Tier, Transport};
+use super::tier::{ModelFormat, Params, RequestShape, Role, Tier, Transport};
 
 type TierConfig = (TierName, Tier, Params);
 use super::task::{Cascade, FallbackPolicy, OutputKind, TaskLabelMetadata, Task, TierPolicy};
@@ -45,7 +45,7 @@ struct RawTier {
     executor: Role,
     transport: Transport,
     request_shape: Option<RequestShape>,
-    computation: Option<Computation>,
+    model_format: Option<ModelFormat>,
     model: Option<String>,
     config: Option<String>,
     enabled: Option<bool>,
@@ -56,18 +56,16 @@ struct RawTier {
 /// The available tier instances. Their vector order has no scheduling meaning.
 fn default_tier_configs() -> Vec<TierConfig> {
     [
-        ("rules", Role::Rules, Transport::InProcess, None, Computation::Automaton),
-        ("fasttext", Role::FastText, Transport::InProcess, None, Computation::FastText),
-        ("modernbert", Role::Encoder, Transport::Grpc, Some(RequestShape::Score), Computation::Onnx),
-        ("harrier", Role::Encoder, Transport::Grpc, Some(RequestShape::Score), Computation::Gguf),
-    ].into_iter().map(|(name, role, transport, request_shape, computation)| (
+        ("rules", Role::Rules, Transport::InProcess, None, None),
+        ("fasttext", Role::FastText, Transport::InProcess, None, None),
+        ("modernbert", Role::Encoder, Transport::Grpc, Some(RequestShape::Score), Some(ModelFormat::Onnx)),
+        ("harrier", Role::Encoder, Transport::Grpc, Some(RequestShape::Score), Some(ModelFormat::Gguf)),
+    ].into_iter().map(|(name, role, transport, request_shape, model_format)| (
         TierName::new(name).expect("built-in tier names are valid"),
         Tier { role, transport, request_shape },
-        Params {
-            computation, model: None, config: None, endpoint: None, timeout_ms: None,
-            enabled: None,
-        },
+        Params { model_format, model: None, config: None, endpoint: None, timeout_ms: None, enabled: None },
     )).collect()
+
 }
 
 fn tier_configs_from(raw: Vec<RawTier>) -> Result<Vec<TierConfig>, Box<dyn Error>> {
@@ -81,17 +79,11 @@ fn tier_configs_from(raw: Vec<RawTier>) -> Result<Vec<TierConfig>, Box<dyn Error
         }
         let definition = Tier { role: tier.executor, transport: tier.transport, request_shape: tier.request_shape };
         definition.validate().map_err(|reason| format!("[[tier]] {label:?}: {reason}"))?;
-        let computation = match (tier.computation, definition.implied_computation()) {
-            (Some(computation), _) | (None, Some(computation)) => computation,
-            (None, None) => {
-                return Err(format!("[[tier]] {label:?}: an encoder must declare `computation` (\"onnx\" or \"gguf\")").into());
-            }
-        };
-        if !definition.accepts(computation) {
-            return Err(format!(
-                "[[tier]] {label:?}: a {} tier cannot run computation {:?}",
-                definition.role.as_str(), computation.as_str()
-            ).into());
+        if definition.role == Role::Encoder && tier.model_format.is_none() {
+            return Err(format!("[[tier]] {label:?}: encoder must declare model_format (onnx or gguf)").into());
+        }
+        if !definition.accepts(tier.model_format) {
+            return Err(format!("[[tier]] {label:?}: model_format {:?} is incompatible with {} executor", tier.model_format.map(ModelFormat::as_str), definition.role.as_str()).into());
         }
         if definition.role != Role::Encoder && (tier.endpoint.is_some() || tier.timeout_ms.is_some()) {
             return Err(format!("[[tier]] {label:?}: endpoint/timeout_ms require grpc transport").into());
@@ -117,7 +109,7 @@ fn tier_configs_from(raw: Vec<RawTier>) -> Result<Vec<TierConfig>, Box<dyn Error
             name,
             definition,
             Params {
-                computation, model: tier.model, config: tier.config, endpoint: tier.endpoint,
+                model_format: tier.model_format, model: tier.model, config: tier.config, endpoint: tier.endpoint,
                 timeout_ms: tier.timeout_ms, enabled: tier.enabled,
             },
         ));
@@ -404,14 +396,14 @@ mod tests {
             [[tier]]
             name = "modernbert"
             executor = "scorer"
-            computation = "onnx"
+            model_format = "onnx"
             transport = "grpc"
             request_shape = "score_tasks"
             endpoint = "http://127.0.0.1:50052"
             [[tier]]
             name = "harrier"
             executor = "scorer"
-            computation = "onnx"
+            model_format = "onnx"
             transport = "grpc"
             request_shape = "score_tasks"
             endpoint = "http://127.0.0.1:50051"
@@ -432,14 +424,14 @@ mod tests {
             [[tier]]
             name = "a"
             executor = "scorer"
-            computation = "onnx"
+            model_format = "onnx"
             transport = "grpc"
             request_shape = "score"
             endpoint = "http://127.0.0.1:50051"
             [[tier]]
             name = "b"
             executor = "scorer"
-            computation = "onnx"
+            model_format = "onnx"
             transport = "grpc"
             request_shape = "score"
             endpoint = "http://127.0.0.1:50052"
@@ -455,7 +447,7 @@ mod tests {
             [[tier]]
             name = "zeta"
             executor = "scorer"
-            computation = "onnx"
+            model_format = "onnx"
             transport = "grpc"
             request_shape = "score"
             endpoint = "http://127.0.0.1:50051"
@@ -533,26 +525,26 @@ mod tests {
     }
 
     #[test]
-    fn two_instances_of_one_tier_declare_their_own_computation_and_model() {
+    fn two_instances_of_one_tier_declare_their_own_model_format_and_model() {
         let cfg = parse(&with_tiers(r#"
             [[tier]]
             name = "a"
             executor = "encoder"
-            computation = "onnx"
+            model_format = "onnx"
             transport = "grpc"
             request_shape = "score"
             model = "modernbert-base"
             [[tier]]
             name = "b"
             role = "encoder"
-            computation = "gguf"
+            model_format = "gguf"
             transport = "grpc"
             request_shape = "score"
             model = "harrier-270m"
         "#)).unwrap();
         assert_eq!(cfg.tiers[0].tier, cfg.tiers[1].tier);
-        assert_eq!(cfg.tiers[0].params.computation, Computation::Onnx);
-        assert_eq!(cfg.tiers[1].params.computation, Computation::Gguf);
+        assert_eq!(cfg.tiers[0].params.model_format, Some(ModelFormat::Onnx));
+        assert_eq!(cfg.tiers[1].params.model_format, Some(ModelFormat::Gguf));
         assert_eq!(cfg.tiers[1].params.model.as_deref(), Some("harrier-270m"));
     }
 
@@ -571,7 +563,7 @@ mod tests {
             model = "models/large.bin"
         "#)).unwrap();
         assert_eq!(cfg.tiers.len(), 2);
-        assert_eq!(cfg.tiers[0].params.computation, Computation::FastText);
+        assert_eq!(cfg.tiers[0].params.model_format, None);
     }
 
     #[test]
@@ -584,7 +576,7 @@ mod tests {
             [[tier]]
             name = "b"
             executor = "scorer"
-            computation = "onnx"
+            model_format = "onnx"
             transport = "grpc"
             request_shape = "score"
         "#)).unwrap();
@@ -593,7 +585,7 @@ mod tests {
     }
 
     #[test]
-    fn an_encoder_must_declare_a_computation_that_fits_its_role() {
+    fn an_encoder_must_declare_a_model_format_and_other_roles_reject_one() {
         let missing = with_tiers(r#"
             [[tier]]
             name = "a"
@@ -605,19 +597,19 @@ mod tests {
             executor = "rules"
             transport = "in_process"
         "#);
-        assert!(parse(&missing).is_err_and(|e| e.to_string().contains("must declare `computation`")));
+        assert!(parse(&missing).is_err_and(|e| e.to_string().contains("must declare model_format")));
         let misfit = with_tiers(r#"
             [[tier]]
             name = "a"
             role = "rules"
-            computation = "onnx"
+            model_format = "onnx"
             transport = "in_process"
             [[tier]]
             name = "b"
             role = "rules"
             transport = "in_process"
         "#);
-        assert!(parse(&misfit).is_err_and(|e| e.to_string().contains("cannot run computation")));
+        assert!(parse(&misfit).is_err_and(|e| e.to_string().contains("model_format")));
     }
 
     #[test]

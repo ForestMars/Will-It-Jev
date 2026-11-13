@@ -5,7 +5,7 @@
 //   Tier          the reusable definition: a role, how it is reached, and, for an
 //                 encoder, which RPC contract it speaks. No instance parameters.
 //   Params        what distinguishes one instance of a Tier from another: the
-//                 computation it runs, its model, rule file, endpoint, timeout.
+//                 model format and model, rule file, endpoint, timeout.
 //   TierInstance  a Tier plus resolved instance parameters, loaded artifacts, and runner,
 //                 TierId generated. It keeps everything it was built from.
 //
@@ -88,27 +88,17 @@ impl RequestShape {
     }
 }
 
-/// How an instance realizes its Tier.
+/// The on-disk representation of an encoder model artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-pub enum Computation {
-    #[serde(rename = "automaton")]
-    Automaton,
-    #[serde(rename = "fasttext")]
-    FastText,
+pub enum ModelFormat {
     #[serde(rename = "onnx")]
     Onnx,
     #[serde(rename = "gguf")]
     Gguf,
 }
-
-impl Computation {
+impl ModelFormat {
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Automaton => "automaton",
-            Self::FastText => "fasttext",
-            Self::Onnx => "onnx",
-            Self::Gguf => "gguf",
-        }
+        match self { Self::Onnx => "onnx", Self::Gguf => "gguf" }
     }
 }
 
@@ -135,22 +125,10 @@ impl Tier {
         }
     }
 
-    pub fn accepts(&self, computation: Computation) -> bool {
-        matches!(
-            (self.role, computation),
-            (Role::Rules, Computation::Automaton)
-                | (Role::FastText, Computation::FastText)
-                | (Role::Encoder, Computation::Onnx | Computation::Gguf)
-        )
-    }
-
-    /// The computation a role implies when configuration does not state one.
-    pub fn implied_computation(&self) -> Option<Computation> {
-        match self.role {
-            Role::Rules => Some(Computation::Automaton),
-            Role::FastText => Some(Computation::FastText),
-            Role::Encoder => None,
-        }
+    pub fn accepts(&self, model_format: Option<ModelFormat>) -> bool {
+        matches!((self.role, model_format),
+            (Role::Rules | Role::FastText, None)
+                | (Role::Encoder, Some(ModelFormat::Onnx | ModelFormat::Gguf)))
     }
 }
 
@@ -159,7 +137,8 @@ impl Tier {
 /// What distinguishes one instance of a Tier from another.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Params {
-    pub computation: Computation,
+    /// Encoder only: artifact representation, not inference runtime.
+    pub model_format: Option<ModelFormat>,
     /// fasttext: path to the model file. encoder: the model name the sidecar is
     /// expected to report; a different `model_id` in a response is logged once.
     pub model: Option<String>,
@@ -288,11 +267,8 @@ impl TierInstance {
     /// already be resolved: every value the tier needs is on it.
     pub fn build(name: TierName, tier: Tier, params: Params) -> Result<Self, Box<dyn Error>> {
         tier.validate().map_err(|reason| format!("tier {name}: {reason}"))?;
-        if !tier.accepts(params.computation) {
-            return Err(format!(
-                "tier {name}: a {} tier cannot run computation {:?}",
-                tier.role.as_str(), params.computation.as_str()
-            ).into());
+        if !tier.accepts(params.model_format) {
+            return Err(format!("tier {name}: model_format {:?} is incompatible with {} executor", params.model_format.map(ModelFormat::as_str), tier.role.as_str()).into());
         }
         let (runner, artifact_hash) = match tier.role {
             Role::Rules => {
@@ -336,7 +312,7 @@ impl TierInstance {
     }
 
     /// The generated identity includes the authored TierName and the
-    /// behaviorally significant computation/model/artifact inputs. Endpoint,
+    /// behaviorally significant model-format/model/artifact inputs. Endpoint,
     /// transport, invocation protocol, timeout and enabled state are deployment
     /// details and do not invalidate calibration.
     pub fn derive_id(
@@ -354,7 +330,7 @@ impl TierInstance {
         };
         field("tier_name", name.as_str());
         field("role", tier.role.as_str());
-        field("computation", params.computation.as_str());
+        field("model_format", params.model_format.map(ModelFormat::as_str).unwrap_or(""));
         field("model", params.model.as_deref().unwrap_or(""));
         field("artifact", &artifact_hash.map(|hash| hex(hash)).unwrap_or_default());
         TierId::from_digest(&digest.finalize())
@@ -534,7 +510,7 @@ impl TierInstance {
 
 #[cfg(test)]
 impl TierInstance {
-    /// An instance whose computation is a test double. The model is the name, so
+    /// An instance whose executor is a test double. The model is the name, so
     /// instances built from different names have different ids.
     pub fn fake(name: &str, fake: Arc<dyn FakeEvaluate>) -> Self {
         Self::fake_with_model(name, name, fake)
@@ -543,7 +519,7 @@ impl TierInstance {
     pub fn fake_with_model(name: &str, model: &str, fake: Arc<dyn FakeEvaluate>) -> Self {
         let tier = Tier { role: Role::Rules, transport: Transport::InProcess, request_shape: None };
         let params = Params {
-            computation: Computation::Automaton, model: Some(model.to_string()), config: None,
+            model_format: None, model: Some(model.to_string()), config: None,
             endpoint: None, timeout_ms: None, enabled: None,
         };
         Self::assemble(
@@ -555,7 +531,7 @@ impl TierInstance {
     pub fn encoder(name: &str, shape: RequestShape, model: Option<&str>, runner: Tier3Runner) -> Self {
         let tier = Tier { role: Role::Encoder, transport: Transport::Grpc, request_shape: Some(shape) };
         let params = Params {
-            computation: Computation::Onnx, model: model.map(str::to_string), config: None,
+            model_format: Some(ModelFormat::Onnx), model: model.map(str::to_string), config: None,
             endpoint: Some("http://127.0.0.1:9".into()), timeout_ms: Some(250), enabled: None,
         };
         Self::assemble(
@@ -678,12 +654,12 @@ mod tests {
         format!("http://{address}")
     }
 
-    fn encoder_config(name: &str, computation: Computation, model: Option<&str>, endpoint: &str) -> (TierName, Tier, Params) {
+    fn encoder_config(name: &str, model_format: ModelFormat, model: Option<&str>, endpoint: &str) -> (TierName, Tier, Params) {
         (
             TierName::new(name).unwrap(),
             Tier { role: Role::Encoder, transport: Transport::Grpc, request_shape: Some(RequestShape::Score) },
             Params {
-                computation, model: model.map(str::to_string), config: None,
+                model_format: Some(model_format), model: model.map(str::to_string), config: None,
                 endpoint: Some(endpoint.to_string()), timeout_ms: Some(250), enabled: None,
             },
         )
@@ -694,7 +670,7 @@ mod tests {
             TierName::new(name).unwrap(),
             Tier { role: Role::Rules, transport: Transport::InProcess, request_shape: None },
             Params {
-                computation: Computation::Automaton, model: None, config: config.map(str::to_string),
+                model_format: None, model: None, config: config.map(str::to_string),
                 endpoint: None, timeout_ms: None, enabled: None,
             },
         )
@@ -706,7 +682,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_instance_keeps_everything_it_was_built_from() {
-        let entry = encoder_config("enc-a", Computation::Onnx, Some("model-a"), "http://127.0.0.1:9");
+        let entry = encoder_config("enc-a", ModelFormat::Onnx, Some("model-a"), "http://127.0.0.1:9");
         let instance = build_entry(entry.clone()).unwrap();
         assert_eq!(instance.name(), &entry.0);
         assert_eq!(instance.tier(), &entry.1);
@@ -715,29 +691,29 @@ mod tests {
 
     #[tokio::test]
     async fn two_instances_of_one_tier_differ_by_their_parameters_and_so_by_id() {
-        let onnx = build_entry(encoder_config("enc-a", Computation::Onnx, Some("modernbert"), "http://127.0.0.1:9")).unwrap();
-        let gguf = build_entry(encoder_config("enc-b", Computation::Gguf, Some("harrier"), "http://127.0.0.1:9")).unwrap();
+        let onnx = build_entry(encoder_config("enc-a", ModelFormat::Onnx, Some("modernbert"), "http://127.0.0.1:9")).unwrap();
+        let gguf = build_entry(encoder_config("enc-b", ModelFormat::Gguf, Some("harrier"), "http://127.0.0.1:9")).unwrap();
         assert_eq!(onnx.tier(), gguf.tier());
         assert_ne!(onnx.id(), gguf.id());
     }
 
     #[tokio::test]
     async fn id_includes_the_tier_name_and_model_but_not_the_endpoint() {
-        let base = build_entry(encoder_config("enc-a", Computation::Onnx, Some("m"), "http://127.0.0.1:9")).unwrap();
-        let renamed = build_entry(encoder_config("renamed", Computation::Onnx, Some("m"), "http://127.0.0.1:9")).unwrap();
-        let moved = build_entry(encoder_config("enc-a", Computation::Onnx, Some("m"), "http://127.0.0.2:9")).unwrap();
-        let swapped = build_entry(encoder_config("enc-a", Computation::Onnx, Some("oryn"), "http://127.0.0.1:9")).unwrap();
+        let base = build_entry(encoder_config("enc-a", ModelFormat::Onnx, Some("m"), "http://127.0.0.1:9")).unwrap();
+        let renamed = build_entry(encoder_config("renamed", ModelFormat::Onnx, Some("m"), "http://127.0.0.1:9")).unwrap();
+        let moved = build_entry(encoder_config("enc-a", ModelFormat::Onnx, Some("m"), "http://127.0.0.2:9")).unwrap();
+        let swapped = build_entry(encoder_config("enc-a", ModelFormat::Onnx, Some("oryn"), "http://127.0.0.1:9")).unwrap();
         assert_ne!(base.id(), renamed.id());
         assert_eq!(base.id(), moved.id());
         assert_ne!(base.id(), swapped.id());
     }
 
     #[test]
-    fn a_computation_that_does_not_fit_the_role_is_rejected() {
+    fn a_model_format_that_does_not_fit_the_role_is_rejected() {
         let (name, tier, mut params) = rules_config("rules-a", Some("config/tier1.toml"));
-        params.computation = Computation::Onnx;
+        params.model_format = Some(ModelFormat::Onnx);
         let error = TierInstance::build(name, tier, params).err().expect("must fail");
-        assert!(error.to_string().contains("cannot run computation"));
+        assert!(error.to_string().contains("model_format"));
     }
 
     #[test]
@@ -766,7 +742,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_sidecar_call_is_labelled_by_model_not_by_name() {
-        let instance = build_entry(encoder_config("enc-a", Computation::Onnx, Some("model-a"), "http://127.0.0.1:9")).unwrap();
+        let instance = build_entry(encoder_config("enc-a", ModelFormat::Onnx, Some("model-a"), "http://127.0.0.1:9")).unwrap();
         let tasks = [String::from("route")];
         let output = instance
             .evaluate(&TierContext { prompt: "test", tasks: &tasks, task_profiles: &[], budget: Duration::from_millis(500) })
