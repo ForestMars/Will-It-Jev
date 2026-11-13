@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tonic::transport::Channel;
 
-use crate::pipeline::task::{OutputKind, TaskProfile};
+use crate::pipeline::task::{OutputKind, Task};
 
 use super::tier3_proto::{
     tier3_scorer_client::Tier3ScorerClient, ScoreRequest, ScoreTasksRequest,

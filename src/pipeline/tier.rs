@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use super::identity::{TierId, TierName};
+use super::tier_types::{TierId, TierName};
 use super::task::{OutputKind, Reading, Task, TierReading, LABEL_JEV, LABEL_LLM};
 use crate::router::tier1_runner::{Tier1Automaton, Tier1Engine};
 use crate::router::tier2_runner::{Tier2Outcome, Tier2Route, Tier2Runner};
@@ -760,7 +760,7 @@ mod tests {
         let tasks = [String::from("route"), String::from("tag")];
         let profiles = [
             Task {
-                cascade: super::task::Cascade::default(),
+                cascade: crate::pipeline::task::Cascade::default(),
                 name: String::from("route"),
                 output_kind: OutputKind::Binary,
                 labels: None,
@@ -769,7 +769,7 @@ mod tests {
                 fallback: super::super::task::FallbackPolicy::Defer,
             },
             Task {
-                cascade: super::task::Cascade::default(),
+                cascade: crate::pipeline::task::Cascade::default(),
                 name: String::from("tag"),
                 output_kind: OutputKind::Multiclass,
                 labels: None,
@@ -794,7 +794,7 @@ mod tests {
         let tier = TierInstance::encoder("route-scorer", RequestShape::ScoreTasks, None, scorer);
         let tasks = [String::from("route")];
         let profiles = [Task {
-            cascade: super::task::Cascade::default(),
+            cascade: crate::pipeline::task::Cascade::default(),
             name: String::from("route"),
             output_kind: OutputKind::Binary,
             labels: None,
@@ -822,7 +822,7 @@ mod tests {
         let tier = TierInstance::encoder("no-joint", RequestShape::ScoreTasks, None, scorer);
         let tasks = [String::from("route")];
         let profiles = [Task {
-            cascade: super::task::Cascade::default(),
+            cascade: crate::pipeline::task::Cascade::default(),
             name: String::from("route"),
             output_kind: OutputKind::Binary,
             labels: None,

@@ -338,6 +338,18 @@ mod tests {
 
     type TierCallLog = Arc<Mutex<Vec<(String, Vec<String>)>>>;
 
+    struct IdentityOnly;
+    #[async_trait]
+    impl FakeEvaluate for IdentityOnly {
+        async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
+            TierOutput::abstain_all("identity-only", ctx.tasks, "test")
+        }
+    }
+
+    fn tier_id(name: &str) -> TierId {
+        *TierInstance::fake(name, Arc::new(IdentityOnly)).id()
+    }
+
     fn test_graph(registry: &TierRegistry, paths: &[(&str, &[&str])]) -> CascadeGraph {
         let paths: BTreeMap<String, Vec<TierId>> = paths.iter().map(|(task, names)| (
             (*task).to_string(),
@@ -386,7 +398,7 @@ mod tests {
 
     fn route_profile() -> Task {
         Task {
-            cascade: super::task::Cascade::default(),
+            cascade: crate::pipeline::task::Cascade::default(),
             name: String::from("route"),
             output_kind: OutputKind::Binary,
             labels: Some(vec![LABEL_JEV.into(), LABEL_LLM.into()]),
@@ -398,7 +410,7 @@ mod tests {
 
     fn tag_profile(labels: Option<Vec<String>>) -> Task {
         Task {
-            cascade: super::task::Cascade::default(),
+            cascade: crate::pipeline::task::Cascade::default(),
             name: String::from("tag"),
             output_kind: OutputKind::Multiclass,
             labels,
@@ -432,7 +444,7 @@ mod tests {
         let mut by_task = BTreeMap::new();
         by_task.insert(String::from("route"), TierPolicy::new(0.95).with_label(LABEL_LLM, 0.70));
         by_task.insert(String::from("tag"), TierPolicy::new(0.80));
-        policies.insert(tname("modernbert"), by_task);
+        policies.insert(tier_id("modernbert"), by_task);
 
         let result = runner.run("prompt", &profiles, &policies, Duration::from_secs(1)).await;
         let calls = calls.lock().unwrap();
@@ -477,8 +489,8 @@ mod tests {
         ], &[("route", &["rules"]), ("tag", &["modernbert"])]));
         let profiles = vec![route_profile(), tag_profile(Some(vec!["help_desk".into()]))];
         let policies: TierPolicyMap = [
-            (tname("rules"), [(String::from("route"), TierPolicy::new(0.9))].into()),
-            (tname("modernbert"), [(String::from("tag"), TierPolicy::new(0.8))].into()),
+            (tier_id("rules"), [(String::from("route"), TierPolicy::new(0.9))].into()),
+            (tier_id("modernbert"), [(String::from("tag"), TierPolicy::new(0.8))].into()),
         ].into();
         let split = runner.run_split(
             "prompt".into(),
@@ -526,7 +538,7 @@ mod tests {
         ], &[("route", &["zulu", "alpha", "mike"])]);
         let policies: TierPolicyMap = ["zulu", "alpha", "mike"]
             .into_iter()
-            .map(|name| (tname(name), [(String::from("route"), TierPolicy::new(0.9))].into()))
+            .map(|name| (tier_id(name), [(String::from("route"), TierPolicy::new(0.9))].into()))
             .collect();
 
         let result = runner
@@ -545,9 +557,9 @@ mod tests {
     async fn a_new_named_tier_can_be_inserted_between_existing_tiers() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let policies: TierPolicyMap = [
-            (tname("fasttext"), [(String::from("route"), TierPolicy::new(0.95))].into()),
-            (tname("prefilter"), [(String::from("route"), TierPolicy::new(0.80))].into()),
-            (tname("modernbert"), [(String::from("route"), TierPolicy::new(0.95))].into()),
+            (tier_id("fasttext"), [(String::from("route"), TierPolicy::new(0.95))].into()),
+            (tier_id("prefilter"), [(String::from("route"), TierPolicy::new(0.80))].into()),
+            (tier_id("modernbert"), [(String::from("route"), TierPolicy::new(0.95))].into()),
         ].into();
 
         let before = test_runner(vec![
@@ -567,7 +579,7 @@ mod tests {
         assert!(resolved_at(&outcome.tasks[&String::from("route")].resolution, "prefilter"));
         let order: Vec<String> = calls.lock().unwrap().iter().map(|(name, _)| name.clone()).collect();
         assert_eq!(order, ["fasttext", "prefilter"], "modernbert must not run once prefilter resolves");
-        assert_eq!(after.directory().slot(&tname("prefilter")).map(Slot::index), Some(1));
+        assert_eq!(after.directory().slot(&tier_id("prefilter")).map(Slot::index), Some(1));
     }
 
     #[tokio::test]
@@ -595,8 +607,8 @@ mod tests {
             &calls,
         ))], &[("route", &["rules"])]);
         let policies: TierPolicyMap = [
-            (tname("rules"), [(String::from("route"), TierPolicy::new(0.95))].into()),
-            (tname("ghost"), [(String::from("route"), TierPolicy::new(0.10))].into()),
+            (tier_id("rules"), [(String::from("route"), TierPolicy::new(0.95))].into()),
+            (tier_id("ghost"), [(String::from("route"), TierPolicy::new(0.10))].into()),
         ].into();
         let outcome = runner.run("p", &[route_profile()], &policies, Duration::from_secs(1)).await;
         assert!(resolved_at(&outcome.tasks[&String::from("route")].resolution, "rules"));

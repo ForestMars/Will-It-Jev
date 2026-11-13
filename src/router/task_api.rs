@@ -25,10 +25,10 @@ use uuid::Uuid;
 
 use crate::pipeline::{
     cascade::CascadeGraph,
-    identity::Slot,
+    tier_types::Slot,
     registry::TierDirectory,
     runner::{CascadeRunner, Resolution, RunOutcome, TaskOutcome},
-    task::{Decision, String, Task, TierPolicyMap, TierReading},
+    task::{Decision, Task, TierPolicyMap, TierReading},
 };
 
 const RUN_TTL: Duration = Duration::from_secs(900);
@@ -364,7 +364,7 @@ fn task_outcome_json(outcome: &TaskOutcome, tiers: &TierDirectory) -> Value {
 mod tests {
     use super::*;
     use crate::pipeline::{
-        identity::{tname, TierName},
+        tier_types::{tname, TierId, TierName},
         registry::TierRegistry,
         task::{FallbackPolicy, OutputKind, Reading, TierPolicy},
         tier::{FakeEvaluate, TierContext, TierInstance, TierOutput},

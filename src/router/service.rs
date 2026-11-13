@@ -19,12 +19,12 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::legacy_tiers::LegacyTierNumbers;
-use crate::pipeline::identity::{Slot, TierId, FALLBACK_TIER_NAME};
+use crate::pipeline::tier_types::{Slot, TierId, FALLBACK_TIER_NAME};
 use crate::pipeline::registry::TierDirectory;
 use crate::pipeline::runner::{CascadeRunner, Resolution, RunOutcome, TierTrace};
 use crate::pipeline::tagger::JointTagStore;
 use crate::pipeline::task::{
-    Decision, Reading, String, Task, TierPolicyMap, TierReading, LABEL_JEV, LABEL_LLM,
+    Decision, Reading, Task, TierPolicyMap, TierReading, LABEL_JEV, LABEL_LLM,
 };
 use crate::tagging::{is_sampled, TagInput, TagQueue};
 use crate::telemetry::{
@@ -441,6 +441,7 @@ fn route_record(
                 latency_ms,
                 resolving_tier: None,
                 resolving_tier_name: None,
+                resolving_tier_id: None,
                 model_id: None,
                 label: None,
                 confidence: None,
@@ -673,7 +674,7 @@ mod tests {
 
     // ---- tier identity in the route record ---------------------------------
 
-    use crate::pipeline::identity::tname;
+    use crate::pipeline::tier_types::tname;
     use crate::pipeline::registry::TierRegistry;
     use crate::pipeline::runner::TaskOutcome;
     use crate::pipeline::task::{FallbackPolicy, OutputKind};

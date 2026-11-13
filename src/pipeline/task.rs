@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn multilabel_resolution_applies_thresholds_independently() {
-        let profile = Task {
+        let profile: Task = Task {
             cascade: Cascade::default(),
             name: String::from("risk_flags"),
             output_kind: OutputKind::Multilabel,
@@ -311,7 +311,7 @@ mod tests {
     #[test]
     fn an_observing_policy_records_the_reading_and_never_resolves() {
         let profile = Task {
-            cascade: super::task::Cascade::default(),
+            cascade: crate::pipeline::task::Cascade::default(),
             name: String::from("urgency"),
             output_kind: OutputKind::Multiclass,
             labels: None,
@@ -346,7 +346,7 @@ mod tests {
     #[test]
     fn unsupported_task_is_not_an_ordinary_model_abstention() {
         let profile = Task {
-            cascade: super::task::Cascade::default(),
+            cascade: crate::pipeline::task::Cascade::default(),
             name: String::from("tag"),
             output_kind: OutputKind::Multiclass,
             labels: None,
@@ -361,7 +361,7 @@ mod tests {
     #[test]
     fn task_profile_contains_no_tier_calibration() {
         let profile = Task {
-            cascade: super::task::Cascade::default(),
+            cascade: crate::pipeline::task::Cascade::default(),
             name: String::from("route"),
             output_kind: OutputKind::Binary,
             labels: Some(vec![LABEL_JEV.into(), LABEL_LLM.into()]),
@@ -377,7 +377,7 @@ mod tests {
     #[test]
     fn policy_is_supplied_independently_of_task_definition() {
         let profile = Task {
-            cascade: super::task::Cascade::default(),
+            cascade: crate::pipeline::task::Cascade::default(),
             name: String::from("route"),
             output_kind: OutputKind::Binary,
             labels: Some(vec![LABEL_JEV.into(), LABEL_LLM.into()]),
@@ -401,7 +401,7 @@ mod tests {
     #[test]
     fn rejects_unknown_labels_and_non_finite_confidence() {
         let profile = Task {
-            cascade: super::task::Cascade::default(),
+            cascade: crate::pipeline::task::Cascade::default(),
             name: String::from("route"),
             output_kind: OutputKind::Binary,
             labels: Some(vec![LABEL_JEV.into(), LABEL_LLM.into()]),

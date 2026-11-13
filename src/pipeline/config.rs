@@ -542,9 +542,9 @@ mod tests {
             request_shape = "score"
             model = "harrier-270m"
         "#)).unwrap();
-        assert_eq!(cfg.tiers[0].tier, cfg.tiers[1].tier);
-        assert_eq!(cfg.tiers[0].params.model_format, Some(ModelFormat::Onnx));
-        assert_eq!(cfg.tiers[1].params.model_format, Some(ModelFormat::Gguf));
+        assert_eq!(cfg.tiers[0].1, cfg.tiers[1].1);
+        assert_eq!(cfg.tiers[0].2.model_format, Some(ModelFormat::Onnx));
+        assert_eq!(cfg.tiers[1].2.model_format, Some(ModelFormat::Gguf));
         assert_eq!(cfg.tiers[1].params.model.as_deref(), Some("harrier-270m"));
     }
 
