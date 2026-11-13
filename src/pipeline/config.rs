@@ -489,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_and_duplicate_tier_ids_in_task_paths() {
+    fn graph_rejects_unknown_and_duplicate_tier_names_in_task_paths() {
         let prefix = "[task.route]\nfallback_label = \"needs_llm\"\n";
         let tier = "[[tier]]\nname=\"rules\"\nexecutor=\"rules\"\ntransport=\"in_process\"\n";
         let unknown = parse(&format!("{prefix}cascade = [\"rules\", \"unknown\"]\n{tier}")).unwrap();
@@ -702,7 +702,7 @@ mod tests {
         assert_eq!(cfg.legacy.ordinal_of(&name("a")), Some(1));
         assert_eq!(cfg.legacy.name_of(2), Some(&name("b")));
         // The old per-tier key no longer exists.
-        let on_the_tier = TWO_TIERS.replace("role = \"rules\"", "role = \"rules\"\n        legacy_ordinal = 1");
+        let on_the_tier = TWO_TIERS.replace("executor = \"rules\"", "executor = \"rules\"\n        legacy_ordinal = 1");
         assert!(parse(&on_the_tier).is_err());
     }
 
