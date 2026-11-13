@@ -6,14 +6,15 @@
 //                 encoder, which RPC contract it speaks. No instance parameters.
 //   Params        what distinguishes one instance of a Tier from another: the
 //                 model format and model, rule file, endpoint, timeout.
-//   TierInstance  a Tier plus resolved instance parameters, loaded artifacts, and runner,
-//                 TierId generated. It keeps everything it was built from.
+//   TierInstance  a Tier plus resolved instance parameters, loaded artifacts, and runner.
+//                 CascadeGraph assigns its TierId using TierInstance::derive_id.
 //
 // A tier returns raw readings for the task IDs it can serve; all task-specific
 // acceptance policy lives outside this module.
 
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -24,11 +25,89 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use super::tier_types::{TierId, TierName};
 use super::task::{OutputKind, Reading, Task, TierReading, LABEL_JEV, LABEL_LLM};
 use crate::router::tier1_runner::{Tier1Automaton, Tier1Engine};
 use crate::router::tier2_runner::{Tier2Outcome, Tier2Route, Tier2Runner};
 use crate::router::tier3_runner::{TasksError, Tier3Runner};
+
+// ---- authored tier name ----------------------------------------------------
+
+/// Authored name of a declared tier. The registry uses it to retrieve the
+/// concrete TierInstance built from that declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
+#[serde(try_from = "String")]
+pub struct TierName(String);
+
+/// Reserved name used in route records when a task resolves through fallback.
+pub const FALLBACK_TIER_NAME: &str = "fallback";
+
+/// Error validating a TierName or parsing a TierId.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TierTypeError(String);
+
+impl fmt::Display for TierTypeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for TierTypeError {}
+
+const MAX_TIER_NAME_LEN: usize = 32;
+
+impl TierName {
+    /// A tier name is 1 to 32 characters: a lowercase ASCII letter followed by
+    /// lowercase letters, digits, `_` or `-`.
+    pub fn new(name: impl Into<String>) -> Result<Self, TierTypeError> {
+        let name = name.into();
+        let mut chars = name.chars();
+        let valid = !name.is_empty()
+            && name.len() <= MAX_TIER_NAME_LEN
+            && chars.next().is_some_and(|c| c.is_ascii_lowercase())
+            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+        if !valid {
+            return Err(TierTypeError(format!(
+                "invalid tier name {name:?}: use 1 to {MAX_TIER_NAME_LEN} characters, starting with a \
+                 lowercase letter, then lowercase letters, digits, '_' or '-'"
+            )));
+        }
+        if name == FALLBACK_TIER_NAME {
+            return Err(TierTypeError(format!(
+                "tier name {FALLBACK_TIER_NAME:?} is reserved for task fallbacks"
+            )));
+        }
+        if name.strip_prefix("tier").is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())) {
+            return Err(TierTypeError(format!(
+                "tier name {name:?} is reserved: `tierN` is the alias for a tier numbered in [legacy_tiers]"
+            )));
+        }
+        Ok(Self(name))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for TierName {
+    type Error = TierTypeError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl fmt::Display for TierName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Shorthand for tests, where tier names are literals.
+#[cfg(test)]
+pub fn tname(name: &str) -> TierName {
+    TierName::new(name).expect("test tier name must be valid")
+}
 
 // ---- definition ------------------------------------------------------------
 
@@ -246,6 +325,51 @@ pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+// ---- TierId ----------------------------------------------------------------
+
+/// Generated TierId for a concrete TierInstance. `TierInstance::derive_id`
+/// hashes its authored name, role, model format, model value and artifact hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TierId([u8; 16]);
+
+impl TierId {
+    pub const LEN: usize = 16;
+
+    pub fn from_digest(digest: &[u8]) -> Self {
+        let mut bytes = [0u8; Self::LEN];
+        bytes.copy_from_slice(&digest[..Self::LEN]);
+        Self(bytes)
+    }
+
+    pub fn parse(hex: &str) -> Result<Self, TierTypeError> {
+        let bad = || TierTypeError(format!("invalid tier id {hex:?}: expected {} hex characters", Self::LEN * 2));
+        if hex.len() != Self::LEN * 2 || !hex.is_ascii() {
+            return Err(bad());
+        }
+        let mut bytes = [0u8; Self::LEN];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map_err(|_| bad())?;
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl fmt::Display for TierId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for TierId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::parse(&text).map_err(serde::de::Error::custom)
+    }
+}
+
 // ---- instance --------------------------------------------------------------
 
 /// A Tier plus the parameters that distinguish this instance, loaded and ready to
@@ -309,10 +433,10 @@ impl TierInstance {
         }
     }
 
-    /// The generated identity includes the authored TierName and the
-    /// behaviorally significant model-format/model/artifact inputs. Endpoint,
-    /// transport, invocation protocol, timeout and enabled state are deployment
-    /// details and do not invalidate calibration.
+    /// Derive the TierId for this instance. The hash includes its authored name,
+    /// role, model format, model value and artifact content hash. Endpoint,
+    /// transport, invocation protocol, timeout and enabled state do not
+    /// contribute to the ID.
     pub fn derive_id(
         name: &TierName,
         tier: &Tier,
@@ -572,6 +696,25 @@ mod tests {
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tonic::{Request, Response, Status};
+
+    #[test]
+    fn tier_id_round_trips_through_hex() {
+        let id = TierId::from_digest(&[0xab; 32]);
+        assert_eq!(id.to_string(), "ab".repeat(16));
+        assert_eq!(TierId::parse(&id.to_string()), Ok(id));
+        assert!(TierId::parse("xyz").is_err());
+        assert!(TierId::parse(&"g".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn tier_names_are_validated() {
+        for ok in ["rules", "fasttext", "modernbert", "harrier", "oryn-2", "a", "prefilter_v2"] {
+            assert!(TierName::new(ok).is_ok(), "{ok} should be valid");
+        }
+        for bad in ["", "Rules", "2fast", "has space", "x.y", "fallback", "tier3", &"a".repeat(33)] {
+            assert!(TierName::new(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
 
     #[derive(Clone, Default)]
     struct TestSidecar {

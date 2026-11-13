@@ -13,13 +13,12 @@ use tokio::task::JoinHandle;
 
 use tracing::debug;
 
-use super::cascade::CascadeGraph;
-use super::tier_types::{Slot, TierId, TierName};
+use super::cascade::{CascadeGraph, Slot};
 use super::registry::TierRegistry;
 use super::task::{
     Decision, FallbackPolicy, Reading, Task, TierPolicyMap, TierReading,
 };
-use super::tier::{TierContext, TierInstance};
+use super::tier::{TierContext, TierId, TierInstance, TierName};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Resolution {
@@ -353,7 +352,7 @@ fn build_outcome(
 mod tests {
     use super::*;
     use crate::pipeline::cascade::CascadeGraph;
-    use crate::pipeline::tier_types::tname;
+    use crate::pipeline::tier::tname;
     use crate::pipeline::registry::TierRegistry;
     use crate::pipeline::task::{OutputKind, TierPolicy, LABEL_JEV, LABEL_LLM};
     use crate::pipeline::tier::{FakeEvaluate, TierOutput};

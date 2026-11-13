@@ -24,8 +24,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::pipeline::{
-    cascade::CascadeGraph,
-    tier_types::Slot,
+    cascade::{CascadeGraph, Slot},
     runner::{CascadeRunner, Resolution, RunOutcome, TaskOutcome},
     task::{Decision, Task, TierPolicyMap, TierReading},
 };
@@ -363,7 +362,7 @@ fn task_outcome_json(outcome: &TaskOutcome, tiers: &CascadeGraph) -> Value {
 mod tests {
     use super::*;
     use crate::pipeline::{
-        tier_types::{tname, TierId, TierName},
+        tier::{tname, TierId, TierName},
         registry::TierRegistry,
         task::{FallbackPolicy, OutputKind, Reading, TierPolicy},
         tier::{FakeEvaluate, TierContext, TierInstance, TierOutput},

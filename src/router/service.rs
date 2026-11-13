@@ -19,8 +19,8 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::legacy_tiers::LegacyTierNumbers;
-use crate::pipeline::tier_types::{Slot, TierId, FALLBACK_TIER_NAME};
-use crate::pipeline::cascade::CascadeGraph;
+use crate::pipeline::cascade::{CascadeGraph, Slot};
+use crate::pipeline::tier::{TierId, FALLBACK_TIER_NAME};
 use crate::pipeline::runner::{CascadeRunner, Resolution, RunOutcome, TierTrace};
 use crate::pipeline::tagger::JointTagStore;
 use crate::pipeline::task::{
@@ -672,9 +672,9 @@ mod tests {
         assert_eq!(openai_chat_response(&payload, None), payload);
     }
 
-    // ---- tier identity in the route record ---------------------------------
+    // ---- tier IDs in the route record ---------------------------------
 
-    use crate::pipeline::tier_types::tname;
+    use crate::pipeline::tier::tname;
     use crate::pipeline::registry::TierRegistry;
     use crate::pipeline::runner::TaskOutcome;
     use crate::pipeline::task::{FallbackPolicy, OutputKind};

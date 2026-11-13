@@ -7,8 +7,7 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-use super::tier::TierInstance;
-use super::tier_types::TierName;
+use super::tier::{TierInstance, TierName};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistryError {
@@ -69,7 +68,7 @@ impl TierRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::tier_types::tname;
+    use crate::pipeline::tier::tname;
     use crate::pipeline::tier::{FakeEvaluate, TierContext, TierOutput};
     use async_trait::async_trait;
 

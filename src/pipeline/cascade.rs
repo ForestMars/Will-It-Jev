@@ -8,14 +8,34 @@ use std::error::Error;
 use std::fmt;
 
 use super::registry::TierRegistry;
-use super::tier::TierInstance;
-use super::tier_types::{Slot, TierId, TierName};
+use super::tier::{TierId, TierInstance, TierName};
+
+/// Positional address of a TierId in the graph's compiled topological order.
+/// A slot is derived from the graph and can change when its order changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Slot(u16);
+
+impl Slot {
+    pub fn from_index(index: usize) -> Option<Self> {
+        u16::try_from(index).ok().map(Self)
+    }
+
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl fmt::Display for Slot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CascadeGraphError {
     UnknownTier { task: String, tier: TierName },
     DuplicateTier { task: String, tier: TierName },
-    IdentityCollision { id: TierId, first: TierName, second: TierName },
+    TierIdCollision { id: TierId, first: TierName, second: TierName },
     Cycle { tiers: Vec<TierId> },
 }
 
@@ -26,7 +46,7 @@ impl fmt::Display for CascadeGraphError {
                 write!(f, "task {task} cascade references unavailable tier {tier}"),
             Self::DuplicateTier { task, tier } =>
                 write!(f, "task {task} cascade lists tier {tier} more than once"),
-            Self::IdentityCollision { id, first, second } =>
+            Self::TierIdCollision { id, first, second } =>
                 write!(f, "tiers {first} and {second} generated the same TierId {id}"),
             Self::Cycle { tiers } => write!(
                 f,
@@ -95,7 +115,7 @@ impl CascadeGraph {
 
                 if let Some(existing) = graph.names_by_id.get(&id) {
                     if existing != name {
-                        return Err(CascadeGraphError::IdentityCollision {
+                        return Err(CascadeGraphError::TierIdCollision {
                             id, first: existing.clone(), second: name.clone(),
                         });
                     }
@@ -205,7 +225,7 @@ impl CascadeGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::tier_types::tname;
+    use crate::pipeline::tier::tname;
     use crate::pipeline::tier::{FakeEvaluate, TierContext, TierOutput};
     use async_trait::async_trait;
     use std::sync::Arc;
@@ -216,6 +236,12 @@ mod tests {
         async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
             TierOutput::abstain_all("silent", ctx.tasks, "test")
         }
+    }
+
+    #[test]
+    fn a_slot_is_an_index_and_nothing_more() {
+        assert_eq!(Slot::from_index(3).map(Slot::index), Some(3));
+        assert_eq!(Slot::from_index(70_000), None);
     }
 
     fn registry(names: &[&str]) -> TierRegistry {

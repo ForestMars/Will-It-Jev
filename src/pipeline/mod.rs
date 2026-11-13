@@ -4,7 +4,6 @@
 // policies, and execution-tier implementations are separate interfaces.
 
 pub mod cascade;
-pub mod tier_types;
 pub mod config;
 pub mod registry;
 pub mod runner;
