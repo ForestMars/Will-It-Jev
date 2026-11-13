@@ -303,10 +303,11 @@ fn selected_task_results(
 /// execution order, for clients that want to show the order.
 fn task_outcome_json(outcome: &TaskOutcome, tiers: &TierDirectory) -> Value {
     let resolution = match &outcome.resolution {
-        Resolution::Tier { tier, model_id, reading } => json!({
+        Resolution::Tier { tier_id, tier, model_id, reading } => json!({
             "kind": "tier",
             "tier": tier.as_str(),
-            "position": tiers.slot(tier).map(Slot::index),
+            "tier_id": tier_id.to_string(),
+            "position": tiers.slot(tier_id).map(Slot::index),
             "model_id": model_id,
             "label": reading.label,
             "confidence": reading.confidence,
@@ -349,7 +350,8 @@ fn task_outcome_json(outcome: &TaskOutcome, tiers: &TierDirectory) -> Value {
         };
         json!({
             "tier": entry.tier.as_str(),
-            "position": tiers.slot(&entry.tier).map(Slot::index),
+            "tier_id": entry.tier_id.to_string(),
+            "position": tiers.slot(&entry.tier_id).map(Slot::index),
             "model_id": entry.model_id,
             "reading": reading,
             "decision": decision,

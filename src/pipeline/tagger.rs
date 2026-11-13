@@ -120,7 +120,7 @@ impl<F: Tagger> Tagger for CascadeTagger<F> {
             return self.fallback.tag(input).await;
         };
         match outcome.tasks.get(&String::from("tag")).map(|task| &task.resolution) {
-            Some(Resolution::Tier { tier, model_id, reading }) => {
+            Some(Resolution::Tier { tier_id, tier, model_id, reading }) => {
                 tracing::debug!(request_id = %input.request_id, tier = %tier, model_id,
                     "tag decision reused from request cascade");
                 Ok(TaggerOutput {
@@ -131,6 +131,7 @@ impl<F: Tagger> Tagger for CascadeTagger<F> {
                         output_kind: self.output_kind.clone(),
                         resolving_tier: self.legacy.ordinal_of(tier),
                         resolving_tier_name: Some(tier.to_string()),
+                        resolving_tier_id: Some(tier_id.to_string()),
                         model_id: Some(model_id.clone()),
                         scores: reading.scores.iter().map(|(category_id, score)| {
                             CategoryScore { category_id: category_id.clone(), score: *score }
@@ -148,7 +149,7 @@ impl<F: Tagger> Tagger for CascadeTagger<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::identity::tname;
+    use crate::pipeline::identity::{tname, TierId};
     use std::future::Future;
     use crate::pipeline::runner::{RunOutcome, TaskOutcome};
     use crate::pipeline::runner::Resolution;
@@ -187,6 +188,7 @@ mod tests {
                 String::from("tag"),
                 TaskOutcome {
                     resolution: Resolution::Tier {
+                        tier_id: TierId::from_digest(&[9; 32]),
                         tier: tname("modernbert"),
                         model_id: "shared-encoder".into(),
                         reading: Reading {

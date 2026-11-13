@@ -132,6 +132,8 @@ pub struct TagRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolving_tier_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolving_tier_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_model_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub decision_scores: Vec<CategoryScore>,
