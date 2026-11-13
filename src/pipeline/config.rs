@@ -23,7 +23,7 @@ use crate::legacy_tiers::LegacyTierNumbers;
 use super::cascade::CascadeGraph;
 use super::identity::TierName;
 use super::tier::{Computation, Params, RequestShape, Role, Tier, TierDecl, Transport};
-use super::task::{Cascade, FallbackPolicy, OutputKind, TaskId, TaskLabelMetadata, TaskProfile, TierPolicy, TierPolicyMap};
+use super::task::{Cascade, FallbackPolicy, OutputKind, String, TaskLabelMetadata, Task, TierPolicy, TierPolicyMap};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -235,24 +235,24 @@ pub struct PipelineConfig {
     pub tiers: Vec<TierDecl>,
     /// Union DAG formed from all task-specific cascade paths.
     pub cascades: CascadeGraph,
-    profiles: BTreeMap<TaskId, TaskProfile>,
-    /// Tier policies are a separate registry, not fields on TaskProfile.
+    profiles: BTreeMap<String, Task>,
+    /// Tier policies are a separate registry, not fields on Task.
     pub tier_policies: TierPolicyMap,
     /// Compatibility numbering for numbered telemetry and `[router.tierN]`.
     pub legacy: LegacyTierNumbers,
 }
 
 impl PipelineConfig {
-    pub fn profile(&self, task: &TaskId) -> Option<TaskProfile> {
+    pub fn profile(&self, task: &String) -> Option<Task> {
         self.profiles.get(task).cloned()
     }
 
     /// All configured task contracts, returned in stable task-ID order.
-    pub fn profiles(&self) -> Vec<TaskProfile> {
+    pub fn profiles(&self) -> Vec<Task> {
         self.profiles.values().cloned().collect()
     }
 
-    pub fn has_policy(&self, task: &TaskId) -> bool {
+    pub fn has_policy(&self, task: &String) -> bool {
         self.tier_policies
             .values()
             .any(|by_task| by_task.contains_key(task))
@@ -297,7 +297,7 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
     let mut profiles = BTreeMap::new();
 
     for (name, profile) in raw.task {
-        let task = TaskId::new(name.clone());
+        let task = name.clone();
         let path = match profile.cascade {
             Some(names) => names.into_iter().map(|tier_name| {
                 TierName::new(tier_name.clone()).map_err(|error| format!("task.{name}.cascade: {error}"))
@@ -345,7 +345,7 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
                 return Err(format!("task.{name}: fallback label {label:?} is not in labels").into());
             }
         }
-        profiles.insert(task.clone(), TaskProfile {
+        profiles.insert(task.clone(), Task {
             task, cascade: Cascade { tiers: path }, output_kind: profile.output_kind, labels, label_metadata,
             taxonomy_version, fallback,
         });
@@ -361,7 +361,7 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
         let tier = decl.name.clone();
         let by_task = tier_policies.entry(tier.clone()).or_default();
         for (task_name, policy) in task_policies {
-            let task = TaskId::new(task_name.clone());
+            let task = String::new(task_name.clone());
             let profile = profiles.get(&task).ok_or_else(|| format!(
                 "tier_policy.{tier}.{task_name}: no matching [task.{task_name}] definition"
             ))?;
@@ -422,7 +422,7 @@ mod tests {
         "#).unwrap();
         assert_eq!(cfg.cascades.order().iter().map(TierName::as_str).collect::<Vec<_>>(), ["rules", "modernbert", "harrier"]);
         assert_eq!(cfg.cascades.tasks_using(&TierName::new("modernbert").unwrap()).unwrap().len(), 2);
-        assert!(cfg.cascades.task_uses(&TaskId::tag(), &TierName::new("harrier").unwrap()));
+        assert!(cfg.cascades.task_uses(&String::from("tag"), &TierName::new("harrier").unwrap()));
     }
 
     #[test]
@@ -472,7 +472,7 @@ mod tests {
     fn legacy_config_without_a_named_registry_keeps_the_original_four_tier_path() {
         let cfg = parse("[task.route]\nfallback_label = \"needs_llm\"").unwrap();
         assert_eq!(
-            cfg.cascades.paths()[&TaskId::route()].iter().map(TierName::as_str).collect::<Vec<_>>(),
+            cfg.cascades.paths()[&String::from("route")].iter().map(TierName::as_str).collect::<Vec<_>>(),
             ["rules", "fasttext", "modernbert", "harrier"]
         );
     }
@@ -504,7 +504,7 @@ mod tests {
             "[task.tag]\ntaxonomy = \"../taskonomies/help_desk.json\"\noutput_kind = \"multiclass\"\nfallback = \"defer\"",
             Path::new("config"),
         ).unwrap();
-        let tag = cfg.profile(&TaskId::tag()).unwrap();
+        let tag = cfg.profile(&String::from("tag")).unwrap();
         assert_eq!(tag.output_kind, OutputKind::Multiclass);
         assert_eq!(tag.labels.as_ref().unwrap().len(), 20);
         assert_eq!(tag.taxonomy_version.as_deref(), Some("1.1.0"));
@@ -521,7 +521,7 @@ mod tests {
         for path in cfg.cascades.paths().values() {
             assert!(path.iter().all(|tier| available.contains(tier)));
         }
-        assert!(cfg.has_policy(&TaskId::route()));
+        assert!(cfg.has_policy(&String::from("route")));
         assert!(!cfg.cascades.order().is_empty());
     }
 

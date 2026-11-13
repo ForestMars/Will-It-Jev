@@ -3,12 +3,12 @@ use std::error::Error;
 use std::fmt;
 
 use super::identity::TierName;
-use super::task::TaskId;
+use super::task::String;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CascadeGraphError {
-    UnknownTier { task: TaskId, tier: TierName },
-    DuplicateTier { task: TaskId, tier: TierName },
+    UnknownTier { task: String, tier: TierName },
+    DuplicateTier { task: String, tier: TierName },
     Cycle { tiers: Vec<TierName> },
 }
 
@@ -29,14 +29,14 @@ impl Error for CascadeGraphError {}
 pub struct CascadeEdge {
     pub from: TierName,
     pub to: TierName,
-    pub task: TaskId,
+    pub task: String,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ExecutionPlan {
-    pub requested_tasks: BTreeSet<TaskId>,
+    pub requested_tasks: BTreeSet<String>,
     pub required_nodes: BTreeSet<TierName>,
-    pub task_entries: BTreeMap<TaskId, TierName>,
+    pub task_entries: BTreeMap<String, TierName>,
 }
 
 /// Persistent aggregate graph of task-specific fallback routes. The topological
@@ -46,20 +46,20 @@ pub struct CascadeGraph {
     nodes: BTreeSet<TierName>,
     edges: BTreeSet<CascadeEdge>,
     order: Vec<TierName>,
-    task_entries: BTreeMap<TaskId, TierName>,
-    tasks_by_tier: BTreeMap<TierName, BTreeSet<TaskId>>,
+    task_entries: BTreeMap<String, TierName>,
+    tasks_by_tier: BTreeMap<TierName, BTreeSet<String>>,
 }
 
 impl CascadeGraph {
     pub fn from_task_paths(
-        paths: BTreeMap<TaskId, Vec<TierName>>,
+        paths: BTreeMap<String, Vec<TierName>>,
         registered: &BTreeSet<TierName>,
     ) -> Result<Self, CascadeGraphError> {
         let mut nodes = BTreeSet::new();
         let mut edges = BTreeSet::new();
         let mut successors: BTreeMap<TierName, BTreeSet<TierName>> = BTreeMap::new();
         let mut indegree: BTreeMap<TierName, usize> = BTreeMap::new();
-        let mut tasks_by_tier: BTreeMap<TierName, BTreeSet<TaskId>> = BTreeMap::new();
+        let mut tasks_by_tier: BTreeMap<TierName, BTreeSet<String>> = BTreeMap::new();
         let mut task_entries = BTreeMap::new();
         let mut first_seen: BTreeMap<TierName, usize> = BTreeMap::new();
         let mut next_rank = 0usize;
@@ -138,9 +138,9 @@ impl CascadeGraph {
     pub fn nodes(&self) -> &BTreeSet<TierName> { &self.nodes }
     pub fn edges(&self) -> &BTreeSet<CascadeEdge> { &self.edges }
     pub fn order(&self) -> &[TierName] { &self.order }
-    pub fn task_entries(&self) -> &BTreeMap<TaskId, TierName> { &self.task_entries }
+    pub fn task_entries(&self) -> &BTreeMap<String, TierName> { &self.task_entries }
 
-    pub fn task_path(&self, task: &TaskId) -> Vec<TierName> {
+    pub fn task_path(&self, task: &String) -> Vec<TierName> {
         let mut path = Vec::new();
         let Some(mut current) = self.task_entries.get(task).cloned() else { return path };
         path.push(current.clone());
@@ -151,19 +151,19 @@ impl CascadeGraph {
         path
     }
 
-    pub fn next(&self, task: &TaskId, tier: &TierName) -> Option<&TierName> {
+    pub fn next(&self, task: &String, tier: &TierName) -> Option<&TierName> {
         self.edges.iter().find(|edge| &edge.task == task && &edge.from == tier).map(|edge| &edge.to)
     }
 
-    pub fn task_uses(&self, task: &TaskId, tier: &TierName) -> bool {
+    pub fn task_uses(&self, task: &String, tier: &TierName) -> bool {
         self.tasks_by_tier.get(tier).is_some_and(|tasks| tasks.contains(task))
     }
 
-    pub fn tasks_using(&self, tier: &TierName) -> Option<&BTreeSet<TaskId>> {
+    pub fn tasks_using(&self, tier: &TierName) -> Option<&BTreeSet<String>> {
         self.tasks_by_tier.get(tier)
     }
 
-    pub fn plan(&self, requested_tasks: &BTreeSet<TaskId>) -> ExecutionPlan {
+    pub fn plan(&self, requested_tasks: &BTreeSet<String>) -> ExecutionPlan {
         let mut required_nodes = BTreeSet::new();
         let mut task_entries = BTreeMap::new();
         for task in requested_tasks {
@@ -180,7 +180,7 @@ impl CascadeGraph {
 mod tests {
     use super::*;
     fn id(s: &str) -> TierName { TierName::new(s).unwrap() }
-    fn task(s: &str) -> TaskId { TaskId::new(s) }
+    fn task(s: &str) -> String { s.to_string() }
 
     #[test]
     fn graph_retains_task_labelled_edges_and_shared_nodes() {

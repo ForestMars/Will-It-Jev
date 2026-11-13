@@ -1,11 +1,10 @@
 // src/pipeline/task.rs
 //
-// Task-side definitions. A TaskProfile describes a use case only: its identity,
+// Task-side definitions. A Task describes a use case only: its identity,
 // accepted labels, and fallback. Tier-specific calibration is deliberately kept
-// in TierPolicyMap, outside this module's TaskProfile.
+// in TierPolicyMap, outside this module's Task.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
 
 use serde::Deserialize;
 
@@ -48,34 +47,6 @@ pub struct TaskLabelMetadata {
     pub group_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
-#[serde(transparent)]
-pub struct TaskId(String);
-
-impl TaskId {
-    pub fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
-    }
-
-    pub fn route() -> Self {
-        Self::new("route")
-    }
-
-    pub fn tag() -> Self {
-        Self::new("tag")
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for TaskId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Reading {
     pub label: String,
@@ -104,7 +75,7 @@ pub enum TierReading {
 }
 
 /// Resolution calibration for one task when it is evaluated by one tier.
-/// This is stored in the pipeline policy registry, never inside TaskProfile.
+/// This is stored in the pipeline policy registry, never inside Task.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)]
@@ -171,7 +142,7 @@ impl TierPolicy {
 /// Execution calibration indexed independently from task definitions:
 /// tier name -> task id -> resolution policy. Execution order is not encoded
 /// here; it belongs to the `TierRegistry`.
-pub type TierPolicyMap = BTreeMap<TierName, BTreeMap<TaskId, TierPolicy>>;
+pub type TierPolicyMap = BTreeMap<TierName, BTreeMap<String, TierPolicy>>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FallbackPolicy {
@@ -187,8 +158,8 @@ pub struct Cascade {
 
 /// A task's output-head contract and its own ordered fallback cascade.
 #[derive(Debug, Clone)]
-pub struct TaskProfile {
-    pub task: TaskId,
+pub struct Task {
+    pub name: String,
     pub cascade: Cascade,
     pub output_kind: OutputKind,
     pub labels: Option<Vec<String>>,
@@ -207,7 +178,7 @@ pub enum Decision {
     },
 }
 
-impl TaskProfile {
+impl Task {
 
     pub fn decide(&self, policy: &TierPolicy, reading: &TierReading) -> Decision {
         let reading = match reading {
@@ -307,9 +278,9 @@ mod tests {
 
     #[test]
     fn multilabel_resolution_applies_thresholds_independently() {
-        let profile = TaskProfile {
+        let profile = Task {
             cascade: Cascade::default(),
-            task: TaskId::new("risk_flags"),
+            name: String::from("risk_flags"),
             output_kind: OutputKind::Multilabel,
             labels: Some(vec!["security".into(), "privacy".into(), "other".into()]),
             label_metadata: Vec::new(),
@@ -335,9 +306,9 @@ mod tests {
 
     #[test]
     fn an_observing_policy_records_the_reading_and_never_resolves() {
-        let profile = TaskProfile {
+        let profile = Task {
             cascade: super::task::Cascade::default(),
-            task: TaskId::new("urgency"),
+            name: String::from("urgency"),
             output_kind: OutputKind::Multiclass,
             labels: None,
             label_metadata: Vec::new(),
@@ -370,9 +341,9 @@ mod tests {
 
     #[test]
     fn unsupported_task_is_not_an_ordinary_model_abstention() {
-        let profile = TaskProfile {
+        let profile = Task {
             cascade: super::task::Cascade::default(),
-            task: TaskId::tag(),
+            name: String::from("tag"),
             output_kind: OutputKind::Multiclass,
             labels: None,
             label_metadata: Vec::new(),
@@ -385,25 +356,25 @@ mod tests {
 
     #[test]
     fn task_profile_contains_no_tier_calibration() {
-        let profile = TaskProfile {
+        let profile = Task {
             cascade: super::task::Cascade::default(),
-            task: TaskId::route(),
+            name: String::from("route"),
             output_kind: OutputKind::Binary,
             labels: Some(vec![LABEL_JEV.into(), LABEL_LLM.into()]),
             label_metadata: Vec::new(),
             taxonomy_version: None,
             fallback: FallbackPolicy::Label(LABEL_LLM.into()),
         };
-        assert_eq!(profile.task, TaskId::route());
+        assert_eq!(profile.name, String::from("route"));
         assert_eq!(profile.labels.as_ref().unwrap().len(), 2);
         assert_eq!(profile.fallback, FallbackPolicy::Label(LABEL_LLM.into()));
     }
 
     #[test]
     fn policy_is_supplied_independently_of_task_definition() {
-        let profile = TaskProfile {
+        let profile = Task {
             cascade: super::task::Cascade::default(),
-            task: TaskId::route(),
+            name: String::from("route"),
             output_kind: OutputKind::Binary,
             labels: Some(vec![LABEL_JEV.into(), LABEL_LLM.into()]),
             label_metadata: Vec::new(),
@@ -425,9 +396,9 @@ mod tests {
 
     #[test]
     fn rejects_unknown_labels_and_non_finite_confidence() {
-        let profile = TaskProfile {
+        let profile = Task {
             cascade: super::task::Cascade::default(),
-            task: TaskId::route(),
+            name: String::from("route"),
             output_kind: OutputKind::Binary,
             labels: Some(vec![LABEL_JEV.into(), LABEL_LLM.into()]),
             label_metadata: Vec::new(),

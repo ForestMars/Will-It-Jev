@@ -28,7 +28,7 @@ use crate::pipeline::{
     identity::Slot,
     registry::TierDirectory,
     runner::{CascadeRunner, Resolution, RunOutcome, TaskOutcome},
-    task::{Decision, TaskId, TaskProfile, TierPolicyMap, TierReading},
+    task::{Decision, String, Task, TierPolicyMap, TierReading},
 };
 
 const RUN_TTL: Duration = Duration::from_secs(900);
@@ -36,7 +36,7 @@ const RUN_TTL: Duration = Duration::from_secs(900);
 #[derive(Clone)]
 struct TaskApiState {
     cascade: Arc<CascadeRunner>,
-    profiles: Vec<TaskProfile>,
+    profiles: Vec<Task>,
     policies: Arc<TierPolicyMap>,
     budget: Duration,
     runs: TaskRunStore,
@@ -129,7 +129,7 @@ impl IntoResponse for ApiError {
 
 pub fn router(
     cascade: Arc<CascadeRunner>,
-    profiles: Vec<TaskProfile>,
+    profiles: Vec<Task>,
     policies: Arc<TierPolicyMap>,
     budget: Duration,
 ) -> Router {
@@ -211,7 +211,7 @@ async fn execute_task_request(
             return Err(ApiError::Invalid(format!("duplicate task ID {name:?}")));
         }
         let profile = state.profiles.iter()
-            .find(|profile| profile.task.as_str() == name)
+            .find(|profile| profile.name.as_str() == name)
             .ok_or_else(|| ApiError::Invalid(format!("task {name:?} is not configured")))?;
         profiles.push(profile.clone());
     }
@@ -226,7 +226,7 @@ async fn execute_task_request(
 
     let mut required_ids = BTreeSet::new();
     for name in &required_names {
-        let id = TaskId::new(name.clone());
+        let id = name.clone();
         if !required_ids.insert(id) {
             return Err(ApiError::Invalid(format!(
                 "duplicate required task ID {name:?}"
@@ -252,7 +252,7 @@ async fn execute_task_request(
     }
 
     let pending_names: Vec<String> = request.tasks.iter()
-        .filter(|name| !required_ids.contains(&TaskId::new((*name).clone())))
+        .filter(|name| !required_ids.contains(&String::new((*name).clone())))
         .cloned()
         .collect();
     let split = Arc::clone(&state.cascade).run_split(
@@ -287,7 +287,7 @@ fn all_task_results(outcome: &RunOutcome, tiers: &TierDirectory) -> Value {
 
 fn selected_task_results(
     outcome: &RunOutcome,
-    selected: &BTreeSet<TaskId>,
+    selected: &BTreeSet<String>,
     tiers: &TierDirectory,
 ) -> Value {
     let mut tasks = Map::new();
@@ -376,7 +376,7 @@ mod tests {
     struct FixtureTier {
         name: String,
         delay: Duration,
-        readings: BTreeMap<TaskId, TierReading>,
+        readings: BTreeMap<String, TierReading>,
         calls: CallLog,
     }
 
@@ -401,10 +401,10 @@ mod tests {
         }
     }
 
-    fn profile(task: &str, kind: OutputKind, labels: &[&str]) -> TaskProfile {
-        TaskProfile {
+    fn profile(task: &str, kind: OutputKind, labels: &[&str]) -> Task {
+        Task {
             cascade: crate::pipeline::task::Cascade::default(),
-            task: TaskId::new(task),
+            task: String::new(task),
             output_kind: kind,
             labels: Some(labels.iter().map(|label| (*label).to_string()).collect()),
             label_metadata: Vec::new(),
@@ -425,7 +425,7 @@ mod tests {
             name: "rules".into(),
             delay: Duration::ZERO,
             readings: [(
-                TaskId::new("customer_intent"),
+                String::new("customer_intent"),
                 TierReading::Scored(Reading::new("billing", 0.97)),
             )].into(),
             calls: calls.clone(),
@@ -434,8 +434,8 @@ mod tests {
             name: "modernbert".into(),
             delay: Duration::from_millis(300),
             readings: [
-                (TaskId::new("urgency"), TierReading::Scored(Reading::new("high", 0.91))),
-                (TaskId::new("fraud_risk"), TierReading::Scored(Reading::new("payment_abuse", 0.88))),
+                (String::from("urgency"), TierReading::Scored(Reading::new("high", 0.91))),
+                (String::new("fraud_risk"), TierReading::Scored(Reading::new("payment_abuse", 0.88))),
             ].into(),
             calls: calls.clone(),
         };
@@ -443,18 +443,18 @@ mod tests {
             Arc::new(TierInstance::fake("rules", Arc::new(tier1))),
             Arc::new(TierInstance::fake("modernbert", Arc::new(tier2))),
         ]);
-        let paths: BTreeMap<TaskId, Vec<TierName>> = [
-            (TaskId::new("customer_intent"), vec![tname("rules")]),
-            (TaskId::new("urgency"), vec![tname("modernbert")]),
-            (TaskId::new("fraud_risk"), vec![tname("modernbert")]),
+        let paths: BTreeMap<String, Vec<TierName>> = [
+            (String::new("customer_intent"), vec![tname("rules")]),
+            (String::from("urgency"), vec![tname("modernbert")]),
+            (String::new("fraud_risk"), vec![tname("modernbert")]),
         ].into();
         let graph = CascadeGraph::from_task_paths(paths, &registry.names()).unwrap();
         let cascade = Arc::new(CascadeRunner::new(registry, graph).unwrap());
         let policies: TierPolicyMap = [
-            (tname("rules"), [(TaskId::new("customer_intent"), TierPolicy::new(0.90))].into()),
+            (tname("rules"), [(String::new("customer_intent"), TierPolicy::new(0.90))].into()),
             (tname("modernbert"), [
-                (TaskId::new("urgency"), TierPolicy::new(0.80)),
-                (TaskId::new("fraud_risk"), TierPolicy::new(0.80)),
+                (String::from("urgency"), TierPolicy::new(0.80)),
+                (String::new("fraud_risk"), TierPolicy::new(0.80)),
             ].into()),
         ].into();
         let state = TaskApiState {
@@ -497,7 +497,7 @@ mod tests {
 
         assert_eq!(complete.tasks.len(), 3);
         assert_eq!(
-            complete.tasks[&TaskId::new("urgency")].resolution,
+            complete.tasks[&String::from("urgency")].resolution,
             Resolution::Tier {
                 tier: tname("modernbert"),
                 model_id: "fixture-tier-modernbert".into(),

@@ -27,7 +27,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::identity::{TierId, TierName};
-use super::task::{OutputKind, Reading, TaskId, TaskProfile, TierReading, LABEL_JEV, LABEL_LLM};
+use super::task::{OutputKind, Reading, String, Task, TierReading, LABEL_JEV, LABEL_LLM};
 use crate::router::tier1_runner::{Tier1Automaton, Tier1Engine};
 use crate::router::tier2_runner::{Tier2Outcome, Tier2Route, Tier2Runner};
 use crate::router::tier3_runner::{TasksError, Tier3Runner};
@@ -187,9 +187,9 @@ pub struct TierDecl {
 pub struct TierContext<'a> {
     pub prompt: &'a str,
     /// Tasks still open that this tier is eligible to answer.
-    pub tasks: &'a [TaskId],
+    pub tasks: &'a [String],
     /// Task contracts are passed to tiers so heads can validate requested output shapes.
-    pub task_profiles: &'a [TaskProfile],
+    pub task_profiles: &'a [Task],
     /// Time left on the run's global deadline.
     pub budget: Duration,
 }
@@ -197,13 +197,13 @@ pub struct TierContext<'a> {
 #[derive(Debug, Clone)]
 pub struct TierOutput {
     pub model_id: String,
-    pub readings: BTreeMap<TaskId, TierReading>,
+    pub readings: BTreeMap<String, TierReading>,
 }
 
 impl TierOutput {
     pub fn abstain_all(
         model_id: impl Into<String>,
-        tasks: &[TaskId],
+        tasks: &[String],
         reason: &'static str,
     ) -> Self {
         Self {
@@ -243,13 +243,13 @@ fn unsupported_all(ctx: &TierContext<'_>, model_id: &str) -> TierOutput {
 }
 
 /// A tier-local scorer for any non-route task. Resolution remains entirely in
-/// TaskProfile and is therefore independent of this implementation.
+/// Task and is therefore independent of this implementation.
 pub trait TaskScorer: Send + Sync {
-    fn score(&self, prompt: &str, profile: &TaskProfile) -> TierReading;
+    fn score(&self, prompt: &str, profile: &Task) -> TierReading;
 }
 
 fn route_only(ctx: &TierContext<'_>, model_id: &str, route: TierReading) -> TierOutput {
-    let route_id = TaskId::route();
+    let route_id = String::from("route");
     let readings = ctx
         .tasks
         .iter()
@@ -288,7 +288,7 @@ pub struct TierInstance {
     params: Params,
     artifact_hash: Option<[u8; 32]>,
     runner: Runner,
-    task_scorers: BTreeMap<TaskId, Arc<dyn TaskScorer>>,
+    task_scorers: BTreeMap<String, Arc<dyn TaskScorer>>,
     request_shape_unimplemented: AtomicBool,
     model_mismatch_reported: AtomicBool,
 }
@@ -390,7 +390,7 @@ impl TierInstance {
     }
 
     #[allow(dead_code)]
-    pub fn with_task_scorer(mut self, task: TaskId, scorer: Arc<dyn TaskScorer>) -> Self {
+    pub fn with_task_scorer(mut self, task: String, scorer: Arc<dyn TaskScorer>) -> Self {
         self.task_scorers.insert(task, scorer);
         self
     }
@@ -407,10 +407,10 @@ impl TierInstance {
     }
 
     /// Tasks other than route are served by an in-process scorer if one is wired.
-    fn other_tasks(&self, ctx: &TierContext<'_>, readings: &mut BTreeMap<TaskId, TierReading>) {
-        for task in ctx.tasks.iter().filter(|task| task.as_str() != TaskId::route().as_str()) {
+    fn other_tasks(&self, ctx: &TierContext<'_>, readings: &mut BTreeMap<String, TierReading>) {
+        for task in ctx.tasks.iter().filter(|task| task.as_str() != String::from("route").as_str()) {
             let reading = self.task_scorers.get(task)
-                .and_then(|scorer| ctx.task_profiles.iter().find(|profile| profile.task.as_str() == task.as_str())
+                .and_then(|scorer| ctx.task_profiles.iter().find(|profile| profile.name.as_str() == task.as_str())
                     .map(|profile| scorer.score(ctx.prompt, profile)))
                 .unwrap_or(TierReading::Unsupported);
             readings.insert(task.clone(), reading);
@@ -419,7 +419,7 @@ impl TierInstance {
 
     fn evaluate_rules(&self, engine: &Tier1Engine, ctx: &TierContext<'_>) -> TierOutput {
         let mut readings = BTreeMap::new();
-        if ctx.tasks.contains(&TaskId::route()) {
+        if ctx.tasks.contains(&String::from("route")) {
             let result = engine.classify(ctx.prompt);
             let p_jev = if result.confidence.is_finite() {
                 result.confidence.clamp(0.0, 1.0)
@@ -431,7 +431,7 @@ impl TierInstance {
             } else {
                 (LABEL_LLM, 1.0 - p_jev)
             };
-            readings.insert(TaskId::route(), TierReading::Scored(Reading {
+            readings.insert(String::from("route"), TierReading::Scored(Reading {
                 label: label.to_string(),
                 confidence,
                 scores: vec![
@@ -446,8 +446,8 @@ impl TierInstance {
 
     fn evaluate_fasttext(&self, runner: &Tier2Runner, ctx: &TierContext<'_>) -> TierOutput {
         let mut readings = BTreeMap::new();
-        if ctx.tasks.contains(&TaskId::route()) {
-            readings.insert(TaskId::route(), tier2_reading(&runner.evaluate(ctx.prompt)));
+        if ctx.tasks.contains(&String::from("route")) {
+            readings.insert(String::from("route"), tier2_reading(&runner.evaluate(ctx.prompt)));
         }
         self.other_tasks(ctx, &mut readings);
         TierOutput { model_id: self.model_label(), readings }
@@ -484,7 +484,7 @@ impl TierInstance {
         match self.tier.request_shape {
             Some(RequestShape::ScoreTasks) => {}
             _ => {
-                return if ctx.tasks.contains(&TaskId::route()) {
+                return if ctx.tasks.contains(&String::from("route")) {
                     self.route_via_score(runner, ctx).await
                 } else {
                     unsupported_all(ctx, &self.model_label())
@@ -494,9 +494,9 @@ impl TierInstance {
         if self.request_shape_unimplemented.load(Ordering::Relaxed) {
             return TierOutput::abstain_all(self.model_label(), ctx.tasks, "score_tasks_unimplemented");
         }
-        let requested_profiles: Vec<TaskProfile> = ctx.tasks.iter()
+        let requested_profiles: Vec<Task> = ctx.tasks.iter()
             .filter_map(|task| ctx.task_profiles.iter()
-                .find(|profile| profile.task.as_str() == task.as_str()).cloned())
+                .find(|profile| profile.name.as_str() == task.as_str()).cloned())
             .collect();
         match runner.score_tasks(ctx.prompt, &requested_profiles, ctx.budget).await {
             Ok(response) => {
@@ -506,7 +506,7 @@ impl TierInstance {
                         .find(|result| result.task == task.as_str())
                         .map(|result| {
                             let expected = ctx.task_profiles.iter()
-                                .find(|profile| profile.task.as_str() == task.as_str())
+                                .find(|profile| profile.name.as_str() == task.as_str())
                                 .map(|profile| match profile.output_kind {
                                     OutputKind::Binary => 1,
                                     OutputKind::Multiclass => 2,
@@ -772,12 +772,12 @@ mod tests {
     #[tokio::test]
     async fn a_failed_sidecar_call_is_labelled_by_model_not_by_name() {
         let instance = TierInstance::build(encoder_decl("enc-a", Computation::Onnx, Some("model-a"), "http://127.0.0.1:9")).unwrap();
-        let tasks = [TaskId::route()];
+        let tasks = [String::from("route")];
         let output = instance
             .evaluate(&TierContext { prompt: "test", tasks: &tasks, task_profiles: &[], budget: Duration::from_millis(500) })
             .await;
         assert_eq!(output.model_id, "model-a");
-        assert!(matches!(output.readings[&TaskId::route()], TierReading::Abstain(_)));
+        assert!(matches!(output.readings[&String::from("route")], TierReading::Abstain(_)));
     }
 
     #[tokio::test]
@@ -786,20 +786,20 @@ mod tests {
         let calls = sidecar.tasks_calls.clone();
         let scorer = Tier3Runner::new(endpoint(sidecar).await, Duration::from_secs(2)).unwrap();
         let tier = TierInstance::encoder("alternate", RequestShape::ScoreTasks, None, scorer);
-        let tasks = [TaskId::route(), TaskId::tag()];
+        let tasks = [String::from("route"), String::from("tag")];
         let profiles = [
-            TaskProfile {
+            Task {
                 cascade: super::task::Cascade::default(),
-                task: TaskId::route(),
+                task: String::from("route"),
                 output_kind: OutputKind::Binary,
                 labels: None,
                 label_metadata: Vec::new(),
                 taxonomy_version: None,
                 fallback: super::super::task::FallbackPolicy::Defer,
             },
-            TaskProfile {
+            Task {
                 cascade: super::task::Cascade::default(),
-                task: TaskId::tag(),
+                task: String::from("tag"),
                 output_kind: OutputKind::Multiclass,
                 labels: None,
                 label_metadata: Vec::new(),
@@ -811,8 +811,8 @@ mod tests {
             .evaluate(&TierContext { prompt: "test", tasks: &tasks, task_profiles: &profiles, budget: Duration::from_secs(2) })
             .await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(matches!(output.readings[&TaskId::route()], TierReading::Scored(_)));
-        assert!(matches!(output.readings[&TaskId::tag()], TierReading::Scored(_)));
+        assert!(matches!(output.readings[&String::from("route")], TierReading::Scored(_)));
+        assert!(matches!(output.readings[&String::from("tag")], TierReading::Scored(_)));
     }
     #[tokio::test]
     async fn score_tasks_request_shape_is_used_even_for_a_single_task() {
@@ -821,10 +821,10 @@ mod tests {
         let score_calls = sidecar.score_calls.clone();
         let scorer = Tier3Runner::new(endpoint(sidecar).await, Duration::from_secs(2)).unwrap();
         let tier = TierInstance::encoder("route-scorer", RequestShape::ScoreTasks, None, scorer);
-        let tasks = [TaskId::route()];
-        let profiles = [TaskProfile {
+        let tasks = [String::from("route")];
+        let profiles = [Task {
             cascade: super::task::Cascade::default(),
-            task: TaskId::route(),
+            task: String::from("route"),
             output_kind: OutputKind::Binary,
             labels: None,
             label_metadata: Vec::new(),
@@ -839,7 +839,7 @@ mod tests {
         }).await;
         assert_eq!(task_calls.load(Ordering::SeqCst), 1);
         assert_eq!(score_calls.load(Ordering::SeqCst), 0);
-        assert!(matches!(output.readings[&TaskId::route()], TierReading::Scored(_)));
+        assert!(matches!(output.readings[&String::from("route")], TierReading::Scored(_)));
     }
 
     #[tokio::test]
@@ -849,10 +849,10 @@ mod tests {
         let score_calls = sidecar.score_calls.clone();
         let scorer = Tier3Runner::new(endpoint(sidecar).await, Duration::from_secs(2)).unwrap();
         let tier = TierInstance::encoder("no-joint", RequestShape::ScoreTasks, None, scorer);
-        let tasks = [TaskId::route()];
-        let profiles = [TaskProfile {
+        let tasks = [String::from("route")];
+        let profiles = [Task {
             cascade: super::task::Cascade::default(),
-            task: TaskId::route(),
+            task: String::from("route"),
             output_kind: OutputKind::Binary,
             labels: None,
             label_metadata: Vec::new(),
@@ -867,6 +867,6 @@ mod tests {
         }).await;
         assert_eq!(task_calls.load(Ordering::SeqCst), 1);
         assert_eq!(score_calls.load(Ordering::SeqCst), 0);
-        assert!(matches!(output.readings[&TaskId::route()], TierReading::Abstain("score_tasks_unimplemented")));
+        assert!(matches!(output.readings[&String::from("route")], TierReading::Abstain("score_tasks_unimplemented")));
     }
 }

@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 
 use crate::legacy_tiers::LegacyTierNumbers;
 use super::runner::{Resolution, RunOutcome};
-use super::task::{Reading, TaskId};
+use super::task::{Reading, String};
 use crate::tagging::{CategoryScore, TaskDecisionMetadata, TagError, TagInput, Tagger, TaggerOutput, TaggerVerdict};
 
 struct JointEntry {
@@ -119,7 +119,7 @@ impl<F: Tagger> Tagger for CascadeTagger<F> {
         let Some(outcome) = self.store.take(&input.request_id, self.budget).await? else {
             return self.fallback.tag(input).await;
         };
-        match outcome.tasks.get(&TaskId::tag()).map(|task| &task.resolution) {
+        match outcome.tasks.get(&String::from("tag")).map(|task| &task.resolution) {
             Some(Resolution::Tier { tier, model_id, reading }) => {
                 tracing::debug!(request_id = %input.request_id, tier = %tier, model_id,
                     "tag decision reused from request cascade");
@@ -127,7 +127,7 @@ impl<F: Tagger> Tagger for CascadeTagger<F> {
                     verdict: verdict(reading),
                     usage: None,
                     decision: Some(TaskDecisionMetadata {
-                        task_id: TaskId::tag().as_str().to_string(),
+                        task_id: String::from("tag").as_str().to_string(),
                         output_kind: self.output_kind.clone(),
                         resolving_tier: self.legacy.ordinal_of(tier),
                         resolving_tier_name: Some(tier.to_string()),
@@ -151,7 +151,7 @@ mod tests {
     use crate::pipeline::identity::tname;
     use std::future::Future;
     use crate::pipeline::runner::{RunOutcome, TaskOutcome};
-    use crate::pipeline::task::TaskId;
+    use crate::pipeline::task::String;
     use crate::pipeline::runner::Resolution;
     use crate::tagging::{Tagger, TaggerVerdict};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -185,7 +185,7 @@ mod tests {
         let store = JointTagStore::default();
         let outcome = RunOutcome {
             tasks: [(
-                TaskId::tag(),
+                String::from("tag"),
                 TaskOutcome {
                     resolution: Resolution::Tier {
                         tier: tname("modernbert"),

@@ -24,7 +24,7 @@ use crate::pipeline::registry::TierDirectory;
 use crate::pipeline::runner::{CascadeRunner, Resolution, RunOutcome, TierTrace};
 use crate::pipeline::tagger::JointTagStore;
 use crate::pipeline::task::{
-    Decision, Reading, TaskId, TaskProfile, TierPolicyMap, TierReading, LABEL_JEV, LABEL_LLM,
+    Decision, Reading, String, Task, TierPolicyMap, TierReading, LABEL_JEV, LABEL_LLM,
 };
 use crate::tagging::{is_sampled, TagInput, TagQueue};
 use crate::telemetry::{
@@ -40,14 +40,14 @@ use super::{
 pub struct AppDependencies {
     pub cascade: Arc<CascadeRunner>,
     /// All configured task contracts, used by the generic task execution API.
-    pub task_profiles: Vec<TaskProfile>,
-    pub route_profile: TaskProfile,
+    pub task_profiles: Vec<Task>,
+    pub route_profile: Task,
     pub tier_policies: Arc<TierPolicyMap>,
     pub dispatcher: DownstreamDispatcher,
     pub hashes: Hashes,
     pub capture_tx: mpsc::Sender<RouteRecord>,
     pub tag_queue: TagQueue,
-    pub tag_profile: Option<TaskProfile>,
+    pub tag_profile: Option<Task>,
     pub joint_tags: JointTagStore,
     pub tag_in_request: bool,
     pub tag_sample_prob: f32,
@@ -61,13 +61,13 @@ pub struct AppDependencies {
 #[derive(Clone)]
 pub struct AppState {
     cascade: Arc<CascadeRunner>,
-    route_profile: TaskProfile,
+    route_profile: Task,
     tier_policies: Arc<TierPolicyMap>,
     dispatcher: Arc<DownstreamDispatcher>,
     hashes: Arc<Hashes>,
     capture_tx: mpsc::Sender<RouteRecord>,
     tag_queue: TagQueue,
-    tag_profile: Option<TaskProfile>,
+    tag_profile: Option<Task>,
     joint_tags: JointTagStore,
     tag_in_request: bool,
     tag_sample_prob: f32,
@@ -233,7 +233,7 @@ async fn completion(
         let split = Arc::clone(&state.cascade).run_split(
             route_input.clone(),
             request_profiles.clone(),
-            BTreeSet::from([TaskId::route()]),
+            BTreeSet::from([String::from("route")]),
             Arc::clone(&state.tier_policies),
             state.budget,
         );
@@ -355,11 +355,11 @@ fn route_record(
     hashes: &Hashes,
     tiers: &TierDirectory,
     legacy: &LegacyTierNumbers,
-    profiles: &[TaskProfile],
+    profiles: &[Task],
     outcome: &RunOutcome,
     started: Instant,
 ) -> (Backend, RouteRecord) {
-    let route_outcome = outcome.tasks.get(&TaskId::route());
+    let route_outcome = outcome.tasks.get(&String::from("route"));
     // The numeric value is the legacy ordinal (0 for a tier without one); the
     // name is the identity. Fallback keeps its historical value of 6.
     let (backend, decision_tier, decision_tier_name) = match route_outcome.map(|task| &task.resolution) {
@@ -396,7 +396,7 @@ fn route_record(
     let latency_us = started.elapsed().as_micros();
     let task_decisions = outcome.tasks.iter().map(|(task_id, task_outcome)| {
         let output_kind = profiles.iter()
-            .find(|profile| profile.task.as_str() == task_id.as_str())
+            .find(|profile| profile.name.as_str() == task_id.as_str())
             .map(|profile| profile.output_kind.as_str())
             .unwrap_or("unknown");
         let latency_ms = outcome.tier_calls.iter()
@@ -698,10 +698,10 @@ mod tests {
         LegacyTierNumbers::new([(tname("rules"), 1), (tname("modernbert"), 3)]).unwrap()
     }
 
-    fn route_profile() -> TaskProfile {
-        TaskProfile {
+    fn route_profile() -> Task {
+        Task {
             cascade: crate::pipeline::task::Cascade::default(),
-            task: TaskId::route(),
+            task: String::from("route"),
             output_kind: OutputKind::Binary,
             labels: Some(vec![LABEL_JEV.into(), LABEL_LLM.into()]),
             label_metadata: Vec::new(),
@@ -720,7 +720,7 @@ mod tests {
 
     fn record_for(resolution: Resolution, trace: Vec<TierTrace>) -> RouteRecord {
         let outcome = RunOutcome {
-            tasks: [(TaskId::route(), TaskOutcome { resolution, trace })].into(),
+            tasks: [(String::from("route"), TaskOutcome { resolution, trace })].into(),
             tier_calls: Vec::new(),
         };
         let hashes = Hashes { tier1_toml: "t1".into(), tier2_bin: "t2".into() };
