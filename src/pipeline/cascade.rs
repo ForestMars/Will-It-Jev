@@ -64,7 +64,6 @@ pub struct CascadeGraph {
     edges: BTreeSet<CascadeEdge>,
     order: Vec<TierId>,
     task_entries: BTreeMap<String, TierId>,
-    tasks_by_tier: BTreeMap<TierId, BTreeSet<String>>,
 }
 
 impl CascadeGraph {
@@ -112,7 +111,6 @@ impl CascadeGraph {
                     first_seen.insert(id, next_rank);
                     next_rank += 1;
                 }
-                graph.tasks_by_tier.entry(id).or_default().insert(task.clone());
                 resolved_path.push(id);
             }
 
@@ -181,11 +179,14 @@ impl CascadeGraph {
     }
 
     pub fn task_uses(&self, task: &str, tier: &TierId) -> bool {
-        self.tasks_by_tier.get(tier).is_some_and(|tasks| tasks.contains(task))
+        self.task_path(task).contains(tier)
     }
 
-    pub fn tasks_using(&self, tier: &TierId) -> Option<&BTreeSet<String>> {
-        self.tasks_by_tier.get(tier)
+    pub fn tasks_using(&self, tier: &TierId) -> BTreeSet<String> {
+        self.task_entries.keys()
+            .filter(|task| self.task_uses(task, tier))
+            .cloned()
+            .collect()
     }
 
     pub fn plan(&self, requested_tasks: &BTreeSet<String>) -> ExecutionPlan {
@@ -236,7 +237,7 @@ mod tests {
         assert_eq!(graph.order(), &[rules, modernbert, harrier]);
         assert_eq!(graph.nodes().len(), 3);
         assert_eq!(graph.edges().len(), 3);
-        assert_eq!(graph.tasks_using(&modernbert).unwrap().len(), 2);
+        assert_eq!(graph.tasks_using(&modernbert).len(), 2);
         assert_eq!(graph.next("route", &rules), Some(&modernbert));
         assert_eq!(graph.next("tag", &rules), None);
         assert!(graph.id_for_name(&name("unused")).is_none());

@@ -77,8 +77,8 @@ impl std::error::Error for CascadeRunnerBuildError {}
 pub struct CascadeRunner {
     /// Complete catalog of available tiers, including tiers absent from this graph.
     registry: TierRegistry,
-    /// The graph's deterministic topological execution projection. An instance's
-    /// position in this vector is its `Slot`.
+    /// Implementations for graph nodes, keyed by graph-assigned TierId.
+    /// Execution order comes exclusively from CascadeGraph::order().
     tiers: BTreeMap<TierId, Arc<TierInstance>>,
     graph: Arc<CascadeGraph>,
 }

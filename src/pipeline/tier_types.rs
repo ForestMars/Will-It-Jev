@@ -4,12 +4,12 @@
 //
 //   TierName  authored configuration name. Task cascades and tier-policy keys
 //             refer to tiers by name; the runtime resolves names through the registry.
-//   TierId    stable generated identifier derived from behavior-determining instance
-//             properties (see `TierInstance::derive_id`). Configuration can record
-//             it in `calibrated_for`; policies, the registry, graph, and execution
-//             traces also use it. A changed model therefore produces a changed id.
-//   Slot      positional address in the compiled execution directory. It is derived
-//             from graph order, changes when that order changes, and is not persisted.
+//   TierId    stable generated identifier derived from a TierInstance when the
+//             CascadeGraph is built. Configuration can record it in `calibrated_for`;
+//             graph nodes, runtime policies, and execution traces use it. The
+//             registry remains keyed only by TierName.
+//   Slot      positional address in the graph's topological execution order. It
+//             changes when that order changes and is never persisted as identity.
 
 use std::error::Error;
 use std::fmt;

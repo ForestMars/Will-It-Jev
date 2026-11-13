@@ -249,7 +249,7 @@ pub fn hex(bytes: &[u8]) -> String {
 // ---- instance --------------------------------------------------------------
 
 /// A Tier plus the parameters that distinguish this instance, loaded and ready to
-/// evaluate. The execution graph is an ordered `Vec` of these.
+/// evaluate. The registry stores instances by TierName; CascadeGraph derives TierId.
 pub struct TierInstance {
     name: TierName,
     tier: Tier,
@@ -649,6 +649,10 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(150)).await;
         format!("http://{address}")
+    }
+
+    fn instance_id(instance: &TierInstance) -> TierId {
+        TierInstance::derive_id(instance.name(), instance.tier(), instance.params(), instance.artifact_hash())
     }
 
     fn encoder_config(name: &str, model_format: ModelFormat, model: Option<&str>, endpoint: &str) -> (TierName, Tier, Params) {
