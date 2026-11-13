@@ -151,9 +151,13 @@ pub enum FallbackPolicy {
 }
 
 /// Authored ordered fallback route. Names resolve to generated TierIds when the runtime graph is compiled.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Cascade<T = TierId> {
     pub tiers: Vec<T>,
+}
+
+impl<T> Default for Cascade<T> {
+    fn default() -> Self { Self { tiers: Vec::new() } }
 }
 
 /// A task's output-head contract and its own ordered fallback cascade.

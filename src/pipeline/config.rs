@@ -293,7 +293,6 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
     let has_explicit_tier_registry = !raw.tier.is_empty();
     let tiers = tier_configs_from(raw.tier)?;
     let legacy = legacy_numbers_from(raw.legacy_tiers, &tiers, has_explicit_tier_registry)?;
-    let registered: std::collections::BTreeSet<TierName> = tiers.iter().map(|tier| tier.0.clone()).collect();
     let mut profiles = BTreeMap::new();
 
     for (name, profile) in raw.task {
