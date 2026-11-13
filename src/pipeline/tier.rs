@@ -338,7 +338,7 @@ impl TierInstance {
         artifact_hash: Option<[u8; 32]>,
     ) -> Self {
         Self {
-            id: Self::derive_id(&tier, &params, artifact_hash.as_ref()),
+            id: Self::derive_id(&name, &tier, &params, artifact_hash.as_ref()),
             name, tier, params, artifact_hash, runner,
             task_scorers: BTreeMap::new(),
             request_shape_unimplemented: AtomicBool::new(false),
@@ -346,12 +346,16 @@ impl TierInstance {
         }
     }
 
-    /// The identity of an instance is a digest of what determines its behavior:
-    /// its definition, computation, model, rule file and the content of the file
-    /// it loaded. It excludes the name, endpoint, timeout and `enabled`:
-    /// renaming an instance or moving a sidecar to another host must not change
-    /// what it is, nor invalidate calibration recorded against it.
-    pub fn derive_id(tier: &Tier, params: &Params, artifact_hash: Option<&[u8; 32]>) -> TierId {
+    /// The generated identity includes the authored TierName and the
+    /// behaviorally significant computation/model/artifact inputs. Endpoint,
+    /// transport, invocation protocol, timeout and enabled state are deployment
+    /// details and do not invalidate calibration.
+    pub fn derive_id(
+        name: &TierName,
+        tier: &Tier,
+        params: &Params,
+        artifact_hash: Option<&[u8; 32]>,
+    ) -> TierId {
         let mut digest = Sha256::new();
         let mut field = |key: &str, value: &str| {
             digest.update(key.as_bytes());
@@ -359,12 +363,10 @@ impl TierInstance {
             digest.update(value.as_bytes());
             digest.update(b"\0");
         };
+        field("tier_name", name.as_str());
         field("role", tier.role.as_str());
-        field("transport", tier.transport.as_str());
-        field("request_shape", tier.request_shape.map_or("", RequestShape::as_str));
         field("computation", params.computation.as_str());
         field("model", params.model.as_deref().unwrap_or(""));
-        field("config", params.config.as_deref().unwrap_or(""));
         field("artifact", &artifact_hash.map(|hash| hex(hash)).unwrap_or_default());
         TierId::from_digest(&digest.finalize())
     }
