@@ -377,6 +377,29 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::cascade::{CascadeGraph, CascadeGraphError};
+    use crate::pipeline::registry::TierRegistry;
+    use crate::pipeline::tier::{FakeEvaluate, TierContext, TierInstance, TierOutput};
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    struct Silent;
+    #[async_trait]
+    impl FakeEvaluate for Silent {
+        async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
+            TierOutput::abstain_all("silent", ctx.tasks, "test")
+        }
+    }
+
+    fn graph_for(cfg: &PipelineConfig) -> Result<CascadeGraph, CascadeGraphError> {
+        let registry = TierRegistry::of(cfg.tiers.iter().map(|(name, _, _)| {
+            Arc::new(TierInstance::fake(name.as_str(), Arc::new(Silent)))
+        }).collect());
+        let paths = cfg.profiles().into_iter()
+            .map(|profile| (profile.name, profile.cascade.tiers))
+            .collect();
+        CascadeGraph::from_task_paths(paths, &registry)
+    }
 
     #[test]
     fn tasks_keep_distinct_paths_and_share_nodes() {
@@ -414,7 +437,7 @@ mod tests {
 
     #[test]
     fn conflicting_task_orders_fail_as_a_cycle() {
-        let result = parse(r#"
+        let cfg = parse(r#"
             [task.route]
             fallback_label = "needs_llm"
             cascade = ["a", "b"]
@@ -435,8 +458,8 @@ mod tests {
             transport = "grpc"
             request_shape = "score"
             endpoint = "http://127.0.0.1:50052"
-        "#);
-        assert!(matches!(result, Err(error) if error.to_string().contains("cycle")));
+        "#).unwrap();
+        assert!(matches!(graph_for(&cfg), Err(CascadeGraphError::Cycle { .. })));
     }
 
     #[test]
@@ -468,8 +491,10 @@ mod tests {
     fn rejects_unknown_and_duplicate_tier_ids_in_task_paths() {
         let prefix = "[task.route]\nfallback_label = \"needs_llm\"\n";
         let tier = "[[tier]]\nname=\"rules\"\nexecutor=\"rules\"\ntransport=\"in_process\"\n";
-        assert!(parse(&format!("{prefix}cascade = [\"rules\", \"unknown\"]\n{tier}")).is_err());
-        assert!(parse(&format!("{prefix}cascade = [\"rules\", \"rules\"]\n{tier}")).is_err());
+        let unknown = parse(&format!("{prefix}cascade = [\"rules\", \"unknown\"]\n{tier}")).unwrap();
+        assert!(matches!(graph_for(&unknown), Err(CascadeGraphError::UnknownTier { .. })));
+        let duplicate = parse(&format!("{prefix}cascade = [\"rules\", \"rules\"]\n{tier}")).unwrap();
+        assert!(matches!(graph_for(&duplicate), Err(CascadeGraphError::DuplicateTier { .. })));
     }
 
     #[test]
@@ -536,7 +561,7 @@ mod tests {
             model = "modernbert-base"
             [[tier]]
             name = "b"
-            role = "encoder"
+            executor = "encoder"
             model_format = "gguf"
             transport = "grpc"
             request_shape = "score"
@@ -558,7 +583,7 @@ mod tests {
             model = "models/small.bin"
             [[tier]]
             name = "b"
-            role = "fasttext"
+            executor = "fasttext"
             transport = "in_process"
             model = "models/large.bin"
         "#)).unwrap();
@@ -589,7 +614,7 @@ mod tests {
         let missing = with_tiers(r#"
             [[tier]]
             name = "a"
-            role = "encoder"
+            executor = "encoder"
             transport = "grpc"
             request_shape = "score"
             [[tier]]
@@ -601,12 +626,12 @@ mod tests {
         let misfit = with_tiers(r#"
             [[tier]]
             name = "a"
-            role = "rules"
+            executor = "rules"
             model_format = "onnx"
             transport = "in_process"
             [[tier]]
             name = "b"
-            role = "rules"
+            executor = "rules"
             transport = "in_process"
         "#);
         assert!(parse(&misfit).is_err_and(|e| e.to_string().contains("model_format")));
@@ -617,36 +642,36 @@ mod tests {
         let rules_model = with_tiers(r#"
             [[tier]]
             name = "a"
-            role = "rules"
+            executor = "rules"
             transport = "in_process"
             model = "x.bin"
             [[tier]]
             name = "b"
-            role = "rules"
+            executor = "rules"
             transport = "in_process"
         "#);
         assert!(parse(&rules_model).is_err_and(|e| e.to_string().contains("takes `config`")));
         let fasttext_config = with_tiers(r#"
             [[tier]]
             name = "a"
-            role = "fasttext"
+            executor = "fasttext"
             transport = "in_process"
             config = "x.toml"
             [[tier]]
             name = "b"
-            role = "rules"
+            executor = "rules"
             transport = "in_process"
         "#);
         assert!(parse(&fasttext_config).is_err_and(|e| e.to_string().contains("only valid on a rules tier")));
         let empty_model = with_tiers(r#"
             [[tier]]
             name = "a"
-            role = "fasttext"
+            executor = "fasttext"
             transport = "in_process"
             model = "  "
             [[tier]]
             name = "b"
-            role = "rules"
+            executor = "rules"
             transport = "in_process"
         "#);
         assert!(parse(&empty_model).is_err_and(|e| e.to_string().contains("model must be non-empty")));
@@ -659,11 +684,11 @@ mod tests {
         cascade = ["a", "b"]
         [[tier]]
         name = "a"
-        role = "rules"
+        executor = "rules"
         transport = "in_process"
         [[tier]]
         name = "b"
-        role = "fasttext"
+        executor = "fasttext"
         transport = "in_process"
         [tier_policy.a.route]
         min_confidence = 0.9

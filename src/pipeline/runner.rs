@@ -194,23 +194,33 @@ impl CascadeRunner {
             // Dispatch every tier with currently ready tasks. A task that reaches
             // the same tier later may form a subsequent batch; it never waits for
             // an unrelated predecessor from another task's route.
-            let batches = std::mem::take(&mut ready);
-            for (tier_id, task_set) in batches {
+            let mut batches = std::mem::take(&mut ready);
+            // Dispatch in the graph's deterministic topological order. BTreeMap
+            // key order is TierId order and has no execution semantics.
+            for tier_id in self.graph.order() {
+                let Some(task_set) = batches.remove(tier_id) else { continue };
                 if start.elapsed() >= budget { break; }
-                let Some(tier) = self.tiers.get(&tier_id).cloned() else {
+                let Some(tier) = self.tiers.get(tier_id).cloned() else {
                     for task in task_set {
                         active.remove(&task);
                     }
                     continue;
                 };
-                let task_ids: Vec<String> = task_set.into_iter()
-                    .filter(|task| active.contains(task))
-                    .collect();
+                let mut task_ids = Vec::new();
+                for task in task_set {
+                    if !active.contains(&task) { continue; }
+                    if policies.get(tier_id).is_some_and(|by_task| by_task.contains_key(&task)) {
+                        task_ids.push(task);
+                    } else if let Some(next) = self.graph.next(&task, tier_id).copied() {
+                        // A tier with no policy for this task is skipped, not invoked.
+                        ready.entry(next).or_default().insert(task);
+                    }
+                }
                 if task_ids.is_empty() { continue; }
                 let remaining = budget.saturating_sub(start.elapsed());
                 let prompt = Arc::clone(&prompt);
                 let all_profiles = Arc::clone(&profiles);
-                let call_tier_id = tier_id;
+                let call_tier_id = *tier_id;
                 let call_tier_name = tier.name().clone();
                 inflight.spawn(async move {
                     let call_started = Instant::now();
@@ -224,7 +234,10 @@ impl CascadeRunner {
                 });
             }
 
-            if inflight.is_empty() { break; }
+            if inflight.is_empty() {
+                if !ready.is_empty() { continue; }
+                break;
+            }
             let remaining = budget.saturating_sub(start.elapsed());
             if remaining.is_zero() { inflight.abort_all(); break; }
             let Some(joined) = tokio::time::timeout(remaining, inflight.join_next()).await.ok().flatten() else {
