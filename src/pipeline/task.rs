@@ -8,8 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
-use super::cascade::TierId;
-use super::tier::TierName;
+use super::tier_types::{TierId, TierName};
 
 pub const LABEL_JEV: &str = "jev_capable";
 pub const LABEL_LLM: &str = "needs_llm";
@@ -140,8 +139,9 @@ impl TierPolicy {
     }
 }
 
-/// Execution calibration indexed independently from task definitions by graph-assigned
-/// TierId, then task name. Execution topology belongs to `CascadeGraph`.
+/// Execution calibration indexed independently from task definitions:
+/// tier name -> task id -> resolution policy. Execution order is not encoded
+/// here; it belongs to the `TierRegistry`.
 pub type TierPolicyMap = BTreeMap<TierId, BTreeMap<String, TierPolicy>>;
 
 #[derive(Debug, Clone, PartialEq)]
