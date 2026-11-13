@@ -346,7 +346,7 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
             }
         }
         profiles.insert(task.clone(), Task {
-            task, cascade: Cascade { tiers: path }, output_kind: profile.output_kind, labels, label_metadata,
+            name: task, cascade: Cascade { tiers: path }, output_kind: profile.output_kind, labels, label_metadata,
             taxonomy_version, fallback,
         });
     }
@@ -361,7 +361,7 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
         let tier = decl.name.clone();
         let by_task = tier_policies.entry(tier.clone()).or_default();
         for (task_name, policy) in task_policies {
-            let task = String::new(task_name.clone());
+            let task = task_name.clone();
             let profile = profiles.get(&task).ok_or_else(|| format!(
                 "tier_policy.{tier}.{task_name}: no matching [task.{task_name}] definition"
             ))?;

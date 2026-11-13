@@ -252,7 +252,7 @@ async fn execute_task_request(
     }
 
     let pending_names: Vec<String> = request.tasks.iter()
-        .filter(|name| !required_ids.contains(&String::new((*name).clone())))
+        .filter(|name| !required_ids.contains(&String::from((*name).clone())))
         .cloned()
         .collect();
     let split = Arc::clone(&state.cascade).run_split(
@@ -404,7 +404,7 @@ mod tests {
     fn profile(task: &str, kind: OutputKind, labels: &[&str]) -> Task {
         Task {
             cascade: crate::pipeline::task::Cascade::default(),
-            task: task.to_string(),
+            name: task.to_string(),
             output_kind: kind,
             labels: Some(labels.iter().map(|label| (*label).to_string()).collect()),
             label_metadata: Vec::new(),
@@ -425,7 +425,7 @@ mod tests {
             name: "rules".into(),
             delay: Duration::ZERO,
             readings: [(
-                String::new("customer_intent"),
+                String::from("customer_intent"),
                 TierReading::Scored(Reading::new("billing", 0.97)),
             )].into(),
             calls: calls.clone(),
@@ -435,7 +435,7 @@ mod tests {
             delay: Duration::from_millis(300),
             readings: [
                 (String::from("urgency"), TierReading::Scored(Reading::new("high", 0.91))),
-                (String::new("fraud_risk"), TierReading::Scored(Reading::new("payment_abuse", 0.88))),
+                (String::from("fraud_risk"), TierReading::Scored(Reading::new("payment_abuse", 0.88))),
             ].into(),
             calls: calls.clone(),
         };
@@ -444,17 +444,17 @@ mod tests {
             Arc::new(TierInstance::fake("modernbert", Arc::new(tier2))),
         ]);
         let paths: BTreeMap<String, Vec<TierName>> = [
-            (String::new("customer_intent"), vec![tname("rules")]),
+            (String::from("customer_intent"), vec![tname("rules")]),
             (String::from("urgency"), vec![tname("modernbert")]),
-            (String::new("fraud_risk"), vec![tname("modernbert")]),
+            (String::from("fraud_risk"), vec![tname("modernbert")]),
         ].into();
         let graph = CascadeGraph::from_task_paths(paths, &registry.names()).unwrap();
         let cascade = Arc::new(CascadeRunner::new(registry, graph).unwrap());
         let policies: TierPolicyMap = [
-            (tname("rules"), [(String::new("customer_intent"), TierPolicy::new(0.90))].into()),
+            (tname("rules"), [(String::from("customer_intent"), TierPolicy::new(0.90))].into()),
             (tname("modernbert"), [
                 (String::from("urgency"), TierPolicy::new(0.80)),
-                (String::new("fraud_risk"), TierPolicy::new(0.80)),
+                (String::from("fraud_risk"), TierPolicy::new(0.80)),
             ].into()),
         ].into();
         let state = TaskApiState {
