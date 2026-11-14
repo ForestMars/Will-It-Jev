@@ -59,7 +59,7 @@ Each tier returns one of two outcomes:
 
 Tier 6 is the terminal generative tier. Provider availability determines whether a response can be returned.
 
-The `TierRegistry` catalogs available `Tier` definitions and their declarative parameters by `TierName`; it stores no `TierInstance` and assigns no `TierId`. Each `Task` owns an ordered `Cascade` of `TierName` values. `CascadeGraph` compiles those named paths, materializes one `TierInstance` for each referenced definition, and assigns each instance a hash-derived `TierId`. Shared names produce shared graph nodes; unused definitions remain in the registry without acquiring an instance ID. Contradictory task paths fail cycle validation. Disabled definitions are omitted from each task's Cascade while preserving the remaining relative order.
+The `TierRegistry` catalogs available `Tier` definitions and their declarative parameters by `TierName`; it stores no `TierInstance` and assigns no `TierId`. Each `Task` owns an ordered `Cascade` of `TierName` values. `CascadeGraph` compiles the paths into a global union of materialized tier instances, assigning each instance a hash-derived `TierId`. Shared names produce shared graph nodes; each union transition retains the task paths that contributed it. Unused definitions remain in the registry without acquiring an instance ID. A cycle in the union of task-path transitions fails validation. Disabled definitions are omitted from each task's Cascade while preserving the remaining relative order.
 
 ```toml
 [task.route]
@@ -82,7 +82,7 @@ min_confidence = 0.95
 min_confidence = 0.85
 ```
 
-A task skips nodes absent from its own Cascade and nodes without a task-specific policy. After a pass, it continues to the next policy-bearing node along its ordered path. Resolution removes that task from the run; exhaustion applies its fallback. Tasks that reach the same graph node are batched into one invocation, allowing a single `ScoreTasks` request to evaluate multiple heads against one shared representation.
+A task skips nodes absent from its own Cascade and nodes without a task-specific policy. After a pass, it continues to the next policy-bearing node along its ordered path. Resolution removes that task from the run; exhaustion applies its fallback. Tasks that are concurrently ready at the same graph node are batched into one invocation, allowing a single `ScoreTasks` request to evaluate multiple heads against one shared representation. If tasks reach that node at different times, the same `TierInstance` can be invoked again for the later cohort; an unrelated or optional predecessor never blocks a task that is already ready.
 
 A new task adds its output contract, ordered `cascade` of TierNames, and policies for the tiers it uses. A new `[[tier]]` adds an available Tier definition to the registry; referencing its name in a task's Cascade causes `CascadeGraph` to materialize its TierInstance.
 
@@ -92,7 +92,7 @@ The identity layers stay distinct. `TierName` identifies an authored tier defini
 
 The original four tiers were once numbered 1 to 4, and those numbers survive at the edges: numbered telemetry fields, `[router.tierN]` settings, numbered environment variables and `tierN` aliases in `[tier_policy.*]` keys. The `[legacy_tiers]` table in `tasks.toml` is the only place a name and a number meet. It is read at load and handed to code that writes those compatibility surfaces; no tier, instance, registry or Cascade carries a number. Configuration with no explicit `[[tier]]` entries keeps the original numbering.
 
-`CascadeGraph` computes a deterministic topological execution order by resolving each task's adjacent TierName pairs to hash-derived TierIds. Shared TierNames resolve to shared graph nodes and execute once for all eligible tasks; definitions absent from every task path remain available in the registry but do not materialize. The complete `tier_outcomes` array remains name-keyed in graph execution order; existing numbered fields remain compatibility projections. Tiers 5 and 6 are downstream execution backends, not Cascade nodes.
+`CascadeGraph` computes a deterministic topological projection of the global union of task-path transitions by resolving adjacent TierName pairs to hash-derived TierIds. That order supports stable graph presentation and `Slot` assignment; it is not a global runtime barrier. The runner advances each task along its own ordered path and concurrently evaluates independent ready nodes. Shared TierNames resolve to one shared `TierInstance`; tasks ready together at that node are batched, while later cohorts can invoke the same instance independently. Definitions absent from every task path remain available in the registry but do not materialize. The complete `tier_outcomes` array remains name-keyed in per-task progression order; existing numbered fields remain compatibility projections. Tiers 5 and 6 are downstream execution backends, not Cascade nodes.
 
 ---
 
@@ -174,7 +174,7 @@ src/
     registry.rs       Unordered TierRegistry of available Tier definitions, keyed by TierName
     cascade.rs        Task-owned TierName paths; CascadeGraph materializes instances and compiles the DAG
     tier.rs           Tier definitions, hash identities, TierInstances and evaluator contract
-    runner.rs         CascadeRunner: one ordered pass, batching eligible tasks at each tier
+    runner.rs         CascadeRunner: concurrent task-path frontiers over shared tier instances
     config.rs         config/tasks.toml loader
     tagger.rs         CascadeTagger: category tagging on the shared tiers
   router/
@@ -517,9 +517,10 @@ See the `LICENSE` file in the repository root.
 Tiers are decoupled from the questions they answer. A `TierInstance` returns raw per-task
 readings and applies no thresholds. Each `Task` owns its ordered `Cascade`, alongside its
 output contract, allowed labels and fallback. `CascadeGraph` is compiled from all task paths.
-The `CascadeRunner` traverses that graph in topological order, batching tasks whose own path
-contains the current TierName and whose tier/task policy is present. Each task leaves when it
-resolves or exhausts the policy-bearing tiers on its path.
+The `CascadeRunner` advances each task along its own policy-bearing path. Independent ready
+nodes execute concurrently; tasks that reach the same shared node together are batched, while
+a later-arriving cohort can invoke that same `TierInstance` separately. Each task leaves when
+it resolves or exhausts the policy-bearing tiers on its path.
 
 * `route` (jev_capable / needs_llm): the policies in `config/tasks.toml` set the
   confidence bars for each eligible tier. The legacy `router::cascade::route`

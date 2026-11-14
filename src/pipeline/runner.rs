@@ -1,14 +1,15 @@
 // src/pipeline/runner.rs
 //
-// Task cascades compile into a shared execution graph. At each graph node,
-// only tasks whose own path includes that tier and whose policy exists are batched.
+// Task cascades compile into a global union of shared tier instances.
+// Runtime scheduling advances each task along its own path and batches tasks
+// that have reached the same node together, without cross-task path barriers.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
-use tracing::debug;
+use tokio::task::{JoinHandle, JoinSet};
+use tracing::{debug, warn};
 
 use super::cascade::CascadeGraph;
 use super::task::{Decision, FallbackPolicy, Reading, Task, TierPolicyMap, TierReading};
@@ -125,21 +126,25 @@ impl CascadeRunner {
             "duplicate task names in profiles",
         );
 
-        // A task participates only at tiers where a corresponding policy exists.
-        // Tasks with no policy anywhere immediately take their configured fallback.
-        let last_policy_index: BTreeMap<String, usize> = profiles.iter()
-            .filter_map(|profile| {
-                self.graph.order().iter().enumerate()
-                    .filter(|(_, tier_id)| {
-                        self.graph.task_uses(&profile.name, tier_id)
-                            && policies.get(tier_id)
-                                .is_some_and(|by_task| by_task.contains_key(&profile.name))
-                    })
-                    .map(|(index, _)| (profile.name.clone(), index))
-                    .last()
+        // Compile each task's own ordered path to the shared global node IDs.
+        // Policies filter participation, but never alter path ordering.
+        let task_paths: BTreeMap<String, Vec<TierId>> = profiles.iter()
+            .map(|profile| {
+                let path = self.graph.task_path(&profile.name).unwrap_or_default()
+                    .iter()
+                    .filter(|tier_id| policies.get(*tier_id)
+                        .is_some_and(|by_task| by_task.contains_key(&profile.name)))
+                    .copied()
+                    .collect();
+                (profile.name.clone(), path)
             })
             .collect();
-        let mut active: BTreeSet<String> = last_policy_index.keys().cloned().collect();
+        let mut next_index: BTreeMap<String, usize> = profile_order.iter()
+            .map(|task| (task.clone(), 0))
+            .collect();
+        let mut active: BTreeSet<String> = task_paths.iter()
+            .filter_map(|(task, path)| (!path.is_empty()).then_some(task.clone()))
+            .collect();
 
         let mut resolved: BTreeMap<String, Resolution> = BTreeMap::new();
         let mut traces: BTreeMap<String, Vec<TierTrace>> = BTreeMap::new();
@@ -153,93 +158,152 @@ impl CascadeRunner {
             }
         }
 
-        for (tier_index, tier_id) in self.graph.order().iter().copied().enumerate() {
-            if active.is_empty() || start.elapsed() >= budget {
-                break;
-            }
+        let shared_profiles = Arc::new(profiles.to_vec());
+        let mut jobs = JoinSet::new();
+        let mut jobs_by_id: std::collections::HashMap<tokio::task::Id, (TierId, Vec<String>)>
+            = std::collections::HashMap::new();
+        let mut pending = BTreeSet::new();
 
-            let task_ids: Vec<String> = profile_order.iter()
-                .filter(|task| {
-                    active.contains(*task)
-                        && self.graph.task_uses(task, &tier_id)
-                        && policies.get(&tier_id)
-                            .is_some_and(|by_task| by_task.contains_key(*task))
-                })
-                .cloned()
-                .collect();
-            if task_ids.is_empty() {
-                continue;
-            }
-
-            let Some(tier) = self.graph.instance(&tier_id) else {
-                for task in task_ids {
-                    active.remove(&task);
-                }
-                continue;
-            };
-            let tier_name = tier.name().clone();
-            let remaining = budget.saturating_sub(start.elapsed());
-            if remaining.is_zero() {
-                break;
-            }
-
-            let call_started = Instant::now();
-            let evaluation = tokio::time::timeout(
-                remaining,
-                tier.evaluate(&TierContext {
-                    prompt,
-                    tasks: &task_ids,
-                    task_profiles: profiles,
-                    budget: remaining,
-                }),
-            ).await;
-            let output = match evaluation {
-                Ok(output) => output,
-                Err(_) => break,
-            };
-            tier_calls.push(TierCall {
-                tier: tier_name.clone(),
-                tasks: task_ids.clone(),
-                took: call_started.elapsed(),
-            });
-
-            let by_task = policies.get(&tier_id)
-                .expect("tasks were selected only when this tier has a policy");
-            for task_name in task_ids {
-                if !active.contains(&task_name) {
+        loop {
+            // Find each task's current frontier. Tasks at the same shared node
+            // are batched when they become ready together; a task never waits
+            // for another task's unrelated predecessor to reach that node.
+            let mut ready: BTreeMap<TierId, Vec<String>> = BTreeMap::new();
+            for task in &profile_order {
+                if !active.contains(task) || pending.contains(task) {
                     continue;
                 }
-                let Some(profile) = profile_by_name.get(task_name.as_str()).copied() else {
-                    active.remove(&task_name);
+                let index = *next_index.get(task).expect("every profile has a cursor");
+                if let Some(tier_id) = task_paths.get(task).and_then(|path| path.get(index)) {
+                    ready.entry(*tier_id).or_default().push(task.clone());
+                }
+            }
+
+            for (tier_id, task_ids) in ready {
+                let Some(tier) = self.graph.instance(&tier_id) else {
+                    for task in task_ids {
+                        active.remove(&task);
+                    }
                     continue;
                 };
-                let policy = by_task.get(&task_name)
-                    .expect("task batch contains only tasks with policies at this tier");
-                let reading = output.readings.get(&task_name)
-                    .cloned()
-                    .unwrap_or(TierReading::Unsupported);
-                let decision = profile.decide(policy, &reading);
-                debug!(task = %task_name, tier = %tier_name, ?decision, "task decision");
 
-                if let Decision::Resolve(resolved_reading) = &decision {
-                    resolved.insert(task_name.clone(), Resolution::Tier {
-                        tier_id,
-                        tier: tier_name.clone(),
-                        model_id: output.model_id.clone(),
-                        reading: resolved_reading.clone(),
-                    });
-                    active.remove(&task_name);
-                } else if last_policy_index.get(&task_name) == Some(&tier_index) {
-                    active.remove(&task_name);
+                let remaining = budget.saturating_sub(start.elapsed());
+                if remaining.is_zero() {
+                    break;
                 }
 
-                traces.entry(task_name.clone()).or_default().push(TierTrace {
-                    tier_id,
-                    tier: tier_name.clone(),
-                    model_id: output.model_id.clone(),
-                    reading,
-                    decision,
+                let tier_name = tier.name().clone();
+                let prompt = prompt.to_string();
+                let profiles_for_job = Arc::clone(&shared_profiles);
+                let tasks_for_job = task_ids.clone();
+                pending.extend(task_ids.iter().cloned());
+
+                let abort = jobs.spawn(async move {
+                    let call_started = Instant::now();
+                    let evaluation = tokio::time::timeout(
+                        remaining,
+                        tier.evaluate(&TierContext {
+                            prompt: &prompt,
+                            tasks: &tasks_for_job,
+                            task_profiles: profiles_for_job.as_slice(),
+                            budget: remaining,
+                        }),
+                    ).await;
+                    (
+                        tier_id,
+                        tier_name,
+                        tasks_for_job,
+                        call_started.elapsed(),
+                        evaluation,
+                    )
                 });
+                jobs_by_id.insert(abort.id(), (tier_id, task_ids));
+            }
+
+            if jobs.is_empty() {
+                break;
+            }
+
+            match jobs.join_next_with_id().await {
+                Some(Ok((job_id, (tier_id, tier_name, task_ids, took, evaluation)))) => {
+                    jobs_by_id.remove(&job_id);
+                    for task in &task_ids {
+                        pending.remove(task);
+                    }
+
+                    match evaluation {
+                        Ok(output) => {
+                            tier_calls.push(TierCall {
+                                tier: tier_name.clone(),
+                                tasks: task_ids.clone(),
+                                took,
+                            });
+
+                            let by_task = policies.get(&tier_id)
+                                .expect("task paths include only tiers with policies");
+                            for task_name in task_ids {
+                                if !active.contains(&task_name) {
+                                    continue;
+                                }
+                                let Some(profile) = profile_by_name.get(task_name.as_str()).copied() else {
+                                    active.remove(&task_name);
+                                    continue;
+                                };
+                                let policy = by_task.get(&task_name)
+                                    .expect("task batch contains only tasks with policies");
+                                let reading = output.readings.get(&task_name)
+                                    .cloned()
+                                    .unwrap_or(TierReading::Unsupported);
+                                let decision = profile.decide(policy, &reading);
+                                debug!(task = %task_name, tier = %tier_name, ?decision, "task decision");
+
+                                if let Decision::Resolve(resolved_reading) = &decision {
+                                    resolved.insert(task_name.clone(), Resolution::Tier {
+                                        tier_id,
+                                        tier: tier_name.clone(),
+                                        model_id: output.model_id.clone(),
+                                        reading: resolved_reading.clone(),
+                                    });
+                                    active.remove(&task_name);
+                                } else {
+                                    let cursor = next_index.get_mut(&task_name)
+                                        .expect("active profile has a path cursor");
+                                    *cursor += 1;
+                                    if *cursor >= task_paths[&task_name].len() {
+                                        active.remove(&task_name);
+                                    }
+                                }
+
+                                traces.entry(task_name.clone()).or_default().push(TierTrace {
+                                    tier_id,
+                                    tier: tier_name.clone(),
+                                    model_id: output.model_id.clone(),
+                                    reading,
+                                    decision,
+                                });
+                            }
+                        }
+                        Err(_) => {
+                            // A timed-out tier only exhausts the tasks in this
+                            // invocation. Other independent task paths continue.
+                            for task in task_ids {
+                                active.remove(&task);
+                            }
+                        }
+                    }
+                }
+                Some(Err(error)) => {
+                    if let Some((tier_id, task_ids)) = jobs_by_id.remove(&error.id()) {
+                        for task in task_ids {
+                            pending.remove(&task);
+                            active.remove(&task);
+                        }
+                        warn!(tier_id = %tier_id, error = %error, "tier evaluation task failed");
+                    } else {
+                        warn!(error = %error, "tier evaluation task failed without a registered job");
+                    }
+                }
+                None => break,
             }
 
             if required_tx.as_ref().is_some_and(|(required, _)| {
@@ -356,34 +420,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_paths_share_graph_nodes_and_batch_only_eligible_tasks() {
+    async fn tasks_at_the_same_frontier_share_one_union_node_invocation() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let registry = TierRegistry::of(vec![
-            fake_tier("rules", &calls, Duration::ZERO, &[("route", TierReading::Abstain("pass"))]),
             fake_tier("modernbert", &calls, Duration::ZERO, &[
                 ("route", scored(LABEL_JEV, 0.97)), ("tag", scored("engineering", 0.88)),
             ]),
         ]);
-        let profiles = vec![route(&["rules", "modernbert"]), tag(&["modernbert"])];
+        let profiles = vec![route(&["modernbert"]), tag(&["modernbert"])];
         let graph = CascadeGraph::from_tasks(&profiles, &registry).unwrap();
-        let rules = tier_id(&graph, "rules");
         let modernbert = tier_id(&graph, "modernbert");
         let runner = CascadeRunner::new(graph);
-        let policies: TierPolicyMap = [
-            (rules, [("route".into(), TierPolicy::new(0.78))].into()),
-            (modernbert, [
+        let policies: TierPolicyMap = [(
+            modernbert,
+            [
                 ("route".into(), TierPolicy::new(0.95)),
                 ("tag".into(), TierPolicy::new(0.80)),
-            ].into()),
-        ].into();
+            ].into(),
+        )].into();
 
         let result = runner.run("prompt", &profiles, &policies, Duration::from_secs(1)).await;
         assert!(resolved_at(&result.tasks["route"].resolution, "modernbert"));
         assert!(resolved_at(&result.tasks["tag"].resolution, "modernbert"));
-        assert_eq!(calls.lock().unwrap().as_slice(), [
-            ("rules".into(), vec!["route".into()]),
-            ("modernbert".into(), vec!["route".into(), "tag".into()]),
-        ]);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [("modernbert".into(), vec!["route".into(), "tag".into()])],
+        );
     }
 
     #[tokio::test]
@@ -410,6 +472,66 @@ mod tests {
         assert_eq!(required.tasks["tag"].resolution, Resolution::Deferred);
         let complete = split.done.await.unwrap();
         assert!(resolved_at(&complete.tasks["tag"].resolution, "modernbert"));
+    }
+
+    #[tokio::test]
+    async fn a_slow_sidecar_predecessor_does_not_block_a_required_task_at_a_shared_node() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let registry = TierRegistry::of(vec![
+            fake_tier("rules", &calls, Duration::from_millis(5), &[
+                ("route", TierReading::Abstain("pass")),
+            ]),
+            fake_tier("prefilter", &calls, Duration::from_millis(250), &[
+                ("tag", TierReading::Abstain("continue")),
+            ]),
+            fake_tier("modernbert", &calls, Duration::from_millis(5), &[
+                ("route", scored(LABEL_JEV, 0.99)),
+                ("tag", scored("engineering", 0.91)),
+            ]),
+        ]);
+        // Put the optional task first deliberately. Its predecessor is slower,
+        // but it shares the eventual encoder TierInstance with the required route.
+        let profiles = vec![
+            tag(&["prefilter", "modernbert"]),
+            route(&["rules", "modernbert"]),
+        ];
+        let graph = CascadeGraph::from_tasks(&profiles, &registry).unwrap();
+        let rules = tier_id(&graph, "rules");
+        let prefilter = tier_id(&graph, "prefilter");
+        let modernbert = tier_id(&graph, "modernbert");
+        let runner = Arc::new(CascadeRunner::new(graph));
+        let policies: TierPolicyMap = [
+            (rules, [("route".into(), TierPolicy::new(0.9))].into()),
+            (prefilter, [("tag".into(), TierPolicy::new(0.8))].into()),
+            (modernbert, [
+                ("route".into(), TierPolicy::new(0.9)),
+                ("tag".into(), TierPolicy::new(0.8)),
+            ].into()),
+        ].into();
+
+        let split = runner.run_split(
+            "prompt".into(),
+            profiles,
+            ["route".into()].into(),
+            Arc::new(policies),
+            Duration::from_secs(2),
+        );
+        let required = tokio::time::timeout(Duration::from_millis(100), split.required)
+            .await
+            .expect("the route must reach the shared node without waiting for tag")
+            .unwrap();
+        assert!(resolved_at(&required.tasks["route"].resolution, "modernbert"));
+        assert_eq!(required.tasks["tag"].resolution, Resolution::Deferred);
+
+        let complete = split.done.await.unwrap();
+        assert!(resolved_at(&complete.tasks["tag"].resolution, "modernbert"));
+
+        let mut encoder_batches: Vec<Vec<String>> = calls.lock().unwrap().iter()
+            .filter(|(tier, _)| tier == "modernbert")
+            .map(|(_, tasks)| tasks.clone())
+            .collect();
+        encoder_batches.sort();
+        assert_eq!(encoder_batches, [vec!["route".to_string()], vec!["tag".to_string()]]);
     }
 
     #[tokio::test]

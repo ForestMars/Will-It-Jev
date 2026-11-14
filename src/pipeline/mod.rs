@@ -1,7 +1,9 @@
 // src/pipeline/mod.rs
 //
-// Multi-task inference substrate. Each Task owns its ordered Cascade; the
-// CascadeGraph compiles their shared tier nodes and ordering constraints.
+// Multi-task inference substrate. Each Task owns its ordered Cascade. The
+// CascadeGraph compiles the global union of shared tier instances and records
+// task-labelled progression edges; runtime scheduling advances task paths
+// independently over those shared nodes.
 
 pub mod cascade;
 pub mod config;

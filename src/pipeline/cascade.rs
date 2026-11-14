@@ -85,11 +85,14 @@ impl fmt::Display for CascadeGraphError {
 }
 impl Error for CascadeGraphError {}
 
-/// The graph owns the concrete TierInstances. Each task path remains a sequence
-/// of TierNames; graph nodes receive hash-derived TierIds only during compilation.
+/// The compiled graph is the global union of materialized tier instances.
+/// Nodes are shared by name/instance identity. Task paths remain separate ordered
+/// projections over those nodes; their adjacencies are retained as provenance,
+/// rather than treated as global runtime barriers.
 #[derive(Clone, Default)]
 pub struct CascadeGraph {
-    paths: BTreeMap<String, Cascade>,
+    paths: BTreeMap<String, Vec<TierId>>,
+    progression_edges: BTreeMap<(TierId, TierId), BTreeSet<String>>,
     order: Vec<TierId>,
     tasks_by_tier: BTreeMap<TierId, BTreeSet<String>>,
     names_by_id: BTreeMap<TierId, TierName>,
@@ -187,12 +190,16 @@ impl CascadeGraph {
             }
 
             for edge in path_ids.windows(2) {
-                if successors.entry(edge[0]).or_default().insert(edge[1]) {
-                    *indegree.entry(edge[1]).or_insert(0) += 1;
+                let from = edge[0];
+                let to = edge[1];
+                graph.progression_edges.entry((from, to)).or_default()
+                    .insert(task.name.clone());
+                if successors.entry(from).or_default().insert(to) {
+                    *indegree.entry(to).or_insert(0) += 1;
                 }
             }
 
-            graph.paths.insert(task.name.clone(), task.cascade.clone());
+            graph.paths.insert(task.name.clone(), path_ids);
         }
 
         // Preserve first appearance in task cascades as the deterministic tie-break.
@@ -231,7 +238,26 @@ impl CascadeGraph {
         Ok(graph)
     }
 
+    /// Deterministic topological projection of the global union of task-path
+    /// transitions. This is useful for stable graph presentation and Slot
+    /// assignment. Runtime scheduling follows task_path(), so an unrelated
+    /// task's predecessor never becomes a barrier for this task.
     pub fn order(&self) -> &[TierId] { &self.order }
+
+    /// The materialized tier instances in one task's authored Cascade order.
+    pub fn task_path(&self, task: &str) -> Option<&[TierId]> {
+        self.paths.get(task).map(Vec::as_slice)
+    }
+
+    /// Tasks whose authored paths contain this transition. These are
+    /// progression edges, not shared-computation dependencies.
+    pub fn tasks_on_transition(
+        &self,
+        from: &TierId,
+        to: &TierId,
+    ) -> Option<&BTreeSet<String>> {
+        self.progression_edges.get(&(*from, *to))
+    }
 
     pub fn task_uses(&self, task: &str, tier: &TierId) -> bool {
         self.tasks_by_tier.get(tier).is_some_and(|tasks| tasks.contains(task))
@@ -346,6 +372,20 @@ mod tests {
         let names: Vec<_> = graph.order().iter()
             .map(|id| graph.tier_name(id).unwrap().as_str()).collect();
         assert_eq!(names, ["alpha", "beta", "gamma"]);
+
+        let alpha = graph.id_for_name(&tname("alpha")).unwrap();
+        let beta = graph.id_for_name(&tname("beta")).unwrap();
+        let gamma = graph.id_for_name(&tname("gamma")).unwrap();
+        assert_eq!(graph.task_path("first").unwrap(), &[alpha, gamma]);
+        assert_eq!(graph.task_path("second").unwrap(), &[beta, gamma]);
+        assert_eq!(
+            graph.tasks_on_transition(&alpha, &gamma).unwrap(),
+            &BTreeSet::from(["first".to_string()]),
+        );
+        assert_eq!(
+            graph.tasks_on_transition(&beta, &gamma).unwrap(),
+            &BTreeSet::from(["second".to_string()]),
+        );
     }
 
     #[test]
