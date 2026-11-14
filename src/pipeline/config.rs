@@ -497,10 +497,8 @@ mod tests {
         let graph = CascadeGraph::from_tasks(&tasks, &registry).unwrap();
         let route = tasks.iter().find(|task| task.name == "route").unwrap();
         let tag = tasks.iter().find(|task| task.name == "tag").unwrap();
-        let route_names: Vec<_> = route.cascade.tiers().iter()
-            .map(|id| graph.tier_name(id).unwrap().as_str()).collect();
-        let tag_names: Vec<_> = tag.cascade.tiers().iter()
-            .map(|id| graph.tier_name(id).unwrap().as_str()).collect();
+        let route_names: Vec<_> = route.cascade.tiers().iter().map(TierName::as_str).collect();
+        let tag_names: Vec<_> = tag.cascade.tiers().iter().map(TierName::as_str).collect();
         let graph_names: Vec<_> = graph.order().iter()
             .map(|id| graph.tier_name(id).unwrap().as_str()).collect();
         assert_eq!(route_names, ["rules", "modernbert", "harrier"]);
