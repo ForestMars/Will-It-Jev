@@ -14,7 +14,7 @@ use pipeline::tagger::{CascadeTagger, JointTagStore};
 use legacy_tiers::LegacyTierNumbers;
 use pipeline::cascade::CascadeGraph;
 use pipeline::task::TierPolicyMap;
-use pipeline::tier::{hex, Params, Role, Tier, TierInstance, TierName};
+use pipeline::tier::{hex, ModelFormat, Params, Role, Tier, TierName};
 use pipeline::TierRegistry;
 use pipeline::CascadeRunner;
 use router::dispatch::DownstreamDispatcher;
@@ -68,11 +68,25 @@ fn grpc_settings(
         .or_else(|| legacy.and_then(|tier| tier.endpoint.as_deref()));
     let timeout_ms = params.timeout_ms.or_else(|| legacy.and_then(|tier| tier.timeout_ms));
     let upper = name.as_str().to_ascii_uppercase().replace('-', "_");
+    // model_format selects the inference runtime adapter. Legacy ordinals only
+    // provide compatibility settings; they do not select the runtime.
     let (endpoint_env, endpoint_aliases, timeout_env): (String, &[&str], String) =
-        match ordinal {
-            Some(3) => ("TIER3_SCORER_ENDPOINT".into(), &["MODERNBERT_ENDPOINT"], "TIER3_MAX_CALL_MS".into()),
-            Some(4) => ("TIER4_SCORER_ENDPOINT".into(), &["TIER4_HARRIER_ENDPOINT", "TIER3_ENDPOINT"], "TIER4_MAX_CALL_MS".into()),
-            _ => (format!("TIER_{upper}_ENDPOINT"), &[], format!("TIER_{upper}_MAX_CALL_MS")),
+        match params.model_format {
+            Some(ModelFormat::Onnx) => (
+                "TIER3_SCORER_ENDPOINT".into(),
+                &["ONNX_RUNTIME_ENDPOINT", "MODERNBERT_ENDPOINT"],
+                "TIER3_MAX_CALL_MS".into(),
+            ),
+            Some(ModelFormat::Gguf) => (
+                "TIER4_SCORER_ENDPOINT".into(),
+                &["GGUF_RUNTIME_ENDPOINT", "TIER4_HARRIER_ENDPOINT", "TIER3_ENDPOINT"],
+                "TIER4_MAX_CALL_MS".into(),
+            ),
+            None => (
+                format!("TIER_{upper}_ENDPOINT"),
+                &[],
+                format!("TIER_{upper}_MAX_CALL_MS"),
+            ),
         };
     Ok((
         configured_endpoint(&endpoint_env, endpoint_aliases, endpoint)?,
@@ -305,13 +319,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         let resolved = resolve_instance_params(name, tier, params, &config.router, &pipeline_config.legacy)?;
-        let instance = TierInstance::build(name.clone(), tier.clone(), resolved)?;
         tracing::info!(
-            tier = %instance.name(), exex = instance.tier().exex.as_str(),
-            model_format = ?instance.params().model_format.map(|format| format.as_str()), model = %instance.model_label(),
-            "tier instance built"
+            tier = %name,
+            executor = tier.exex.as_str(),
+            model_format = ?resolved.model_format.map(ModelFormat::as_str),
+            "tier definition registered"
         );
-        registry.register(Arc::new(instance))?;
+        registry.register(name.clone(), *tier, resolved)?;
     }
     if registry.is_empty() {
         return Err("no cascade tier is enabled; enable at least one [[tier]]".into());
@@ -352,10 +366,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Legacy artifact hashes describe the loaded legacy executors, independent
     // of whether a particular task currently traverses them.
     let artifact_hash = |role: Role| {
-        registry.names().into_iter()
-            .filter_map(|name| registry.get(&name))
-            .find(|tier| tier.tier().exex == role)
-            .and_then(|tier| tier.artifact_hash().map(|hash| hex(hash)))
+        execution_graph.instances()
+            .find(|(_, instance)| instance.tier().exex == role)
+            .and_then(|(_, instance)| instance.artifact_hash().map(|hash| hex(hash)))
             .unwrap_or_else(|| "disabled".to_string())
     };
     let hashes = telemetry::Hashes {
@@ -396,7 +409,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         let has_executable_tag_head = execution_graph.order().iter().any(|id| {
             execution_graph.task_uses("tag", id)
-                && execution_graph.tier_name(id).and_then(|name| registry.get(name)).is_some_and(|instance| {
+                && execution_graph.instance(id).is_some_and(|instance| {
                     instance.tier().exex == Role::Encoder
                         && tier_policies.get(id).is_some_and(|by_task| by_task.contains_key("tag"))
                 })
@@ -410,7 +423,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let tier_policies = Arc::new(tier_policies);
-    let cascade = Arc::new(CascadeRunner::new(registry, execution_graph)?);
+    let cascade = Arc::new(CascadeRunner::new(execution_graph));
     let legacy = Arc::new(pipeline_config.legacy.clone());
 
     let downstream_timeout =
