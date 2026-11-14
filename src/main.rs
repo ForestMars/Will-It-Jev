@@ -13,7 +13,7 @@ use crate::tagging::{ClickHouseRawTable, OvenV1Tagger, TagConfig};
 use pipeline::tagger::{CascadeTagger, JointTagStore};
 use legacy_tiers::LegacyTierNumbers;
 use pipeline::cascade::Cascade;
-use pipeline::task::{Task, TierPolicyMap};
+use pipeline::task::TierPolicyMap;
 use pipeline::tier::{hex, Params, Role, Tier, TierInstance, TierName};
 use pipeline::TierRegistry;
 use pipeline::CascadeRunner;

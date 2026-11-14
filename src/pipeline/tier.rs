@@ -7,7 +7,7 @@
 //   Params        what distinguishes one instance of a Tier from another: the
 //                 model format and model, rule file, endpoint, timeout.
 //   TierInstance  a Tier plus resolved instance parameters, loaded artifacts, and runner.
-//                 CascadeGraph assigns its TierId using TierInstance::derive_id.
+//                 Cascade assigns its TierId using TierInstance::derive_id.
 //
 // A tier returns raw readings for the task IDs it can serve; all task-specific
 // acceptance policy lives outside this module.
@@ -904,7 +904,6 @@ mod tests {
         let tasks = [String::from("route"), String::from("tag")];
         let profiles = [
             Task {
-                cascade: crate::pipeline::task::Cascade::default(),
                 name: String::from("route"),
                 output_kind: OutputKind::Binary,
                 labels: None,
@@ -913,7 +912,6 @@ mod tests {
                 fallback: super::super::task::FallbackPolicy::Defer,
             },
             Task {
-                cascade: crate::pipeline::task::Cascade::default(),
                 name: String::from("tag"),
                 output_kind: OutputKind::Multiclass,
                 labels: None,
@@ -938,7 +936,6 @@ mod tests {
         let tier = TierInstance::encoder("route-scorer", RequestShape::ScoreTasks, None, scorer);
         let tasks = [String::from("route")];
         let profiles = [Task {
-            cascade: crate::pipeline::task::Cascade::default(),
             name: String::from("route"),
             output_kind: OutputKind::Binary,
             labels: None,
@@ -966,7 +963,6 @@ mod tests {
         let tier = TierInstance::encoder("no-joint", RequestShape::ScoreTasks, None, scorer);
         let tasks = [String::from("route")];
         let profiles = [Task {
-            cascade: crate::pipeline::task::Cascade::default(),
             name: String::from("route"),
             output_kind: OutputKind::Binary,
             labels: None,

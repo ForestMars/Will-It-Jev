@@ -737,7 +737,7 @@ mod tests {
             "11111111-1111-4111-8111-111111111111".into(),
             "prompt",
             &hashes,
-            &graph(),
+            &cascade(),
             &legacy(),
             &[route_profile()],
             &outcome,

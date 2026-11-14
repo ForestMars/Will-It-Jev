@@ -362,7 +362,7 @@ fn task_outcome_json(outcome: &TaskOutcome, tiers: &Cascade) -> Value {
 mod tests {
     use super::*;
     use crate::pipeline::{
-        tier::{tname, TierId},
+        tier::tname,
         registry::TierRegistry,
         task::{FallbackPolicy, OutputKind, Reading, TierPolicy},
         tier::{FakeEvaluate, TierContext, TierInstance, TierOutput},
