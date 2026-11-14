@@ -419,7 +419,7 @@ mod tests {
             fake_tier("rules", &calls, Duration::ZERO, &[("route", scored(LABEL_JEV, 0.99))]),
             fake_tier("harrier", &calls, Duration::ZERO, &[("route", scored(LABEL_LLM, 0.99))]),
         ]);
-        let profiles = vec![route(&registry, &["rules"])];
+        let profiles = vec![route(&["rules"])];
         let graph = CascadeGraph::from_tasks(&profiles, &registry).unwrap();
         let rules = tier_id(&graph, "rules");
         let unrelated = TierId::from_digest(&[0xab; 32]);
@@ -452,7 +452,7 @@ mod tests {
     async fn task_with_no_policy_uses_fallback_without_a_tier_call() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let registry = TierRegistry::of(vec![fake_tier("rules", &calls, Duration::ZERO, &[])]);
-        let profiles = vec![tag(&registry, &["rules"])];
+        let profiles = vec![tag(&["rules"])];
         let graph = CascadeGraph::from_tasks(&profiles, &registry).unwrap();
         let runner = CascadeRunner::new(graph);
         let result = runner.run("prompt", &profiles, &TierPolicyMap::new(), Duration::from_secs(1)).await;
