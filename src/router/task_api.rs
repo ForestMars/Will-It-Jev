@@ -365,7 +365,7 @@ mod tests {
         cascade::{Cascade, CascadeGraph},
         registry::TierRegistry,
         task::{FallbackPolicy, OutputKind, Reading, TierPolicy},
-        tier::{tname, FakeEvaluate, TierContext, TierInstance, TierOutput},
+        tier::{tname, FakeEvaluate, ModelFormat, Params, RequestShape, Role, Tier, TierContext, TierOutput, Transport},
     };
     use async_trait::async_trait;
     use std::collections::BTreeMap;
@@ -392,11 +392,10 @@ mod tests {
         }
     }
 
-    fn profile(task: &str, kind: OutputKind, labels: &[&str],
-        registry: &TierRegistry, path: &[&str]) -> Task {
+    fn profile(task: &str, kind: OutputKind, labels: &[&str], path: &[&str]) -> Task {
         Task {
             name: task.to_string(),
-            cascade: Cascade::from_names(&path.iter().map(|name| tname(name)).collect::<Vec<_>>(), registry).unwrap(),
+            cascade: Cascade::from_names(&path.iter().map(|name| tname(name)).collect::<Vec<_>>()).unwrap(),
             output_kind: kind,
             labels: Some(labels.iter().map(|label| (*label).to_string()).collect()),
             label_metadata: Vec::new(),
@@ -405,18 +404,38 @@ mod tests {
         }
     }
 
+    fn fake_entry(
+        name: &str,
+        role: Role,
+        fake: Arc<dyn FakeEvaluate>,
+    ) -> (super::super::super::pipeline::tier::TierName, Tier, Params, Arc<dyn FakeEvaluate>) {
+        let (transport, request_shape, model_format, model, config, endpoint, timeout_ms) =
+            match role {
+                Role::Rules => (Transport::InProcess, None, None, None, Some("test-rules".into()), None, None),
+                Role::FastText => (Transport::InProcess, None, None, Some("test-fasttext".into()), None, None, None),
+                Role::Encoder => (Transport::Grpc, Some(RequestShape::Score), Some(ModelFormat::Onnx),
+                    Some(name.into()), None, Some("http://127.0.0.1:9".into()), Some(250)),
+            };
+        (
+            tname(name),
+            Tier { exex: role, transport, request_shape },
+            Params { model_format, model, config, endpoint, timeout_ms, enabled: None },
+            fake,
+        )
+    }
+
     #[tokio::test]
     async fn arbitrary_tasks_follow_independent_paths_and_return_required_subset_first() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let registry = TierRegistry::of(vec![
-            Arc::new(TierInstance::fake("rules", Arc::new(FixtureTier {
+            fake_entry("rules", Role::Rules, Arc::new(FixtureTier {
                 name: "rules".into(),
                 delay: Duration::from_millis(5),
                 readings: [("customer_intent".into(),
                     TierReading::Scored(Reading::new("billing", 0.97)))].into(),
                 calls: calls.clone(),
-            }))),
-            Arc::new(TierInstance::fake("modernbert", Arc::new(FixtureTier {
+            })),
+            fake_entry("modernbert", Role::Encoder, Arc::new(FixtureTier {
                 name: "modernbert".into(),
                 delay: Duration::from_millis(300),
                 readings: [
@@ -424,18 +443,18 @@ mod tests {
                     ("fraud_risk".into(), TierReading::Scored(Reading::new("payment_abuse", 0.88))),
                 ].into(),
                 calls: calls.clone(),
-            }))),
-        ]);
+            })),
+        ])
 
         let profiles = vec![
-            profile("customer_intent", OutputKind::Multiclass, &["billing", "account"], &registry, &["rules"]),
-            profile("urgency", OutputKind::Ordinal, &["low", "medium", "high"], &registry, &["modernbert"]),
-            profile("fraud_risk", OutputKind::Multilabel, &["account_takeover", "payment_abuse"], &registry, &["modernbert"]),
+            profile("customer_intent", OutputKind::Multiclass, &["billing", "account"], &["rules"]),
+            profile("urgency", OutputKind::Ordinal, &["low", "medium", "high"], &["modernbert"]),
+            profile("fraud_risk", OutputKind::Multilabel, &["account_takeover", "payment_abuse"], &["modernbert"]),
         ];
         let graph = CascadeGraph::from_tasks(&profiles, &registry).unwrap();
         let rules_id = graph.id_for_name(&tname("rules")).unwrap();
         let modernbert_id = graph.id_for_name(&tname("modernbert")).unwrap();
-        let cascade = Arc::new(CascadeRunner::new(registry, graph).unwrap());
+        let cascade = Arc::new(CascadeRunner::new(graph));
         let policies: TierPolicyMap = [
             (rules_id, [("customer_intent".into(), TierPolicy::new(0.90))].into()),
             (modernbert_id, [
