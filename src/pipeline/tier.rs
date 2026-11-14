@@ -860,13 +860,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_sidecar_call_is_labelled_by_model_not_by_name() {
+    async fn failed_sidecar_call_uses_tier_name_as_fallback_label() {
         let instance = build_entry(encoder_config("enc-a", ModelFormat::Onnx, Some("model-a"), "http://127.0.0.1:9")).unwrap();
         let tasks = [String::from("route")];
         let output = instance
             .evaluate(&TierContext { prompt: "test", tasks: &tasks, task_profiles: &[], budget: Duration::from_millis(500) })
             .await;
-        assert_eq!(output.model_id, "model-a");
+        assert_eq!(output.model_id, "enc-a");
         assert!(matches!(output.readings[&String::from("route")], TierReading::Abstain(_)));
     }
 
