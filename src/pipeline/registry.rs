@@ -1,13 +1,10 @@
-// src/pipeline/registry.rs
-//
-// Unordered inventory of available tier instances, addressed only by authored name.
+// Unordered catalog of tier definitions. Concrete instances belong to CascadeGraph.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
 
-use super::tier::{TierInstance, TierName};
+use super::tier::{Params, Tier, TierName};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistryError {
@@ -21,29 +18,36 @@ impl fmt::Display for RegistryError {
         }
     }
 }
+
 impl Error for RegistryError {}
 
-/// The complete inventory of available tier instances. It has no execution
-/// order and no knowledge of graph identities.
+/// Available tier definitions and their declarative parameters.
+/// This catalog deliberately contains no TierInstance and assigns no TierId.
 #[derive(Default)]
 pub struct TierRegistry {
-    entries: BTreeMap<TierName, Arc<TierInstance>>,
+    entries: BTreeMap<TierName, (Tier, Params)>,
+    #[cfg(test)]
+    fakes: BTreeMap<TierName, std::sync::Arc<dyn super::tier::FakeEvaluate>>,
 }
 
 impl TierRegistry {
     pub fn new() -> Self { Self::default() }
 
-    pub fn register(&mut self, tier: Arc<TierInstance>) -> Result<(), RegistryError> {
-        let name = tier.name().clone();
+    pub fn register(
+        &mut self,
+        name: TierName,
+        tier: Tier,
+        params: Params,
+    ) -> Result<(), RegistryError> {
         if self.entries.contains_key(&name) {
             return Err(RegistryError::DuplicateName(name));
         }
-        self.entries.insert(name, tier);
+        self.entries.insert(name, (tier, params));
         Ok(())
     }
 
-    pub fn get(&self, name: &TierName) -> Option<Arc<TierInstance>> {
-        self.entries.get(name).map(Arc::clone)
+    pub fn get(&self, name: &TierName) -> Option<(&Tier, &Params)> {
+        self.entries.get(name).map(|(tier, params)| (tier, params))
     }
 
     pub fn names(&self) -> BTreeSet<TierName> {
@@ -55,11 +59,40 @@ impl TierRegistry {
     #[cfg(test)]
     pub fn len(&self) -> usize { self.entries.len() }
 
+    // Test adapters are injected in place of materialized production instances.
     #[cfg(test)]
-    pub fn of(tiers: Vec<Arc<TierInstance>>) -> Self {
+    pub fn register_fake(
+        &mut self,
+        name: TierName,
+        tier: Tier,
+        params: Params,
+        fake: std::sync::Arc<dyn super::tier::FakeEvaluate>,
+    ) -> Result<(), RegistryError> {
+        self.register(name.clone(), tier, params)?;
+        self.fakes.insert(name, fake);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fake(
+        &self,
+        name: &TierName,
+    ) -> Option<std::sync::Arc<dyn super::tier::FakeEvaluate>> {
+        self.fakes.get(name).cloned()
+    }
+
+    #[cfg(test)]
+    pub fn of(tiers: Vec<std::sync::Arc<super::tier::TierInstance>>) -> Self {
         let mut registry = Self::new();
-        for tier in tiers {
-            registry.register(tier).expect("test tier names must be unique");
+        for instance in tiers {
+            let fake = instance.fake_evaluator()
+                .expect("test registry instances must use FakeEvaluate");
+            registry.register_fake(
+                instance.name().clone(),
+                *instance.tier(),
+                instance.params().clone(),
+                fake,
+            ).expect("test tier names must be unique");
         }
         registry
     }
@@ -68,49 +101,51 @@ impl TierRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::tier::tname;
-    use crate::pipeline::tier::{FakeEvaluate, TierContext, TierOutput};
-    use async_trait::async_trait;
+    use crate::pipeline::tier::{tname, ModelFormat, RequestShape, Role, Transport};
 
-    struct Silent;
-    #[async_trait]
-    impl FakeEvaluate for Silent {
-        async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
-            TierOutput::abstain_all("silent", ctx.tasks, "test")
+    fn params() -> Params {
+        Params {
+            model_format: Some(ModelFormat::Onnx),
+            model: Some("opaque-model-config".into()),
+            config: None,
+            endpoint: Some("http://127.0.0.1:9".into()),
+            timeout_ms: Some(250),
+            enabled: None,
         }
     }
 
-    fn fake(name: &str) -> Arc<TierInstance> {
-        Arc::new(TierInstance::fake(name, Arc::new(Silent)))
-    }
-
     #[test]
-    fn registry_is_an_unordered_inventory_addressed_by_name() {
-        let registry = TierRegistry::of(vec![fake("modernbert"), fake("rules"), fake("unused")]);
-        assert_eq!(registry.len(), 3);
-        assert!(registry.get(&tname("modernbert")).is_some());
-        assert!(registry.get(&tname("rules")).is_some());
-        assert!(registry.get(&tname("unused")).is_some());
-        assert_eq!(
-            registry.names(),
-            [tname("modernbert"), tname("rules"), tname("unused")].into()
-        );
-    }
-
-    #[test]
-    fn duplicate_names_are_rejected() {
+    fn registry_is_an_unordered_catalog_of_definitions() {
         let mut registry = TierRegistry::new();
-        registry.register(fake("rules")).unwrap();
-        assert_eq!(registry.register(fake("rules")), Err(RegistryError::DuplicateName(tname("rules"))));
-        assert_eq!(registry.len(), 1);
+        let encoder = Tier {
+            exex: Role::Encoder,
+            transport: Transport::Grpc,
+            request_shape: Some(RequestShape::Score),
+        };
+        registry.register(tname("encoder"), encoder, params()).unwrap();
+        registry.register(tname("unused"), encoder, params()).unwrap();
+
+        assert_eq!(registry.len(), 2);
+        assert!(registry.get(&tname("encoder")).is_some());
+        assert!(registry.get(&tname("unused")).is_some());
     }
 
     #[test]
-    fn different_tier_names_can_represent_separate_instances() {
-        let registry = TierRegistry::of(vec![
-            Arc::new(TierInstance::fake_with_model("first", "same-model", Arc::new(Silent))),
-            Arc::new(TierInstance::fake_with_model("second", "same-model", Arc::new(Silent))),
-        ]);
-        assert_eq!(registry.len(), 2);
+    fn duplicate_tier_names_are_rejected() {
+        let mut registry = TierRegistry::new();
+        let tier = Tier {
+            exex: Role::Rules,
+            transport: Transport::InProcess,
+            request_shape: None,
+        };
+        let make_params = || Params {
+            model_format: None, model: None, config: Some("config/tier1.toml".into()),
+            endpoint: None, timeout_ms: None, enabled: None,
+        };
+        registry.register(tname("rules"), tier, make_params()).unwrap();
+        assert_eq!(
+            registry.register(tname("rules"), tier, make_params()),
+            Err(RegistryError::DuplicateName(tname("rules"))),
+        );
     }
 }
