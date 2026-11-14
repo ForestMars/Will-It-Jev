@@ -430,7 +430,7 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
 mod tests {
     use super::*;
     use crate::pipeline::cascade::CascadeGraph;
-    use crate::pipeline::tier::{FakeEvaluate, TierContext, TierInstance, TierOutput};
+    use crate::pipeline::tier::{FakeEvaluate, TierContext, TierOutput};
     use async_trait::async_trait;
     use std::sync::Arc;
 
@@ -442,8 +442,13 @@ mod tests {
         }
     }
     fn registry(cfg: &PipelineConfig) -> TierRegistry {
-        TierRegistry::of(cfg.tiers.iter().map(|(name, _, _)|
-            Arc::new(TierInstance::fake(name.as_str(), Arc::new(Silent)))).collect())
+        let entries = cfg.tiers.iter().map(|(name, tier, params)| (
+            name.clone(),
+            *tier,
+            params.clone(),
+            Arc::new(Silent) as Arc<dyn FakeEvaluate>,
+        )).collect();
+        TierRegistry::of(entries)
     }
     fn named_config() -> &'static str {
         r#"
