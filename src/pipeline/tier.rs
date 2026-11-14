@@ -183,7 +183,7 @@ impl ModelFormat {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tier {
-    pub role: Role,
+    pub exex: Role,
     pub transport: Transport,
     /// Encoder over gRPC only.
     pub request_shape: Option<RequestShape>,
@@ -192,7 +192,7 @@ pub struct Tier {
 impl Tier {
     /// A definition is coherent when its role, transport and request shape agree.
     pub fn validate(&self) -> Result<(), &'static str> {
-        match (self.role, self.transport, self.request_shape) {
+        match (self.exex, self.transport, self.request_shape) {
             (Role::Rules | Role::FastText, Transport::InProcess, None) => Ok(()),
             (Role::Rules | Role::FastText, _, _) => {
                 Err("rules and fasttext require transport = \"in_process\" and no request_shape")
@@ -205,7 +205,7 @@ impl Tier {
     }
 
     pub fn accepts(&self, model_format: Option<ModelFormat>) -> bool {
-        matches!((self.role, model_format),
+        matches!((self.exex, model_format),
             (Role::Rules | Role::FastText, None)
                 | (Role::Encoder, Some(ModelFormat::Onnx | ModelFormat::Gguf)))
     }
@@ -391,9 +391,9 @@ impl TierInstance {
     pub fn build(name: TierName, tier: Tier, params: Params) -> Result<Self, Box<dyn Error>> {
         tier.validate().map_err(|reason| format!("tier {name}: {reason}"))?;
         if !tier.accepts(params.model_format) {
-            return Err(format!("tier {name}: model_format {:?} is incompatible with {} executor", params.model_format.map(ModelFormat::as_str), tier.role.as_str()).into());
+            return Err(format!("tier {name}: model_format {:?} is incompatible with {} executor", params.model_format.map(ModelFormat::as_str), tier.exex.as_str()).into());
         }
-        let (runner, artifact_hash) = match tier.role {
+        let (runner, artifact_hash) = match tier.exex {
             Role::Rules => {
                 let path = params.config.as_deref()
                     .ok_or_else(|| format!("tier {name}: rules tier has no `config` path"))?;
@@ -451,7 +451,7 @@ impl TierInstance {
             digest.update(b"\0");
         };
         field("tier_name", name.as_str());
-        field("role", tier.role.as_str());
+        field("role", tier.exex.as_str());
         field("model_format", params.model_format.map(ModelFormat::as_str).unwrap_or(""));
         field("model", params.model.as_deref().unwrap_or(""));
         field("artifact", &artifact_hash.map(|hash| hex(hash)).unwrap_or_default());
@@ -467,7 +467,7 @@ impl TierInstance {
     /// example when a sidecar call fails. It comes from the model, never from the
     /// name: names are free to change.
     pub fn model_label(&self) -> String {
-        match self.tier.role {
+        match self.tier.exex {
             Role::Rules => "heuristic".to_string(),
             Role::FastText => self.params.model.as_deref()
                 .and_then(|path| Path::new(path).file_name())
@@ -638,7 +638,7 @@ impl TierInstance {
     }
 
     pub fn fake_with_model(name: &str, model: &str, fake: Arc<dyn FakeEvaluate>) -> Self {
-        let tier = Tier { role: Role::Rules, transport: Transport::InProcess, request_shape: None };
+        let tier = Tier { exex: Role::Rules, transport: Transport::InProcess, request_shape: None };
         let params = Params {
             model_format: None, model: Some(model.to_string()), config: None,
             endpoint: None, timeout_ms: None, enabled: None,
@@ -650,7 +650,7 @@ impl TierInstance {
 
     /// An encoder instance over an already-constructed gRPC runner.
     pub fn encoder(name: &str, shape: RequestShape, model: Option<&str>, runner: Tier3Runner) -> Self {
-        let tier = Tier { role: Role::Encoder, transport: Transport::Grpc, request_shape: Some(shape) };
+        let tier = Tier { exex: Role::Encoder, transport: Transport::Grpc, request_shape: Some(shape) };
         let params = Params {
             model_format: Some(ModelFormat::Onnx), model: model.map(str::to_string), config: None,
             endpoint: Some("http://127.0.0.1:9".into()), timeout_ms: Some(250), enabled: None,
@@ -801,7 +801,7 @@ mod tests {
     fn encoder_config(name: &str, model_format: ModelFormat, model: Option<&str>, endpoint: &str) -> (TierName, Tier, Params) {
         (
             TierName::new(name).unwrap(),
-            Tier { role: Role::Encoder, transport: Transport::Grpc, request_shape: Some(RequestShape::Score) },
+            Tier { exex: Role::Encoder, transport: Transport::Grpc, request_shape: Some(RequestShape::Score) },
             Params {
                 model_format: Some(model_format), model: model.map(str::to_string), config: None,
                 endpoint: Some(endpoint.to_string()), timeout_ms: Some(250), enabled: None,
@@ -812,7 +812,7 @@ mod tests {
     fn rules_config(name: &str, config: Option<&str>) -> (TierName, Tier, Params) {
         (
             TierName::new(name).unwrap(),
-            Tier { role: Role::Rules, transport: Transport::InProcess, request_shape: None },
+            Tier { exex: Role::Rules, transport: Transport::InProcess, request_shape: None },
             Params {
                 model_format: None, model: None, config: config.map(str::to_string),
                 endpoint: None, timeout_ms: None, enabled: None,

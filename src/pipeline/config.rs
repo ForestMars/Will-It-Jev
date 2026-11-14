@@ -3,9 +3,10 @@
 // Loads task definitions, the tier registry, and tier/task resolution policies
 // as separate concerns.
 //
+//   [pipeline].cascade       the one shared ordered execution cascade
 //   [task.<id>]               what a task is
 //   [[tier]]                  the available named tiers; no execution order
-//   [tier_policy.<tier>.<id>] when a tier may resolve a task
+//   [tier_policy.<tier>.<id>] whether a task runs/resolves at a tier
 //   [legacy_tiers]            compatibility: tier name -> its old number (optional)
 //
 // `<tier>` is a tier name. For configs written before tiers had names, the key
@@ -24,18 +25,38 @@ use super::tier::TierName;
 use super::tier::{ModelFormat, Params, RequestShape, Role, Tier, Transport};
 
 type TierConfig = (TierName, Tier, Params);
-use super::task::{Cascade, FallbackPolicy, OutputKind, TaskLabelMetadata, Task, TierPolicy};
+use super::task::{FallbackPolicy, OutputKind, TaskLabelMetadata, Task, TierPolicy};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineSettings {
-    #[serde(default)]
     pub tag_via_cascade: bool,
-    /// Include sampled tagging as a best-effort task in the route request's cascade.
-    #[serde(default)]
+    /// Include sampled tagging as a best-effort task in the route request.
     pub tag_in_request: bool,
-    #[serde(default = "default_tag_budget_ms")]
     pub tag_budget_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPipelineSettings {
+    cascade: Option<Vec<String>>,
+    #[serde(default)]
+    tag_via_cascade: bool,
+    #[serde(default)]
+    tag_in_request: bool,
+    #[serde(default = "default_tag_budget_ms")]
+    tag_budget_ms: u64,
+}
+
+impl Default for RawPipelineSettings {
+    fn default() -> Self {
+        Self {
+            cascade: None,
+            tag_via_cascade: false,
+            tag_in_request: false,
+            tag_budget_ms: default_tag_budget_ms(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,7 +83,7 @@ fn default_tier_configs() -> Vec<TierConfig> {
         ("harrier", Role::Encoder, Transport::Grpc, Some(RequestShape::Score), Some(ModelFormat::Gguf)),
     ].into_iter().map(|(name, role, transport, request_shape, model_format)| (
         TierName::new(name).expect("built-in tier names are valid"),
-        Tier { role, transport, request_shape },
+        Tier { exex: role, transport, request_shape },
         Params { model_format, model: None, config: None, endpoint: None, timeout_ms: None, enabled: None },
     )).collect()
 
@@ -77,18 +98,18 @@ fn tier_configs_from(raw: Vec<RawTier>) -> Result<Vec<TierConfig>, Box<dyn Error
         if tiers.iter().any(|existing| existing.0 == name) {
             return Err(format!("[[tier]] {label:?} is defined twice").into());
         }
-        let definition = Tier { role: tier.executor, transport: tier.transport, request_shape: tier.request_shape };
+        let definition = Tier { exex: tier.executor, transport: tier.transport, request_shape: tier.request_shape };
         definition.validate().map_err(|reason| format!("[[tier]] {label:?}: {reason}"))?;
-        if definition.role == Role::Encoder && tier.model_format.is_none() {
+        if definition.exex == Role::Encoder && tier.model_format.is_none() {
             return Err(format!("[[tier]] {label:?}: encoder must declare model_format (onnx or gguf)").into());
         }
         if !definition.accepts(tier.model_format) {
-            return Err(format!("[[tier]] {label:?}: model_format {:?} is incompatible with {} executor", tier.model_format.map(ModelFormat::as_str), definition.role.as_str()).into());
+            return Err(format!("[[tier]] {label:?}: model_format {:?} is incompatible with {} executor", tier.model_format.map(ModelFormat::as_str), definition.exex.as_str()).into());
         }
-        if definition.role != Role::Encoder && (tier.endpoint.is_some() || tier.timeout_ms.is_some()) {
+        if definition.exex != Role::Encoder && (tier.endpoint.is_some() || tier.timeout_ms.is_some()) {
             return Err(format!("[[tier]] {label:?}: endpoint/timeout_ms require grpc transport").into());
         }
-        match definition.role {
+        match definition.exex {
             Role::Rules if tier.model.is_some() => {
                 return Err(format!("[[tier]] {label:?}: a rules tier takes `config`, not `model`").into());
             }
@@ -165,11 +186,7 @@ fn default_tag_budget_ms() -> u64 {
 
 impl Default for PipelineSettings {
     fn default() -> Self {
-        Self {
-            tag_via_cascade: false,
-            tag_in_request: false,
-            tag_budget_ms: default_tag_budget_ms(),
-        }
+        Self { tag_via_cascade: false, tag_in_request: false, tag_budget_ms: default_tag_budget_ms() }
     }
 }
 
@@ -177,9 +194,6 @@ impl Default for PipelineSettings {
 #[serde(deny_unknown_fields)]
 struct RawProfile {
     labels: Option<Vec<String>>,
-    /// Ordered path of tier names for this task.
-    #[serde(default)]
-    cascade: Option<Vec<String>>,
     #[serde(default)]
     output_kind: OutputKind,
     taxonomy: Option<String>,
@@ -209,7 +223,7 @@ struct RawCategory {
 #[derive(Debug, Default, Deserialize)]
 struct RawFile {
     #[serde(default)]
-    pipeline: PipelineSettings,
+    pipeline: RawPipelineSettings,
     #[serde(default)]
     task: BTreeMap<String, RawProfile>,
     #[serde(default)]
@@ -225,7 +239,9 @@ pub struct PipelineConfig {
     pub settings: PipelineSettings,
     /// Available configured tiers; vector order carries no scheduling semantics.
     pub(crate) tiers: Vec<TierConfig>,
-    profiles: BTreeMap<String, Task<TierName>>,
+    /// The single authored execution order shared by every task.
+    pub cascade: Vec<TierName>,
+    profiles: BTreeMap<String, Task>,
     /// Configuration policies are authored by tier name and resolve to TierId
     /// after tier instances have been constructed.
     pub tier_policies: BTreeMap<TierName, BTreeMap<String, TierPolicy>>,
@@ -234,12 +250,12 @@ pub struct PipelineConfig {
 }
 
 impl PipelineConfig {
-    pub fn profile(&self, task: &str) -> Option<Task<TierName>> {
+    pub fn profile(&self, task: &str) -> Option<Task> {
         self.profiles.get(task).cloned()
     }
 
-    /// All configured task contracts, returned in stable task-ID order.
-    pub fn profiles(&self) -> Vec<Task<TierName>> {
+    /// All configured task contracts, returned in stable task-name order.
+    pub fn profiles(&self) -> Vec<Task> {
         self.profiles.values().cloned().collect()
     }
 
@@ -279,26 +295,48 @@ pub fn parse(contents: &str) -> Result<PipelineConfig, Box<dyn Error>> {
     parse_with_base(contents, Path::new("."))
 }
 
-// Keep authored cascade paths as TierNames here. Availability, duplicate-path, and cycle validation belongs to CascadeGraph construction.
+// The shared authored Cascade is parsed as TierNames here and resolved against TierRegistry at startup.
 fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dyn Error>> {
     let raw: RawFile = toml::from_str(contents)?;
     let has_explicit_tier_registry = !raw.tier.is_empty();
     let tiers = tier_configs_from(raw.tier)?;
     let legacy = legacy_numbers_from(raw.legacy_tiers, &tiers, has_explicit_tier_registry)?;
+    let RawPipelineSettings {
+        cascade: configured_cascade,
+        tag_via_cascade,
+        tag_in_request,
+        tag_budget_ms,
+    } = raw.pipeline;
+    let cascade = match configured_cascade {
+        Some(names) => names.into_iter()
+            .map(|name| TierName::new(name.clone())
+                .map_err(|error| format!("pipeline.cascade: {error}")))
+            .collect::<Result<Vec<_>, _>>()?,
+        None if has_explicit_tier_registry => {
+            return Err("pipeline.cascade is required when [[tier]] entries are configured".into());
+        }
+        None => default_tier_configs().into_iter().map(|tier| tier.0).collect(),
+    };
+    if cascade.is_empty() {
+        return Err("pipeline.cascade must contain at least one tier".into());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for name in &cascade {
+        if !seen.insert(name.clone()) {
+            return Err(format!("pipeline.cascade lists tier {name} more than once").into());
+        }
+        if !tiers.iter().any(|tier| &tier.0 == name) {
+            return Err(format!(
+                "pipeline.cascade references unavailable tier {name}; registered tiers: {}",
+                known_tier_names(&tiers),
+            ).into());
+        }
+    }
+    let settings = PipelineSettings { tag_via_cascade, tag_in_request, tag_budget_ms };
     let mut profiles = BTreeMap::new();
 
     for (name, profile) in raw.task {
         let task = name.clone();
-        let path = match profile.cascade {
-            Some(names) => names.into_iter().map(|tier_name| {
-                TierName::new(tier_name.clone()).map_err(|error| format!("task.{name}.cascade: {error}"))
-            }).collect::<Result<Vec<_>, _>>()?,
-            None if has_explicit_tier_registry => {
-                return Err(format!("task.{name}: cascade is required when [[tier]] entries are configured").into());
-            }
-            None => default_tier_configs().into_iter().map(|tier| tier.0).collect(),
-        };
-
         let (labels, label_metadata, taxonomy_version) = if let Some(taxonomy_path) = &profile.taxonomy {
             let taxonomy_file = base.join(taxonomy_path);
             let taxonomy: RawTaxonomy = serde_json::from_str(&fs::read_to_string(&taxonomy_file)?)
@@ -337,8 +375,12 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
             }
         }
         profiles.insert(task.clone(), Task {
-            name: task, cascade: Cascade { tiers: path }, output_kind: profile.output_kind, labels, label_metadata,
-            taxonomy_version, fallback,
+            name: task,
+            output_kind: profile.output_kind,
+            labels,
+            label_metadata,
+            taxonomy_version,
+            fallback,
         });
     }
 
@@ -348,15 +390,15 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
             "tier_policy: unknown tier {tier_key:?}; registered tiers: {}", known_tier_names(&tiers)
         ))?;
         let tier = decl.0.clone();
+        if !cascade.contains(&tier) {
+            return Err(format!("tier_policy.{tier}: tier is not in pipeline.cascade").into());
+        }
         let by_task = tier_policies.entry(tier.clone()).or_default();
         for (task_name, policy) in task_policies {
             let task = task_name.clone();
             let profile = profiles.get(&task).ok_or_else(|| format!(
                 "tier_policy.{tier}.{task_name}: no matching [task.{task_name}] definition"
             ))?;
-            if !profile.cascade.tiers.contains(&tier) {
-                return Err(format!("tier_policy.{tier}.{task_name}: tier is not in task.{task_name}.cascade").into());
-            }
             validate_policy(&task_name, &tier, &policy)?;
             if let Some(labels) = &profile.labels {
                 for label in policy.label_min_confidence.keys().chain(policy.never_resolve.iter()) {
@@ -372,19 +414,21 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
             }
         }
     }
-    Ok(PipelineConfig { settings: raw.pipeline, tiers, profiles, tier_policies, legacy })
+
+    Ok(PipelineConfig { settings, tiers, cascade, profiles, tier_policies, legacy })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::cascade::{CascadeGraph, CascadeGraphError};
+    use crate::pipeline::cascade::{Cascade, CascadeError};
     use crate::pipeline::registry::TierRegistry;
     use crate::pipeline::tier::{FakeEvaluate, TierContext, TierInstance, TierOutput};
     use async_trait::async_trait;
     use std::sync::Arc;
 
     struct Silent;
+
     #[async_trait]
     impl FakeEvaluate for Silent {
         async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
@@ -392,129 +436,180 @@ mod tests {
         }
     }
 
-    fn graph_for(cfg: &PipelineConfig) -> Result<CascadeGraph, CascadeGraphError> {
+    fn cascade_for(cfg: &PipelineConfig) -> Result<Cascade, CascadeError> {
         let registry = TierRegistry::of(cfg.tiers.iter().map(|(name, _, _)| {
             Arc::new(TierInstance::fake(name.as_str(), Arc::new(Silent)))
         }).collect());
-        let paths = cfg.profiles().into_iter()
-            .map(|profile| (profile.name, profile.cascade.tiers))
-            .collect();
-        CascadeGraph::from_task_paths(paths, &registry)
+        Cascade::from_names(&cfg.cascade, &registry)
     }
 
     #[test]
-    fn tasks_keep_distinct_paths_and_share_nodes() {
+    fn pipeline_declares_one_shared_cascade_for_all_tasks() {
         let cfg = parse(r#"
+            [pipeline]
+            cascade = ["rules", "modernbert", "harrier"]
             [task.route]
             labels = ["jev_capable", "needs_llm"]
             fallback_label = "needs_llm"
-            cascade = ["rules", "modernbert", "harrier"]
             [task.tag]
             labels = ["engineering", "help_desk"]
             fallback = "defer"
-            cascade = ["modernbert", "harrier"]
             [[tier]]
             name = "rules"
             executor = "rules"
             transport = "in_process"
             [[tier]]
             name = "modernbert"
-            executor = "scorer"
+            executor = "encoder"
             model_format = "onnx"
             transport = "grpc"
             request_shape = "score_tasks"
             endpoint = "http://127.0.0.1:50052"
             [[tier]]
             name = "harrier"
-            executor = "scorer"
-            model_format = "onnx"
+            executor = "encoder"
+            model_format = "gguf"
             transport = "grpc"
             request_shape = "score_tasks"
             endpoint = "http://127.0.0.1:50051"
         "#).unwrap();
-        assert_eq!(cfg.profile("route").unwrap().cascade.tiers.iter().map(TierName::as_str).collect::<Vec<_>>(), ["rules", "modernbert", "harrier"]);
-        assert_eq!(cfg.profile("tag").unwrap().cascade.tiers.iter().map(TierName::as_str).collect::<Vec<_>>(), ["modernbert", "harrier"]);
+
+        assert_eq!(
+            cfg.cascade.iter().map(TierName::as_str).collect::<Vec<_>>(),
+            ["rules", "modernbert", "harrier"]
+        );
+        assert_eq!(cfg.profiles().len(), 2);
+        assert!(cascade_for(&cfg).is_ok());
     }
 
     #[test]
-    fn conflicting_task_orders_fail_as_a_cycle() {
-        let cfg = parse(r#"
+    fn task_contract_rejects_a_task_owned_cascade() {
+        let result = parse(r#"
             [task.route]
             fallback_label = "needs_llm"
-            cascade = ["a", "b"]
-            [task.tag]
-            fallback = "defer"
-            cascade = ["b", "a"]
-            [[tier]]
-            name = "a"
-            executor = "scorer"
-            model_format = "onnx"
-            transport = "grpc"
-            request_shape = "score"
-            endpoint = "http://127.0.0.1:50051"
-            [[tier]]
-            name = "b"
-            executor = "scorer"
-            model_format = "onnx"
-            transport = "grpc"
-            request_shape = "score"
-            endpoint = "http://127.0.0.1:50052"
-        "#).unwrap();
-        assert!(matches!(graph_for(&cfg), Err(CascadeGraphError::Cycle { .. })));
+            cascade = ["rules"]
+        "#);
+        assert!(result.is_err());
     }
 
     #[test]
-    fn explicit_tier_registry_requires_each_task_to_declare_its_cascade() {
+    fn explicit_tier_registry_requires_pipeline_cascade() {
         let result = parse(r#"
             [task.route]
             fallback_label = "needs_llm"
             [[tier]]
             name = "zeta"
-            executor = "scorer"
+            executor = "encoder"
             model_format = "onnx"
             transport = "grpc"
             request_shape = "score"
             endpoint = "http://127.0.0.1:50051"
         "#);
-        assert!(result.is_err_and(|error| error.to_string().contains("cascade is required")));
+        assert!(result.is_err_and(|error| {
+            error.to_string().contains("pipeline.cascade is required")
+        }));
     }
 
     #[test]
-    fn legacy_config_without_a_named_registry_keeps_the_original_four_tier_path() {
+    fn legacy_config_without_a_named_registry_keeps_the_original_four_tier_cascade() {
         let cfg = parse("[task.route]\nfallback_label = \"needs_llm\"").unwrap();
         assert_eq!(
-            cfg.profile("route").unwrap().cascade.tiers.iter().map(TierName::as_str).collect::<Vec<_>>(),
+            cfg.cascade.iter().map(TierName::as_str).collect::<Vec<_>>(),
             ["rules", "fasttext", "modernbert", "harrier"]
         );
     }
 
     #[test]
-    fn graph_rejects_unknown_and_duplicate_tier_names_in_task_paths() {
-        let prefix = "[task.route]\nfallback_label = \"needs_llm\"\n";
-        let tier = "[[tier]]\nname=\"rules\"\nexecutor=\"rules\"\ntransport=\"in_process\"\n";
-        let unknown = parse(&format!("{prefix}cascade = [\"rules\", \"unknown\"]\n{tier}")).unwrap();
-        assert!(matches!(graph_for(&unknown), Err(CascadeGraphError::UnknownTier { .. })));
-        let duplicate = parse(&format!("{prefix}cascade = [\"rules\", \"rules\"]\n{tier}")).unwrap();
-        assert!(matches!(graph_for(&duplicate), Err(CascadeGraphError::DuplicateTier { .. })));
+    fn pipeline_cascade_rejects_unknown_duplicate_and_empty_orders() {
+        let tier = r#"
+            [[tier]]
+            name = "rules"
+            executor = "rules"
+            transport = "in_process"
+        "#;
+        let unknown = parse(&format!(
+            "[pipeline]\ncascade = [\"rules\", \"missing\"]\n{tier}"
+        )).unwrap_err();
+        assert!(unknown.to_string().contains("unavailable tier missing"));
+
+        let duplicate = parse(&format!(
+            "[pipeline]\ncascade = [\"rules\", \"rules\"]\n{tier}"
+        )).unwrap_err();
+        assert!(duplicate.to_string().contains("more than once"));
+
+        let empty = parse(&format!("[pipeline]\ncascade = []\n{tier}")).unwrap_err();
+        assert!(empty.to_string().contains("at least one tier"));
+    }
+
+    #[test]
+    fn cascade_builder_requires_available_unique_names() {
+        let cfg = parse(r#"
+            [pipeline]
+            cascade = ["rules"]
+            [task.route]
+            fallback_label = "needs_llm"
+            [[tier]]
+            name = "rules"
+            executor = "rules"
+            transport = "in_process"
+        "#).unwrap();
+        let registry = TierRegistry::of(vec![
+            Arc::new(TierInstance::fake("rules", Arc::new(Silent))),
+        ]);
+        assert!(matches!(
+            Cascade::from_names(&[TierName::new("rules").unwrap(), TierName::new("missing").unwrap()], &registry),
+            Err(CascadeError::UnknownTier(_))
+        ));
+        assert!(matches!(
+            Cascade::from_names(&[TierName::new("rules").unwrap(), TierName::new("rules").unwrap()], &registry),
+            Err(CascadeError::DuplicateTier(_))
+        ));
+        assert_eq!(cfg.cascade.len(), 1);
     }
 
     #[test]
     fn validates_executor_transport_and_request_shape_separately() {
-        let prefix = "[task.route]\nfallback_label = \"needs_llm\"\n";
         for tier in [
             "[[tier]]\nname=\"x\"\nexecutor=\"rules\"\ntransport=\"grpc\"",
-            "[[tier]]\nname=\"x\"\nexecutor=\"scorer\"\ntransport=\"in_process\"",
-            "[[tier]]\nname=\"x\"\nexecutor=\"scorer\"\ntransport=\"grpc\"\nrequest_shape=\"other\"",
+            "[[tier]]\nname=\"x\"\nexecutor=\"encoder\"\nmodel_format=\"onnx\"\ntransport=\"in_process\"",
+            "[[tier]]\nname=\"x\"\nexecutor=\"encoder\"\nmodel_format=\"onnx\"\ntransport=\"grpc\"\nrequest_shape=\"other\"",
             "[[tier]]\nname=\"x\"\nexecutor=\"rules\"\ntransport=\"in_process\"\nrequest_shape=\"score\"",
         ] {
-            assert!(parse(&format!("{prefix}{tier}")).is_err(), "accepted invalid spec: {tier}");
+            let input = format!(
+                "[pipeline]\ncascade = [\"x\"]\n[task.route]\nfallback_label = \"needs_llm\"\n{tier}"
+            );
+            assert!(parse(&input).is_err(), "accepted invalid spec: {tier}");
         }
     }
 
     #[test]
-    fn preserves_taxonomy_and_policy_validation() {
+    fn policies_must_reference_the_shared_cascade_and_a_known_task() {
+        let base = r#"
+            [pipeline]
+            cascade = ["a"]
+            [task.route]
+            labels = ["jev_capable", "needs_llm"]
+            fallback_label = "needs_llm"
+            [[tier]]
+            name = "a"
+            executor = "encoder"
+            model_format = "onnx"
+            transport = "grpc"
+            request_shape = "score"
+        "#;
+        assert!(parse(&format!("{base}\n[tier_policy.a.unknown]\nmin_confidence = 0.5")).is_err());
+        assert!(parse(&format!("{base}\n[tier_policy.a.route]\nmin_confidence = 1.5")).is_err());
+
+        let outside = base.replace("cascade = [\"a\"]", "cascade = [\"a\"]\n[tier_policy.a.route]\nmin_confidence = 0.5");
+        assert!(parse(&outside).is_ok());
+        let absent_tier = base.replace("cascade = [\"a\"]", "cascade = []");
+        assert!(parse(&absent_tier).is_err());
+    }
+
+    #[test]
+    fn preserves_taxonomy_and_policy_label_validation() {
         let cfg = parse_with_base(
-            "[task.tag]\ntaxonomy = \"../taskonomies/help_desk.json\"\noutput_kind = \"multiclass\"\nfallback = \"defer\"",
+            "[pipeline]\ncascade = [\"rules\", \"fasttext\", \"modernbert\", \"harrier\"]\n[task.tag]\ntaxonomy = \"../taskonomies/help_desk.json\"\noutput_kind = \"multiclass\"\nfallback = \"defer\"",
             Path::new("config"),
         ).unwrap();
         let tag = cfg.profile("tag").unwrap();
@@ -522,36 +617,33 @@ mod tests {
         assert_eq!(tag.labels.as_ref().unwrap().len(), 20);
         assert_eq!(tag.taxonomy_version.as_deref(), Some("1.1.0"));
         assert!(tag.label_metadata.iter().any(|row| row.id == "app_access_req"));
-        assert!(parse("[task.route]\nfallback_label = \"needs_llm\"\n[tier_policy.tier0.route]\nmin_confidence = 0.5").is_err());
-        assert!(parse("[task.route]\nfallback_label = \"needs_llm\"\n[tier_policy.unknown.route]\nmin_confidence = 0.5").is_err());
-        assert!(parse("[task.route]\nfallback_label = \"needs_llm\"\n[tier_policy.tier3.route]\nmin_confidence = 1.5").is_err());
     }
 
     #[test]
-    fn shipped_config_references_available_tiers() {
+    fn shipped_config_references_available_tiers_and_has_task_policies() {
         let cfg = load_or_default("config/tasks.toml").unwrap();
-        let available: std::collections::BTreeSet<_> = cfg.tiers.iter().map(|tier| tier.0.clone()).collect();
-        for task in cfg.profiles() {
-            assert!(task.cascade.tiers.iter().all(|tier| available.contains(tier)));
-        }
-        assert!(cfg.has_policy(&String::from("route")));
+        let available: std::collections::BTreeSet<_> =
+            cfg.tiers.iter().map(|tier| tier.0.clone()).collect();
+        assert!(cfg.cascade.iter().all(|tier| available.contains(tier)));
+        assert!(cfg.has_policy("route"));
         assert!(!cfg.profiles().is_empty());
     }
 
     fn with_tiers(tiers: &str) -> String {
         format!(
             r#"
+            [pipeline]
+            cascade = ["a"]
             [task.route]
             labels = ["jev_capable", "needs_llm"]
             fallback_label = "needs_llm"
-            cascade = ["a", "b"]
             {tiers}
             "#
         )
     }
 
     #[test]
-    fn two_instances_of_one_tier_declare_their_own_model_format_and_model() {
+    fn two_instances_of_one_executor_declare_their_own_model_format_and_model() {
         let cfg = parse(&with_tiers(r#"
             [[tier]]
             name = "a"
@@ -575,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn several_instances_of_the_in_process_roles_are_allowed() {
+    fn several_instances_of_the_in_process_executors_are_allowed() {
         let cfg = parse(&with_tiers(r#"
             [[tier]]
             name = "a"
@@ -593,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn the_older_executor_vocabulary_is_still_read() {
+    fn scorer_is_still_accepted_as_an_encoder_alias() {
         let cfg = parse(&with_tiers(r#"
             [[tier]]
             name = "a"
@@ -606,12 +698,12 @@ mod tests {
             transport = "grpc"
             request_shape = "score"
         "#)).unwrap();
-        assert_eq!(cfg.tiers[0].1.role, Role::Rules);
-        assert_eq!(cfg.tiers[1].1.role, Role::Encoder);
+        assert_eq!(cfg.tiers[0].1.exex, Role::Rules);
+        assert_eq!(cfg.tiers[1].1.exex, Role::Encoder);
     }
 
     #[test]
-    fn an_encoder_must_declare_a_model_format_and_other_roles_reject_one() {
+    fn an_encoder_must_declare_a_model_format_and_other_executors_reject_one() {
         let missing = with_tiers(r#"
             [[tier]]
             name = "a"
@@ -630,38 +722,26 @@ mod tests {
             executor = "rules"
             model_format = "onnx"
             transport = "in_process"
-            [[tier]]
-            name = "b"
-            executor = "rules"
-            transport = "in_process"
         "#);
         assert!(parse(&misfit).is_err_and(|e| e.to_string().contains("model_format")));
     }
 
     #[test]
-    fn instance_parameters_are_checked_against_the_role() {
+    fn instance_parameters_are_checked_against_the_executor() {
         let rules_model = with_tiers(r#"
             [[tier]]
             name = "a"
             executor = "rules"
             transport = "in_process"
             model = "x.bin"
-            [[tier]]
-            name = "b"
-            executor = "rules"
-            transport = "in_process"
         "#);
-        assert!(parse(&rules_model).is_err_and(|e| e.to_string().contains("takes `config`")));
+        assert!(parse(&rules_model).is_err_and(|e| e.to_string().contains("takes `config`, not `model`")));
         let fasttext_config = with_tiers(r#"
             [[tier]]
             name = "a"
             executor = "fasttext"
             transport = "in_process"
             config = "x.toml"
-            [[tier]]
-            name = "b"
-            executor = "rules"
-            transport = "in_process"
         "#);
         assert!(parse(&fasttext_config).is_err_and(|e| e.to_string().contains("only valid on a rules tier")));
         let empty_model = with_tiers(r#"
@@ -670,19 +750,16 @@ mod tests {
             executor = "fasttext"
             transport = "in_process"
             model = "  "
-            [[tier]]
-            name = "b"
-            executor = "rules"
-            transport = "in_process"
         "#);
         assert!(parse(&empty_model).is_err_and(|e| e.to_string().contains("model must be non-empty")));
     }
 
     const TWO_TIERS: &str = r#"
+        [pipeline]
+        cascade = ["a", "b"]
         [task.route]
         labels = ["jev_capable", "needs_llm"]
         fallback_label = "needs_llm"
-        cascade = ["a", "b"]
         [[tier]]
         name = "a"
         executor = "rules"
@@ -701,8 +778,7 @@ mod tests {
         let name = |value: &str| TierName::new(value).unwrap();
         assert_eq!(cfg.legacy.ordinal_of(&name("a")), Some(1));
         assert_eq!(cfg.legacy.name_of(2), Some(&name("b")));
-        // The old per-tier key no longer exists.
-        let on_the_tier = TWO_TIERS.replace("executor = \"rules\"", "executor = \"rules\"\n        legacy_ordinal = 1");
+        let on_the_tier = TWO_TIERS.replace("executor = \"rules\"", "executor = \"rules\"\nlegacy_ordinal = 1");
         assert!(parse(&on_the_tier).is_err());
     }
 
@@ -716,12 +792,16 @@ mod tests {
 
     #[test]
     fn a_tiern_policy_key_resolves_through_the_legacy_table() {
-        let cfg = parse(&TWO_TIERS.replace("[tier_policy.a.route]", "[tier_policy.tier1.route]")
-            .replace("min_confidence = 0.9\n    ", "min_confidence = 0.9\n        [legacy_tiers]\n        a = 1\n    ")).unwrap();
+        let input = TWO_TIERS
+            .replace("[tier_policy.a.route]", "[tier_policy.tier1.route]")
+            .replace(
+                "min_confidence = 0.9",
+                "min_confidence = 0.9\n[legacy_tiers]\na = 1",
+            );
+        let cfg = parse(&input).unwrap();
         assert!(cfg.tier_policies.contains_key(&TierName::new("a").unwrap()));
-        // Without the table the alias has nothing to resolve through.
         assert!(parse(&TWO_TIERS.replace("[tier_policy.a.route]", "[tier_policy.tier1.route]"))
-            .is_err_and(|e| e.to_string().contains("unknown tier")));
+            .is_err_and(|error| error.to_string().contains("unknown tier")));
     }
 
     #[test]
@@ -738,3 +818,4 @@ mod tests {
         assert_eq!(cfg.legacy, LegacyTierNumbers::original_four());
     }
 }
+

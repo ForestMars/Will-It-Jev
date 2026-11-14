@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
-use super::tier::{TierId, TierName};
+use super::tier::TierId;
 
 pub const LABEL_JEV: &str = "jev_capable";
 pub const LABEL_LLM: &str = "needs_llm";
@@ -78,7 +78,6 @@ pub enum TierReading {
 /// This is stored in the pipeline policy registry, never inside Task.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)]
 pub struct TierPolicy {
     pub min_confidence: f32,
     #[serde(default)]
@@ -140,8 +139,7 @@ impl TierPolicy {
 }
 
 /// Execution calibration indexed independently from task definitions:
-/// tier name -> task id -> resolution policy. Execution order is not encoded
-/// here; it belongs to the `TierRegistry`.
+/// tier id -> task id -> resolution policy. Execution order belongs to Cascade.
 pub type TierPolicyMap = BTreeMap<TierId, BTreeMap<String, TierPolicy>>;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -150,21 +148,10 @@ pub enum FallbackPolicy {
     Defer,
 }
 
-/// Authored ordered fallback route. Names resolve to generated TierIds when the runtime graph is compiled.
+/// A task's output-head contract, accepted labels and unresolved fallback.
 #[derive(Debug, Clone)]
-pub struct Cascade<T = TierId> {
-    pub tiers: Vec<T>,
-}
-
-impl<T> Default for Cascade<T> {
-    fn default() -> Self { Self { tiers: Vec::new() } }
-}
-
-/// A task's output-head contract and its own ordered fallback cascade.
-#[derive(Debug, Clone)]
-pub struct Task<TierRef = TierId> {
+pub struct Task {
     pub name: String,
-    pub cascade: Cascade<TierRef>,
     pub output_kind: OutputKind,
     pub labels: Option<Vec<String>>,
     pub label_metadata: Vec<TaskLabelMetadata>,
@@ -182,7 +169,7 @@ pub enum Decision {
     },
 }
 
-impl<TierRef> Task<TierRef> {
+impl Task {
 
     pub fn decide(&self, policy: &TierPolicy, reading: &TierReading) -> Decision {
         let reading = match reading {
@@ -283,7 +270,6 @@ mod tests {
     #[test]
     fn multilabel_resolution_applies_thresholds_independently() {
         let profile: Task = Task {
-            cascade: Cascade::default(),
             name: String::from("risk_flags"),
             output_kind: OutputKind::Multilabel,
             labels: Some(vec!["security".into(), "privacy".into(), "other".into()]),
@@ -311,7 +297,6 @@ mod tests {
     #[test]
     fn an_observing_policy_records_the_reading_and_never_resolves() {
         let profile: Task = Task {
-            cascade: crate::pipeline::task::Cascade::default(),
             name: String::from("urgency"),
             output_kind: OutputKind::Multiclass,
             labels: None,
@@ -346,7 +331,6 @@ mod tests {
     #[test]
     fn unsupported_task_is_not_an_ordinary_model_abstention() {
         let profile: Task = Task {
-            cascade: crate::pipeline::task::Cascade::default(),
             name: String::from("tag"),
             output_kind: OutputKind::Multiclass,
             labels: None,
@@ -361,7 +345,6 @@ mod tests {
     #[test]
     fn task_profile_contains_no_tier_calibration() {
         let profile: Task = Task {
-            cascade: crate::pipeline::task::Cascade::default(),
             name: String::from("route"),
             output_kind: OutputKind::Binary,
             labels: Some(vec![LABEL_JEV.into(), LABEL_LLM.into()]),
@@ -377,7 +360,6 @@ mod tests {
     #[test]
     fn policy_is_supplied_independently_of_task_definition() {
         let profile: Task = Task {
-            cascade: crate::pipeline::task::Cascade::default(),
             name: String::from("route"),
             output_kind: OutputKind::Binary,
             labels: Some(vec![LABEL_JEV.into(), LABEL_LLM.into()]),
@@ -401,7 +383,6 @@ mod tests {
     #[test]
     fn rejects_unknown_labels_and_non_finite_confidence() {
         let profile: Task = Task {
-            cascade: crate::pipeline::task::Cascade::default(),
             name: String::from("route"),
             output_kind: OutputKind::Binary,
             labels: Some(vec![LABEL_JEV.into(), LABEL_LLM.into()]),

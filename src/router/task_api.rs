@@ -24,7 +24,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::pipeline::{
-    cascade::{CascadeGraph, Slot},
+    cascade::{Cascade, Slot},
     runner::{CascadeRunner, Resolution, RunOutcome, TaskOutcome},
     task::{Decision, Task, TierPolicyMap, TierReading},
 };
@@ -172,7 +172,7 @@ async fn get_task_run(
             Json(json!({
                 "run_id": run_id,
                 "status": "complete",
-                "tasks": all_task_results(&outcome, &state.cascade.graph()),
+                "tasks": all_task_results(&outcome, &state.cascade.cascade()),
             })),
         ).into_response(),
         Ok(TaskRunLookup::Failed(error)) | Err(error) => (
@@ -245,7 +245,7 @@ async fn execute_task_request(
         return Ok(json!({
             "run_id": run_id,
             "status": "complete",
-            "tasks": all_task_results(&outcome, &state.cascade.graph()),
+            "tasks": all_task_results(&outcome, &state.cascade.cascade()),
         }));
     }
 
@@ -270,12 +270,12 @@ async fn execute_task_request(
         "run_id": run_id,
         "status": "partial",
         "required_tasks": required_names,
-        "tasks": selected_task_results(&required_outcome, &required_ids, &state.cascade.graph()),
+        "tasks": selected_task_results(&required_outcome, &required_ids, &state.cascade.cascade()),
         "pending_tasks": pending_names,
     }))
 }
 
-fn all_task_results(outcome: &RunOutcome, tiers: &CascadeGraph) -> Value {
+fn all_task_results(outcome: &RunOutcome, tiers: &Cascade) -> Value {
     let mut tasks = Map::new();
     for (task_id, task_outcome) in &outcome.tasks {
         tasks.insert(task_id.as_str().to_string(), task_outcome_json(task_outcome, tiers));
@@ -286,7 +286,7 @@ fn all_task_results(outcome: &RunOutcome, tiers: &CascadeGraph) -> Value {
 fn selected_task_results(
     outcome: &RunOutcome,
     selected: &BTreeSet<String>,
-    tiers: &CascadeGraph,
+    tiers: &Cascade,
 ) -> Value {
     let mut tasks = Map::new();
     for task_id in selected {
@@ -299,7 +299,7 @@ fn selected_task_results(
 
 /// `tier` is the tier's name; `position` is its zero-based place in the
 /// execution order, for clients that want to show the order.
-fn task_outcome_json(outcome: &TaskOutcome, tiers: &CascadeGraph) -> Value {
+fn task_outcome_json(outcome: &TaskOutcome, tiers: &Cascade) -> Value {
     let resolution = match &outcome.resolution {
         Resolution::Tier { tier_id, tier, model_id, reading } => json!({
             "kind": "tier",
@@ -362,7 +362,7 @@ fn task_outcome_json(outcome: &TaskOutcome, tiers: &CascadeGraph) -> Value {
 mod tests {
     use super::*;
     use crate::pipeline::{
-        tier::{tname, TierId, TierName},
+        tier::{tname, TierId},
         registry::TierRegistry,
         task::{FallbackPolicy, OutputKind, Reading, TierPolicy},
         tier::{FakeEvaluate, TierContext, TierInstance, TierOutput},
@@ -403,7 +403,6 @@ mod tests {
 
     fn profile(task: &str, kind: OutputKind, labels: &[&str]) -> Task {
         Task {
-            cascade: crate::pipeline::task::Cascade::default(),
             name: task.to_string(),
             output_kind: kind,
             labels: Some(labels.iter().map(|label| (*label).to_string()).collect()),
@@ -416,7 +415,7 @@ mod tests {
     #[tokio::test]
     async fn generic_api_runs_three_arbitrary_tasks_and_returns_required_subset_first() {
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let mut profiles = vec![
+        let profiles = vec![
             profile("customer_intent", OutputKind::Multiclass, &["billing", "account"]),
             profile("urgency", OutputKind::Ordinal, &["low", "medium", "high"]),
             profile("fraud_risk", OutputKind::Multilabel, &["account_takeover", "payment_abuse"]),
@@ -443,18 +442,13 @@ mod tests {
             Arc::new(TierInstance::fake("rules", Arc::new(tier1))),
             Arc::new(TierInstance::fake("modernbert", Arc::new(tier2))),
         ]);
-        let paths: BTreeMap<String, Vec<TierName>> = [
-            ("customer_intent".to_string(), vec![tname("rules")]),
-            ("urgency".to_string(), vec![tname("modernbert")]),
-            ("fraud_risk".to_string(), vec![tname("modernbert")]),
-        ].into();
-        let graph = CascadeGraph::from_task_paths(paths, &registry).unwrap();
-        let rules_id = graph.id_for_name(&tname("rules")).unwrap();
-        let modernbert_id = graph.id_for_name(&tname("modernbert")).unwrap();
-        profiles[0].cascade.tiers = graph.task_path("customer_intent");
-        profiles[1].cascade.tiers = graph.task_path("urgency");
-        profiles[2].cascade.tiers = graph.task_path("fraud_risk");
-        let cascade = Arc::new(CascadeRunner::new(registry, graph).unwrap());
+        let cascade_order = Cascade::from_names(
+            &[tname("rules"), tname("modernbert")],
+            &registry,
+        ).unwrap();
+        let rules_id = cascade_order.id_for_name(&tname("rules")).unwrap();
+        let modernbert_id = cascade_order.id_for_name(&tname("modernbert")).unwrap();
+        let cascade = Arc::new(CascadeRunner::new(registry, cascade_order).unwrap());
         let policies: TierPolicyMap = [
             (rules_id, [(String::from("customer_intent"), TierPolicy::new(0.90))].into()),
             (modernbert_id, [

@@ -12,7 +12,8 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use crate::tagging::{ClickHouseRawTable, OvenV1Tagger, TagConfig};
 use pipeline::tagger::{CascadeTagger, JointTagStore};
 use legacy_tiers::LegacyTierNumbers;
-use pipeline::task::{Cascade, Task, TierPolicyMap};
+use pipeline::cascade::Cascade;
+use pipeline::task::{Task, TierPolicyMap};
 use pipeline::tier::{hex, Params, Role, Tier, TierInstance, TierName};
 use pipeline::TierRegistry;
 use pipeline::CascadeRunner;
@@ -89,7 +90,7 @@ fn resolve_instance_params(
     legacy: &LegacyTierNumbers,
 ) -> Result<Params, Box<dyn std::error::Error>> {
     let mut resolved = params.clone();
-    match tier.role {
+    match tier.exex {
         Role::Rules => {
             if resolved.config.is_none() {
                 resolved.config = Some(env_or("TIER1_CONFIG", "config/tier1.toml"));
@@ -306,7 +307,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let resolved = resolve_instance_params(name, tier, params, &config.router, &pipeline_config.legacy)?;
         let instance = TierInstance::build(name.clone(), tier.clone(), resolved)?;
         tracing::info!(
-            tier = %instance.name(), role = instance.tier().role.as_str(),
+            tier = %instance.name(), exex = instance.tier().exex.as_str(),
             model_format = ?instance.params().model_format.map(|format| format.as_str()), model = %instance.model_label(),
             "tier instance built"
         );
@@ -316,55 +317,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("no cascade tier is enabled; enable at least one [[tier]]".into());
     }
 
-    // The graph resolves authored TierNames against the complete available
-    // registry and assigns TierIds only to instances used by its task paths.
+    // Resolve the one authored cascade against the complete available registry.
     let configured_tasks = pipeline_config.profiles();
-    let mut task_paths = std::collections::BTreeMap::new();
-    for configured in &configured_tasks {
-        let mut path = Vec::with_capacity(configured.cascade.tiers.len());
-        for name in &configured.cascade.tiers {
-            if registry.get(name).is_some() {
-                path.push(name.clone());
-            } else {
-                tracing::info!(task = %configured.name, tier = %name, "disabled tier omitted from task cascade");
-            }
+    let enabled_cascade_names: Vec<_> = pipeline_config.cascade.iter().filter_map(|name| {
+        if registry.get(name).is_some() {
+            Some(name.clone())
+        } else {
+            tracing::info!(tier = %name, "disabled tier omitted from pipeline cascade");
+            None
         }
-        task_paths.insert(configured.name.clone(), path);
-    }
-    let execution_graph = pipeline::cascade::CascadeGraph::from_task_paths(task_paths, &registry)?;
-
-    let runtime_tasks: Vec<Task> = configured_tasks.into_iter().map(|configured| Task {
-        name: configured.name.clone(),
-        cascade: Cascade { tiers: execution_graph.task_path(&configured.name) },
-        output_kind: configured.output_kind,
-        labels: configured.labels,
-        label_metadata: configured.label_metadata,
-        taxonomy_version: configured.taxonomy_version,
-        fallback: configured.fallback,
     }).collect();
+    let execution_cascade = Cascade::from_names(&enabled_cascade_names, &registry)?;
+    let runtime_tasks = configured_tasks;
 
-    // Policies are authored by TierName and become TierId-keyed only after the
-    // graph has resolved the corresponding node.
+    // Policies are authored by TierName and become TierId-keyed only after the shared Cascade has resolved the corresponding node.
     let mut tier_policies = TierPolicyMap::new();
     for (name, by_task) in &pipeline_config.tier_policies {
-        if let Some(id) = execution_graph.id_for_name(name) {
+        if let Some(id) = execution_cascade.id_for_name(name) {
             tier_policies.insert(id, by_task.clone());
         } else {
             tracing::info!(tier = %name, "policies for a disabled or unused tier are inactive");
         }
     }
-    if execution_graph.order().is_empty() {
+    if execution_cascade.order().is_empty() {
         return Err("no task cascade contains an enabled tier".into());
     }
     tracing::info!(
-        order = ?execution_graph.order().iter().map(ToString::to_string).collect::<Vec<_>>(),
-        "cascade DAG topological order"
+        order = ?execution_cascade.order().iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "pipeline cascade order"
     );
 
-    let artifact_hash = |role: Role| {
-        execution_graph.order().iter()
-            .filter_map(|id| execution_graph.tier_name(id).and_then(|name| registry.get(name)))
-            .find(|tier| tier.tier().role == role)
+    let artifact_hash = |exex: Role| {
+        execution_cascade.order().iter()
+            .filter_map(|id| execution_cascade.tier_name(id).and_then(|name| registry.get(name)))
+            .find(|tier| tier.tier().exex == exex)
             .and_then(|tier| tier.artifact_hash().map(|hash| hex(hash)))
             .unwrap_or_else(|| "disabled".to_string())
     };
@@ -374,7 +360,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     for (tier_id, by_task) in &tier_policies {
-        let Some(name) = execution_graph.tier_name(tier_id) else { continue };
+        let Some(name) = execution_cascade.tier_name(tier_id) else { continue };
         for (task, policy) in by_task {
             if let Some(calibrated_for) = policy.calibrated_for {
                 if calibrated_for != *tier_id {
@@ -384,14 +370,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "tier_policy was calibrated for a different instance than the one now running under this name"
                     );
                 }
-            }
-        }
-    }
-
-    for task in &runtime_tasks {
-        for tier_id in &task.cascade.tiers {
-            if !tier_policies.get(tier_id).is_some_and(|by_task| by_task.contains_key(&task.name)) {
-                tracing::warn!(task = %task.name, tier_id = %tier_id, "tier is in the task's cascade but has no resolution policy; it will execute and pass the task onward");
             }
         }
     }
@@ -411,9 +389,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !pipeline_config.has_policy("tag") {
             return Err("tasks.toml: tag_in_request = true but no [tier_policy.<tier>.tag] policy is configured".into());
         }
-        let has_executable_tag_head = profile.cascade.tiers.iter().any(|id| {
-            execution_graph.tier_name(id).and_then(|name| registry.get(name)).is_some_and(|instance| {
-                instance.tier().role == Role::Encoder
+        let has_executable_tag_head = execution_cascade.order().iter().any(|id| {
+            execution_cascade.tier_name(id).and_then(|name| registry.get(name)).is_some_and(|instance| {
+                instance.tier().exex == Role::Encoder
                     && tier_policies.get(id).is_some_and(|by_task| by_task.contains_key("tag"))
             })
         });
@@ -426,7 +404,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let tier_policies = Arc::new(tier_policies);
-    let cascade = Arc::new(CascadeRunner::new(registry, execution_graph)?);
+    let cascade = Arc::new(CascadeRunner::new(registry, execution_cascade)?);
     let legacy = Arc::new(pipeline_config.legacy.clone());
 
     let downstream_timeout =

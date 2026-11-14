@@ -1,28 +1,26 @@
-# Task contracts, available tiers, task-specific cascades and resolution policies
-# are separate concerns. Each task's cascade is an ordered TierId path. The
-# union of all paths forms a DAG; shared TierIds execute once for all eligible
-# tasks that reach the node.
+# Task contracts, the shared pipeline cascade, available tiers and resolution
+# policies are separate concerns. A task participates at a tier only when a
+# [tier_policy.<tier>.<task>] entry exists.
 
 [pipeline]
 tag_via_cascade = false
 tag_in_request = false
 tag_budget_ms = 4000
+cascade = ["rules", "fasttext", "modernbert", "harrier"]
 
 [task.route]
 labels = ["jev_capable", "needs_llm"]
 fallback_label = "needs_llm"
-cascade = ["rules", "fasttext", "modernbert", "harrier"]
 
 [task.tag]
 output_kind = "multiclass"
 taxonomy = "../taskonomies/help_desk.json"
 fallback = "defer"
-cascade = ["modernbert", "harrier"]
 
 # Each [[tier]] is one instance, addressed by the `name` you give it. The
-# router generates the instance's identity (a TierId) from what determines its
-# behavior, so a name can change without changing what the instance is. The
-# list catalogs available instances; it does not define execution order.
+# router generates the instance's TierId from its TierName and behaviorally
+# significant content, so renaming an instance changes its TierId. The list
+# catalogs available instances; it does not define execution order.
 #
 #   executor     which executor handles the tier: rules | fasttext | encoder
 #   transport    how the router reaches it: in_process | grpc

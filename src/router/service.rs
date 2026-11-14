@@ -19,7 +19,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::legacy_tiers::LegacyTierNumbers;
-use crate::pipeline::cascade::{CascadeGraph, Slot};
+use crate::pipeline::cascade::{Cascade, Slot};
 use crate::pipeline::tier::{TierId, FALLBACK_TIER_NAME};
 use crate::pipeline::runner::{CascadeRunner, Resolution, RunOutcome, TierTrace};
 use crate::pipeline::tagger::JointTagStore;
@@ -73,7 +73,7 @@ pub struct AppState {
     tag_sample_prob: f32,
     joint_tag_ttl: Duration,
     budget: Duration,
-    tiers: Arc<CascadeGraph>,
+    cascade_order: Arc<Cascade>,
     legacy: Arc<LegacyTierNumbers>,
 }
 
@@ -101,7 +101,7 @@ pub fn app(dependencies: AppDependencies) -> Router {
         dependencies.budget,
     );
     let state = AppState {
-        tiers: dependencies.cascade.graph(),
+        cascade_order: dependencies.cascade.cascade(),
         legacy: dependencies.legacy,
         cascade: dependencies.cascade,
         route_profile: dependencies.route_profile,
@@ -259,7 +259,7 @@ async fn completion(
         );
     }
     let (backend, mut record) =
-        route_record(request_id, &route_input, &state.hashes, &state.tiers, &state.legacy, &request_profiles, &outcome, route_started);
+        route_record(request_id, &route_input, &state.hashes, &state.cascade_order, &state.legacy, &request_profiles, &outcome, route_started);
 
     tracing::info!(
         request_id = %record.request_id,
@@ -353,7 +353,7 @@ fn route_record(
     request_id: String,
     prompt: &str,
     hashes: &Hashes,
-    tiers: &CascadeGraph,
+    tiers: &Cascade,
     legacy: &LegacyTierNumbers,
     profiles: &[Task],
     outcome: &RunOutcome,
@@ -498,7 +498,7 @@ fn backend_for_label(label: &str) -> Backend {
 /// Every tier that ran for the route task, by name, in execution order. This is
 /// the complete per-tier record; it covers tiers that have no legacy number and
 /// so never appear in the numbered fields below.
-fn tier_outcome_records(trace: &[TierTrace], tiers: &CascadeGraph) -> Vec<TierOutcomeRecord> {
+fn tier_outcome_records(trace: &[TierTrace], tiers: &Cascade) -> Vec<TierOutcomeRecord> {
     trace
         .iter()
         .map(|entry| {
@@ -691,13 +691,12 @@ mod tests {
     }
 
     /// rules, prefilter, modernbert in that execution order.
-    fn graph() -> CascadeGraph {
+    fn cascade() -> Cascade {
         let mut registry = TierRegistry::new();
         for name in ["rules", "prefilter", "modernbert"] {
             registry.register(Arc::new(TierInstance::fake(name, Arc::new(NamedTier)))).unwrap();
         }
-        let paths = [("route".to_string(), vec![tname("rules"), tname("prefilter"), tname("modernbert")])].into();
-        CascadeGraph::from_task_paths(paths, &registry).unwrap()
+        Cascade::from_names(&[tname("rules"), tname("prefilter"), tname("modernbert")], &registry).unwrap()
     }
 
     /// rules is 1 and modernbert is 3; prefilter has no legacy number.
@@ -707,7 +706,6 @@ mod tests {
 
     fn route_profile() -> Task {
         Task {
-            cascade: crate::pipeline::task::Cascade::default(),
             name: String::from("route"),
             output_kind: OutputKind::Binary,
             labels: Some(vec![LABEL_JEV.into(), LABEL_LLM.into()]),
@@ -718,7 +716,7 @@ mod tests {
     }
 
     fn test_tier_id(name: &str) -> TierId {
-        graph().id_for_name(&tname(name)).expect("test tier exists")
+        cascade().id_for_name(&tname(name)).expect("test tier exists")
     }
 
     fn trace(tier: &str, reading: TierReading, decision: Decision) -> TierTrace {
