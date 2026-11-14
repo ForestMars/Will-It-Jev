@@ -141,14 +141,6 @@ pub enum Transport {
     Grpc,
 }
 
-impl Transport {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::InProcess => "in_process",
-            Self::Grpc => "grpc",
-        }
-    }
-}
 
 /// The RPC contract an encoder speaks: one route score, or one head per task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -158,14 +150,6 @@ pub enum RequestShape {
     ScoreTasks,
 }
 
-impl RequestShape {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Score => "score",
-            Self::ScoreTasks => "score_tasks",
-        }
-    }
-}
 
 /// The on-disk representation of an encoder model artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

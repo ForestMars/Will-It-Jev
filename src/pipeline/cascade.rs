@@ -116,9 +116,6 @@ impl Cascade {
         &self.order
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.order.is_empty()
-    }
 
     pub fn tier_name(&self, id: &TierId) -> Option<&TierName> {
         self.names_by_id.get(id)

@@ -32,7 +32,6 @@ pub enum Resolution {
 
 #[derive(Debug, Clone)]
 pub struct TierTrace {
-    pub tier_id: TierId,
     pub tier: TierName,
     pub model_id: String,
     pub reading: TierReading,
@@ -240,7 +239,6 @@ impl CascadeRunner {
                 Err(_) => break,
             };
             tier_calls.push(TierCall {
-                tier_id,
                 tier: tier_name.clone(),
                 tasks: task_ids.clone(),
                 took: call_started.elapsed(),
