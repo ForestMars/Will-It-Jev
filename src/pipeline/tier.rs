@@ -889,6 +889,7 @@ mod tests {
         let profiles = [
             Task {
                 name: String::from("route"),
+                cascade: Default::default(),
                 output_kind: OutputKind::Binary,
                 labels: None,
                 label_metadata: Vec::new(),
@@ -897,6 +898,7 @@ mod tests {
             },
             Task {
                 name: String::from("tag"),
+                cascade: Default::default(),
                 output_kind: OutputKind::Multiclass,
                 labels: None,
                 label_metadata: Vec::new(),
@@ -921,6 +923,7 @@ mod tests {
         let tasks = [String::from("route")];
         let profiles = [Task {
             name: String::from("route"),
+                cascade: Default::default(),
             output_kind: OutputKind::Binary,
             labels: None,
             label_metadata: Vec::new(),
@@ -948,6 +951,7 @@ mod tests {
         let tasks = [String::from("route")];
         let profiles = [Task {
             name: String::from("route"),
+                cascade: Default::default(),
             output_kind: OutputKind::Binary,
             labels: None,
             label_metadata: Vec::new(),

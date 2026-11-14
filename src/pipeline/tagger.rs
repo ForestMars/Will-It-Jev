@@ -1,8 +1,8 @@
 // src/pipeline/tagger.rs
 //
-// Adapt the task-independent cascade to the existing tagging interface. The
-// tag task supplies its own profile and is evaluated with the same shared
-// cascade and separate tier/task policy registry as the route task.
+// Adapt a task's Cascade result to the existing tagging interface. The tag
+// task carries its own ordered path; shared TierIds are evaluated once in the
+// CascadeGraph when route and tag paths overlap.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

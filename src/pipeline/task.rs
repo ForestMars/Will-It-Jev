@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
+use super::cascade::Cascade;
 use super::tier::TierId;
 
 pub const LABEL_JEV: &str = "jev_capable";
@@ -138,8 +139,9 @@ impl TierPolicy {
     }
 }
 
-/// Execution calibration indexed independently from task definitions:
-/// tier id -> task id -> resolution policy. Execution order belongs to Cascade.
+/// Resolution calibration indexed by concrete tier identity and task name.
+/// Task.cascade defines the ordered path; a policy supplies the rule when that
+/// task reaches the tier.
 pub type TierPolicyMap = BTreeMap<TierId, BTreeMap<String, TierPolicy>>;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -152,6 +154,7 @@ pub enum FallbackPolicy {
 #[derive(Debug, Clone)]
 pub struct Task {
     pub name: String,
+    pub cascade: Cascade,
     pub output_kind: OutputKind,
     pub labels: Option<Vec<String>>,
     pub label_metadata: Vec<TaskLabelMetadata>,
@@ -271,6 +274,7 @@ mod tests {
     fn multilabel_resolution_applies_thresholds_independently() {
         let profile: Task = Task {
             name: String::from("risk_flags"),
+            cascade: Default::default(),
             output_kind: OutputKind::Multilabel,
             labels: Some(vec!["security".into(), "privacy".into(), "other".into()]),
             label_metadata: Vec::new(),
@@ -298,6 +302,7 @@ mod tests {
     fn an_observing_policy_records_the_reading_and_never_resolves() {
         let profile: Task = Task {
             name: String::from("urgency"),
+            cascade: Default::default(),
             output_kind: OutputKind::Multiclass,
             labels: None,
             label_metadata: Vec::new(),
@@ -332,6 +337,7 @@ mod tests {
     fn unsupported_task_is_not_an_ordinary_model_abstention() {
         let profile: Task = Task {
             name: String::from("tag"),
+            cascade: Default::default(),
             output_kind: OutputKind::Multiclass,
             labels: None,
             label_metadata: Vec::new(),
@@ -346,6 +352,7 @@ mod tests {
     fn task_profile_contains_no_tier_calibration() {
         let profile: Task = Task {
             name: String::from("route"),
+            cascade: Default::default(),
             output_kind: OutputKind::Binary,
             labels: Some(vec![LABEL_JEV.into(), LABEL_LLM.into()]),
             label_metadata: Vec::new(),
@@ -361,6 +368,7 @@ mod tests {
     fn policy_is_supplied_independently_of_task_definition() {
         let profile: Task = Task {
             name: String::from("route"),
+            cascade: Default::default(),
             output_kind: OutputKind::Binary,
             labels: Some(vec![LABEL_JEV.into(), LABEL_LLM.into()]),
             label_metadata: Vec::new(),
@@ -384,6 +392,7 @@ mod tests {
     fn rejects_unknown_labels_and_non_finite_confidence() {
         let profile: Task = Task {
             name: String::from("route"),
+            cascade: Default::default(),
             output_kind: OutputKind::Binary,
             labels: Some(vec![LABEL_JEV.into(), LABEL_LLM.into()]),
             label_metadata: Vec::new(),

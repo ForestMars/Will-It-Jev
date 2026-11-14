@@ -1,7 +1,7 @@
 // src/pipeline/mod.rs
 //
-// Task-independent inference cascade. Task definitions, tier/task resolution
-// policies, and execution-tier implementations are separate interfaces.
+// Multi-task inference substrate. Each Task owns its ordered Cascade; the
+// CascadeGraph compiles their shared tier nodes and ordering constraints.
 
 pub mod cascade;
 pub mod config;

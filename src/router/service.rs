@@ -19,7 +19,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::legacy_tiers::LegacyTierNumbers;
-use crate::pipeline::cascade::{Cascade, Slot};
+use crate::pipeline::cascade::{CascadeGraph, Slot};
 use crate::pipeline::tier::{TierId, FALLBACK_TIER_NAME};
 use crate::pipeline::runner::{CascadeRunner, Resolution, RunOutcome, TierTrace};
 use crate::pipeline::tagger::JointTagStore;
@@ -73,7 +73,7 @@ pub struct AppState {
     tag_sample_prob: f32,
     joint_tag_ttl: Duration,
     budget: Duration,
-    cascade_order: Arc<Cascade>,
+    cascade_order: Arc<CascadeGraph>,
     legacy: Arc<LegacyTierNumbers>,
 }
 
@@ -101,7 +101,7 @@ pub fn app(dependencies: AppDependencies) -> Router {
         dependencies.budget,
     );
     let state = AppState {
-        cascade_order: dependencies.cascade.cascade(),
+        cascade_order: dependencies.cascade.graph(),
         legacy: dependencies.legacy,
         cascade: dependencies.cascade,
         route_profile: dependencies.route_profile,
@@ -353,7 +353,7 @@ fn route_record(
     request_id: String,
     prompt: &str,
     hashes: &Hashes,
-    tiers: &Cascade,
+    tiers: &CascadeGraph,
     legacy: &LegacyTierNumbers,
     profiles: &[Task],
     outcome: &RunOutcome,
@@ -498,7 +498,7 @@ fn backend_for_label(label: &str) -> Backend {
 /// Every tier that ran for the route task, by name, in execution order. This is
 /// the complete per-tier record; it covers tiers that have no legacy number and
 /// so never appear in the numbered fields below.
-fn tier_outcome_records(trace: &[TierTrace], tiers: &Cascade) -> Vec<TierOutcomeRecord> {
+fn tier_outcome_records(trace: &[TierTrace], tiers: &CascadeGraph) -> Vec<TierOutcomeRecord> {
     trace
         .iter()
         .map(|entry| {
@@ -672,8 +672,9 @@ mod tests {
         assert_eq!(openai_chat_response(&payload, None), payload);
     }
 
-    // ---- tier IDs in the route record ---------------------------------
+    // ---- task-owned cascade and graph telemetry ---------------------------
 
+    use crate::pipeline::cascade::Cascade;
     use crate::pipeline::tier::tname;
     use crate::pipeline::registry::TierRegistry;
     use crate::pipeline::runner::TaskOutcome;
@@ -682,7 +683,6 @@ mod tests {
     use async_trait::async_trait;
 
     struct NamedTier;
-
     #[async_trait]
     impl FakeEvaluate for NamedTier {
         async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
@@ -690,13 +690,66 @@ mod tests {
         }
     }
 
-    /// rules, prefilter, modernbert in that execution order.
-    fn cascade() -> Cascade {
+    fn fixture() -> (Task, CascadeGraph) {
         let mut registry = TierRegistry::new();
         for name in ["rules", "prefilter", "modernbert"] {
             registry.register(Arc::new(TierInstance::fake(name, Arc::new(NamedTier)))).unwrap();
         }
-        Cascade::from_names(&[tname("rules"), tname("prefilter"), tname("modernbert")], &registry).unwrap()
+        let task = Task {
+            name: "route".into(),
+            cascade: Cascade::from_names(
+                &[tname("rules"), tname("prefilter"), tname("modernbert")], &registry,
+            ).unwrap(),
+            output_kind: OutputKind::Binary,
+            labels: Some(vec![LABEL_JEV.into(), LABEL_LLM.into()]),
+            label_metadata: Vec::new(),
+            taxonomy_version: None,
+            fallback: FallbackPolicy::Label(LABEL_LLM.into()),
+        };
+        let graph = CascadeGraph::from_tasks(&[task.clone()], &registry).unwrap();
+        (task, graph)
+    }
+
+    /// rules is 1 and modernbert is 3; prefilter has no legacy number.
+    fn legacy() -> LegacyTierNumbers {
+        LegacyTierNumbers::new([(tname("rules"), 1), (tname("modernbert"), 3)]).unwrap()
+    }
+
+    fn test_tier_id(name: &str) -> TierId {
+        fixture().1.id_for_name(&tname(name)).expect("test tier exists")
+    }
+
+    fn trace(tier: &str, reading: TierReading, decision: Decision) -> TierTrace {
+        TierTrace {
+            tier_id: test_tier_id(tier),
+            tier: tname(tier),
+            model_id: format!("m-{tier}"),
+            reading,
+            decision,
+        }
+    }
+
+    fn pass() -> Decision {
+        Decision::Pass { reason: "below_threshold", top_guess: None, score: 0.4 }
+    }
+
+    fn record_for(resolution: Resolution, trace: Vec<TierTrace>) -> RouteRecord {
+        let (profile, graph) = fixture();
+        let outcome = RunOutcome {
+            tasks: [("route".to_string(), TaskOutcome { resolution, trace })].into(),
+            tier_calls: Vec::new(),
+        };
+        let hashes = Hashes { tier1_toml: "t1".into(), tier2_bin: "t2".into() };
+        route_record(
+            "11111111-1111-4111-8111-111111111111".into(),
+            "prompt",
+            &hashes,
+            &graph,
+            &legacy(),
+            &[profile],
+            &outcome,
+            Instant::now(),
+        ).1
     }
 
     /// rules is 1 and modernbert is 3; prefilter has no legacy number.

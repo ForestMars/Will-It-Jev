@@ -1,18 +1,18 @@
-# Task contracts, the shared pipeline cascade, available tiers and resolution
-# policies are separate concerns. A task participates at a tier only when a
-# [tier_policy.<tier>.<task>] entry exists.
+# Each task owns an ordered cascade of TierIds. CascadeGraph is computed from
+# all task paths; tier/task policies determine which task is eligible at a node.
 
 [pipeline]
 tag_via_cascade = false
 tag_in_request = false
 tag_budget_ms = 4000
-cascade = ["rules", "fasttext", "modernbert", "harrier"]
 
 [task.route]
+cascade = ["rules", "fasttext", "modernbert", "harrier"]
 labels = ["jev_capable", "needs_llm"]
 fallback_label = "needs_llm"
 
 [task.tag]
+cascade = ["modernbert", "harrier"]
 output_kind = "multiclass"
 taxonomy = "../taskonomies/help_desk.json"
 fallback = "defer"

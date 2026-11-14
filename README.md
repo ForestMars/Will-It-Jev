@@ -59,17 +59,16 @@ Each tier returns one of two outcomes:
 
 Tier 6 is the terminal generative tier. Provider availability determines whether a response can be returned.
 
-Disabled tiers are omitted from the runtime registry without cost. The `TierRegistry` catalogs every configured instance by `TierName`; it does not impose execution order. The single `Cascade` establishes the shared order for all tasks. A task receives a turn at a tier only when that tier has a corresponding `[tier_policy.<tier>.<task>]` entry.
+The `TierRegistry` catalogs every configured instance by `TierName`; its membership and insertion order do not define execution. Each `Task` owns an ordered `Cascade` of TierIds. `CascadeGraph` is computed from all task cascades: adjacent tiers create dependency edges, shared TierIds become shared nodes, and contradictory paths fail cycle validation. Disabled instances are omitted from each task's runtime Cascade while preserving the remaining relative order. A task receives a turn at a graph node only when its own Cascade contains that TierId and a corresponding `[tier_policy.<tier>.<task>]` entry exists.
 
 ```toml
-[pipeline]
-cascade = ["rules", "fasttext", "modernbert", "harrier"]
-
 [task.route]
+cascade = ["rules", "fasttext", "modernbert", "harrier"]
 labels = ["jev_capable", "needs_llm"]
 fallback_label = "needs_llm"
 
 [task.tag]
+cascade = ["modernbert", "harrier"]
 output_kind = "multiclass"
 fallback = "defer"
 
@@ -83,17 +82,17 @@ min_confidence = 0.95
 min_confidence = 0.85
 ```
 
-A task with no policy at a tier skips that tier. A task that passes its policy continues to the next tier in the shared cascade where it has a policy. Resolution removes that task from the run; exhaustion applies the task's fallback. Tasks that reach the same tier are batched into one invocation, allowing a single `ScoreTasks` request to evaluate multiple heads against one shared representation.
+A task skips nodes absent from its own Cascade and nodes without a task-specific policy. After a pass, it continues to the next policy-bearing node along its ordered path. Resolution removes that task from the run; exhaustion applies its fallback. Tasks that reach the same graph node are batched into one invocation, allowing a single `ScoreTasks` request to evaluate multiple heads against one shared representation.
 
-A new task adds its output contract and policies at the tiers that should evaluate it. It does not carry tier names or define a separate route. A new `[[tier]]` adds an available instance; placing its name in `[pipeline].cascade` makes it part of the shared execution order.
+A new task adds its output contract, ordered `cascade`, and policies for the tiers it uses. A new `[[tier]]` adds an available instance to the registry; adding its name to a task's Cascade makes it part of that task's execution path.
 
-Three concepts stay distinct. A `TierName` is authored and looks up an instance in the registry. A `TierId` is generated from the name and behavior-determining instance content, including its tier definition, model format, model, rule artifact and artifact hash. Renaming an instance changes its `TierId`; endpoint, timeout and enabled state do not. A `Slot` is the instance's position in the configured Cascade: an execution/telemetry address, not a stable identity.
+Three concepts stay distinct. A `TierName` is authored and looks up an instance in the registry. A `TierId` is generated from the name and behavior-determining instance content, including its tier definition, model format, model, rule artifact and artifact hash. Renaming an instance changes its `TierId`; endpoint, timeout and enabled state do not. A `Slot` is the instance's position in the compiled `CascadeGraph`: an execution/telemetry address, not a stable identity.
 
 A `Tier` is the reusable definition; a `TierInstance` adds the parameters and loaded implementation that distinguish a concrete instance. `model_format` identifies only the encoder artifact representation (`onnx` or `gguf`); it does not choose an inference runtime. Several instances of one Tier can coexist, for example one encoder over ONNX and another over GGUF. The `model` field identifies the model an instance runs (a file for FastText; for an encoder, the name the sidecar should report). `TIER1_CONFIG` and `FASTTEXT_MODEL` only supply a value for an instance that declares none.
 
 The original four tiers were once numbered 1 to 4, and those numbers survive at the edges: numbered telemetry fields, `[router.tierN]` settings, numbered environment variables and `tierN` aliases in `[tier_policy.*]` keys. The `[legacy_tiers]` table in `tasks.toml` is the only place a name and a number meet. It is read at load and handed to code that writes those compatibility surfaces; no tier, instance, registry or Cascade carries a number. Configuration with no explicit `[[tier]]` entries keeps the original numbering.
 
-The Cascade preserves the authored global order and compiles TierIds from enabled registered instances. Tiers absent from the Cascade remain available in the registry but do not execute. The complete `tier_outcomes` array remains name-keyed in execution order; existing numbered fields remain compatibility projections. Tiers 5 and 6 are downstream execution backends, not Cascade entries.
+`CascadeGraph` computes a deterministic topological execution order from the adjacent TierId pairs in each Task's Cascade. Shared TierIds execute once for all eligible tasks; tiers absent from every task path remain available in the registry but do not execute. The complete `tier_outcomes` array remains name-keyed in graph execution order; existing numbered fields remain compatibility projections. Tiers 5 and 6 are downstream execution backends, not Cascade nodes.
 
 ---
 
@@ -173,7 +172,7 @@ src/
   pipeline/           Task-agnostic cascade engine (see "Multi-task cascade" below)
     task.rs           Task contracts, raw readings and tier/task resolution policies
     registry.rs       Unordered TierRegistry of available TierInstances, keyed by TierName
-    cascade.rs        One ordered Cascade of TierIds shared by every task
+    cascade.rs        Task-owned Cascade paths and the computed CascadeGraph
     tier.rs           Tier declarations, TierInstances and their concrete evaluators
     runner.rs         CascadeRunner: one ordered pass, batching eligible tasks at each tier
     config.rs         config/tasks.toml loader
@@ -516,18 +515,19 @@ See the `LICENSE` file in the repository root.
 ## Multi-task cascade
 
 Tiers are decoupled from the questions they answer. A `TierInstance` returns raw per-task
-readings and applies no thresholds. A `Task` defines the output contract, allowed labels and
-fallback. The presence of a `[tier_policy.<tier>.<task>]` entry makes that task eligible at that
-tier and supplies its confidence bars. The `CascadeRunner` walks the single shared `Cascade`
-once, batches all eligible open tasks at each tier, and removes each task as soon as it resolves
-or exhausts the tiers for which it has a policy.
+readings and applies no thresholds. Each `Task` owns its ordered `Cascade`, alongside its
+output contract, allowed labels and fallback. `CascadeGraph` is compiled from all task paths.
+The `CascadeRunner` traverses that graph in topological order, batching tasks whose own path
+contains the current TierId and whose tier/task policy is present. Each task leaves when it
+resolves or exhausts the policy-bearing tiers on its path.
 
 * `route` (jev_capable / needs_llm): the policies in `config/tasks.toml` set the
   confidence bars for each eligible tier. The legacy `router::cascade::route`
   path remains separate from the generic task runner.
 * `tag` (domain categories): `CascadeTagger` implements `tagging::Tagger`, falling back
   to the Ollama tagger when no tier resolves. Off by default (`tag_via_cascade` in
-  `config/tasks.toml`) and needs a `[tier_policy.<tier>.tag]` entry on a tier in the shared Cascade.
+  `config/tasks.toml`) and needs a `[tier_policy.<tier>.tag]` entry for a tier in
+  `[task.tag].cascade`.
 * Joint execution: the additive `ScoreTasks` RPC scores several tasks from one shared
   encoding. A sidecar that answers UNIMPLEMENTED is served route-only via `Score`.
   No shipped sidecar implements it yet.
