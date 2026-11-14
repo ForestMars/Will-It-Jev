@@ -15,7 +15,6 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -151,7 +150,7 @@ pub enum RequestShape {
 }
 
 
-/// The on-disk representation of an encoder model artifact.
+/// Inference runtime selected for an encoder by the adapter boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum ModelFormat {
     #[serde(rename = "onnx")]
@@ -200,7 +199,7 @@ impl Tier {
 /// What distinguishes one instance of a Tier from another.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Params {
-    /// Encoder only: artifact representation, not inference runtime.
+    /// Encoder only: selects the inference runtime at the adapter boundary.
     pub model_format: Option<ModelFormat>,
     /// fasttext: path to the model file. encoder: the model name the sidecar is
     /// expected to report; a different `model_id` in a response is logged once.
@@ -366,7 +365,6 @@ pub struct TierInstance {
     runner: Runner,
     task_scorers: BTreeMap<String, Arc<dyn TaskScorer>>,
     request_shape_unimplemented: AtomicBool,
-    model_mismatch_reported: AtomicBool,
 }
 
 impl TierInstance {
@@ -413,7 +411,6 @@ impl TierInstance {
             name, tier, params, artifact_hash, runner,
             task_scorers: BTreeMap::new(),
             request_shape_unimplemented: AtomicBool::new(false),
-            model_mismatch_reported: AtomicBool::new(false),
         }
     }
 
@@ -447,18 +444,10 @@ impl TierInstance {
     pub fn params(&self) -> &Params { &self.params }
     pub fn artifact_hash(&self) -> Option<&[u8; 32]> { self.artifact_hash.as_ref() }
 
-    /// Label recorded as `model_id` when the instance has no better answer, for
-    /// example when a sidecar call fails. It comes from the model, never from the
-    /// name: names are free to change.
+    /// Fallback label used when an adapter call fails before returning runtime metadata.
+    /// Model identity remains inside the adapter boundary.
     pub fn model_label(&self) -> String {
-        match self.tier.exex {
-            Role::Rules => "heuristic".to_string(),
-            Role::FastText => self.params.model.as_deref()
-                .and_then(|path| Path::new(path).file_name())
-                .map(|file| file.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "fasttext".to_string()),
-            Role::Encoder => self.params.model.clone().unwrap_or_else(|| "unknown".to_string()),
-        }
+        self.name.as_str().to_string()
     }
 
     #[allow(dead_code)]
@@ -525,24 +514,10 @@ impl TierInstance {
         TierOutput { model_id: self.model_label(), readings }
     }
 
-    /// A sidecar serves whatever model it loaded. If the instance declares a model
-    /// and the sidecar reports another, say so once.
-    fn check_reported_model(&self, reported: &str) {
-        if let Some(expected) = self.params.model.as_deref() {
-            if expected != reported && !self.model_mismatch_reported.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
-                    tier = %self.name, expected, reported,
-                    "sidecar reported a different model than the instance declares"
-                );
-            }
-        }
-    }
-
     async fn route_via_score(&self, runner: &Tier3Runner, ctx: &TierContext<'_>) -> TierOutput {
         match runner.score_raw(ctx.prompt, ctx.budget).await {
             Err(reason) => TierOutput::abstain_all(self.model_label(), ctx.tasks, reason),
             Ok(raw) => {
-                self.check_reported_model(&raw.model_id);
                 route_only(
                     ctx,
                     &raw.model_id,
@@ -572,7 +547,6 @@ impl TierInstance {
             .collect();
         match runner.score_tasks(ctx.prompt, &requested_profiles, ctx.budget).await {
             Ok(response) => {
-                self.check_reported_model(&response.model_id);
                 let readings = ctx.tasks.iter().map(|task| {
                     let reading = response.results.iter()
                         .find(|result| result.task == task.as_str())
@@ -619,6 +593,14 @@ impl TierInstance {
     /// instances built from different names have different ids.
     pub fn fake(name: &str, fake: Arc<dyn FakeEvaluate>) -> Self {
         Self::fake_with_model(name, name, fake)
+    }
+
+    #[cfg(test)]
+    pub fn fake_evaluator(&self) -> Option<Arc<dyn FakeEvaluate>> {
+        match &self.runner {
+            Runner::Fake(fake) => Some(Arc::clone(fake)),
+            _ => None,
+        }
     }
 
     pub fn fake_with_model(name: &str, model: &str, fake: Arc<dyn FakeEvaluate>) -> Self {
