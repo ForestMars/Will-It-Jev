@@ -415,9 +415,9 @@ impl TierInstance {
     }
 
     /// Derive the TierId for this instance. The hash includes its authored name,
-    /// role, model format, model value and artifact content hash. Endpoint,
-    /// transport, invocation protocol, timeout and enabled state do not
-    /// contribute to the ID.
+    /// complete tier definition (role, transport and request shape), model format,
+    /// model value and artifact content hash. Endpoint, timeout and enabled state
+    /// are deployment settings and do not contribute to the ID.
     pub fn derive_id(
         name: &TierName,
         tier: &Tier,
@@ -433,6 +433,15 @@ impl TierInstance {
         };
         field("tier_name", name.as_str());
         field("role", tier.exex.as_str());
+        field("transport", match tier.transport {
+            Transport::InProcess => "in_process",
+            Transport::Grpc => "grpc",
+        });
+        field("request_shape", match tier.request_shape {
+            Some(RequestShape::Score) => "score",
+            Some(RequestShape::ScoreTasks) => "score_tasks",
+            None => "",
+        });
         field("model_format", params.model_format.map(ModelFormat::as_str).unwrap_or(""));
         field("model", params.model.as_deref().unwrap_or(""));
         field("artifact", &artifact_hash.map(|hash| hex(hash)).unwrap_or_default());
@@ -817,6 +826,22 @@ mod tests {
         assert_ne!(instance_id(&base), instance_id(&renamed));
         assert_eq!(instance_id(&base), instance_id(&moved));
         assert_ne!(instance_id(&base), instance_id(&swapped));
+    }
+
+    #[test]
+    fn id_includes_transport_and_request_shape_from_the_tier_definition() {
+        let (name, tier, params) = encoder_config(
+            "enc-a", ModelFormat::Onnx, Some("m"), "http://127.0.0.1:9",
+        );
+        let base = TierInstance::derive_id(&name, &tier, &params, None);
+
+        let mut different_shape = tier;
+        different_shape.request_shape = Some(RequestShape::ScoreTasks);
+        assert_ne!(base, TierInstance::derive_id(&name, &different_shape, &params, None));
+
+        let mut different_transport = tier;
+        different_transport.transport = Transport::InProcess;
+        assert_ne!(base, TierInstance::derive_id(&name, &different_transport, &params, None));
     }
 
     #[test]
