@@ -96,7 +96,8 @@ impl TierRegistry {
                 .expect("test tier names must be unique");
         }
         registry
-    }}
+    }
+}
 
 #[cfg(test)]
 mod tests {
