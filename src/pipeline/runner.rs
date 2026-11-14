@@ -434,7 +434,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_keeps_instances_unused_by_every_task_path() {
+    async fn registry_keeps_unused_definitions_without_graph_instances() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let registry = TierRegistry::of(vec![
             fake_tier("rules", &calls, Duration::ZERO, &[]),
