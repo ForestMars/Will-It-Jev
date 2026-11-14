@@ -1,5 +1,5 @@
-# Each task owns an ordered cascade of TierIds. CascadeGraph is computed from
-# all task paths; tier/task policies determine which task is eligible at a node.
+# Each task owns an ordered cascade of TierNames. CascadeGraph materializes
+# the referenced TierInstances and compiles shared task paths into a DAG.
 
 [pipeline]
 tag_via_cascade = false
@@ -17,21 +17,19 @@ output_kind = "multiclass"
 taxonomy = "../taskonomies/help_desk.json"
 fallback = "defer"
 
-# Each [[tier]] is one instance, addressed by the `name` you give it. The
-# router generates the instance's TierId from its TierName and behaviorally
-# significant content, so renaming an instance changes its TierId. The list
-# catalogs available instances; it does not define execution order.
+# Each [[tier]] is an available Tier definition, addressed by TierName. The
+# registry catalogs definitions; task cascades select which definitions the
+# CascadeGraph materializes as TierInstances with hash-derived TierIds.
 #
 #   executor     which executor handles the tier: rules | fasttext | encoder
 #   transport    how the router reaches it: in_process | grpc
 #   request_shape  encoder only: the RPC contract, score | score_tasks
-#   model_format  encoder model artifact representation: onnx | gguf
-#                 (required for encoders; does not select an inference runtime)
-#   model        fasttext: model file. encoder: the model name the sidecar
-#                should report (a different model_id is logged once)
+#   model_format  encoder inference runtime: onnx | gguf; selects the adapter
+#   model        fasttext: model file; encoder: opaque instance configuration
+#                included in the hash-derived TierId
 #   config       rules: rule file
 #
-# `model` / `config` fall back to FASTTEXT_MODEL / TIER1_CONFIG for an instance
+# `model` / `config` fall back to FASTTEXT_MODEL / TIER1_CONFIG for a definition
 # that declares none. `scorer` is accepted as an alias of `encoder`.
 
 [[tier]]
@@ -72,7 +70,7 @@ harrier = 4
 
 # Calibration belongs to a tier name + task pair. A policy may record the
 # instance it was fitted on with `calibrated_for = "<TierId, 32 hex>"`; the
-# router warns at boot if the instance now running under that name differs.
+# startup compares it with the TierInstance materialized on the graph.
 # `authority = "observe"` records a tier's reading for a task without ever
 # resolving it, for heads that are logged rather than routed.
 [tier_policy.rules.route]
