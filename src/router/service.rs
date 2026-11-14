@@ -679,7 +679,7 @@ mod tests {
     use crate::pipeline::registry::TierRegistry;
     use crate::pipeline::runner::TaskOutcome;
     use crate::pipeline::task::{FallbackPolicy, OutputKind};
-    use crate::pipeline::tier::{FakeEvaluate, TierContext, TierInstance, TierOutput};
+    use crate::pipeline::tier::{FakeEvaluate, ModelFormat, Params, RequestShape, Role, Tier, TierContext, TierOutput, Transport};
     use async_trait::async_trait;
 
     struct NamedTier;
@@ -693,12 +693,25 @@ mod tests {
     fn fixture() -> (Task, CascadeGraph) {
         let mut registry = TierRegistry::new();
         for name in ["rules", "prefilter", "modernbert"] {
-            registry.register(Arc::new(TierInstance::fake(name, Arc::new(NamedTier)))).unwrap();
+            let (tier, params) = if name == "rules" {
+                (
+                    Tier { exex: Role::Rules, transport: Transport::InProcess, request_shape: None },
+                    Params { model_format: None, model: None, config: Some("test-rules".into()),
+                        endpoint: None, timeout_ms: None, enabled: None },
+                )
+            } else {
+                (
+                    Tier { exex: Role::Encoder, transport: Transport::Grpc, request_shape: Some(RequestShape::Score) },
+                    Params { model_format: Some(ModelFormat::Onnx), model: Some(name.into()), config: None,
+                        endpoint: Some("http://127.0.0.1:9".into()), timeout_ms: Some(250), enabled: None },
+                )
+            };
+            registry.register_fake(tname(name), tier, params, Arc::new(NamedTier)).unwrap();
         }
         let task = Task {
             name: "route".into(),
             cascade: Cascade::from_names(
-                &[tname("rules"), tname("prefilter"), tname("modernbert")], &registry,
+                &[tname("rules"), tname("prefilter"), tname("modernbert")],
             ).unwrap(),
             output_kind: OutputKind::Binary,
             labels: Some(vec![LABEL_JEV.into(), LABEL_LLM.into()]),
