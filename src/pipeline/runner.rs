@@ -440,7 +440,7 @@ mod tests {
             fake_tier("rules", &calls, Duration::ZERO, &[]),
             fake_tier("harrier", &calls, Duration::ZERO, &[]),
         ]);
-        let profiles = vec![route(&registry, &["rules"])];
+        let profiles = vec![route(&["rules"])];
         let graph = CascadeGraph::from_tasks(&profiles, &registry).unwrap();
         let runner = CascadeRunner::new(graph);
         assert!(registry.get(&tname("harrier")).is_some());
