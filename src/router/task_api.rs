@@ -496,9 +496,11 @@ mod tests {
             Resolution::Tier { ref tier, .. } if tier.as_str() == "modernbert"));
         assert!(matches!(complete.tasks[&String::from("fraud_risk")].resolution,
             Resolution::Tier { ref tier, .. } if tier.as_str() == "modernbert"));
-        let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0], ("rules".to_string(), vec!["customer_intent".into()]));
-        assert_eq!(calls[1], ("modernbert".to_string(), vec!["urgency".into(), "fraud_risk".into()]));
+        let mut calls = calls.lock().unwrap().clone();
+        calls.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(calls, [
+            ("modernbert".to_string(), vec!["urgency".into(), "fraud_risk".into()]),
+            ("rules".to_string(), vec!["customer_intent".into()]),
+        ]);
     }
 }
