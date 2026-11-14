@@ -404,10 +404,8 @@ mod tests {
         let graph = CascadeGraph::from_tasks(&tasks, &registry).unwrap();
 
         assert_eq!(graph.dependencies().len(), 1);
-        assert_eq!(
-            graph.dependencies()[0].tasks,
-            ["first".to_string(), "second".to_string()].into_iter().collect(),
-        );
+        let expected: BTreeSet<String> = ["first", "second"].into_iter().map(str::to_string).collect();
+        assert_eq!(graph.dependencies()[0].tasks, expected);
     }
 
     #[test]
@@ -427,7 +425,8 @@ mod tests {
         let owners: BTreeSet<_> = blocked_dependencies.iter()
             .flat_map(|edge| edge.tasks.iter().cloned())
             .collect();
-        assert_eq!(owners, ["first".to_string(), "second".to_string()].into_iter().collect());
+        let expected_owners: BTreeSet<String> = ["first", "second"].into_iter().map(str::to_string).collect();
+        assert_eq!(owners, expected_owners);
         assert!(blocked_dependencies.iter().all(|edge| edge.tasks.len() == 1));
     }
 
