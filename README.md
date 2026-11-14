@@ -84,7 +84,7 @@ min_confidence = 0.85
 
 A task skips nodes absent from its own Cascade and nodes without a task-specific policy. After a pass, it continues to the next policy-bearing node along its ordered path. Resolution removes that task from the run; exhaustion applies its fallback. Tasks that reach the same graph node are batched into one invocation, allowing a single `ScoreTasks` request to evaluate multiple heads against one shared representation.
 
-A new task adds its output contract, ordered `cascade`, and policies for the tiers it uses. A new `[[tier]]` adds an available instance to the registry; adding its name to a task's Cascade makes it part of that task's execution path.
+A new task adds its output contract, ordered `cascade` of TierNames, and policies for the tiers it uses. A new `[[tier]]` adds an available Tier definition to the registry; referencing its name in a task's Cascade causes `CascadeGraph` to materialize its TierInstance.
 
 The identity layers stay distinct. `TierName` identifies an authored tier definition and appears in task cascades. `TierId` is generated only when `CascadeGraph` materializes a concrete instance; the hash includes its name and behavior-determining configuration, including inference runtime, model-related configuration and loaded artifact content. Endpoint and timeout are deployment details, not identity. `Slot` is the instance's position in the compiled graph, an execution/telemetry address rather than an identity.
 
@@ -92,7 +92,7 @@ The identity layers stay distinct. `TierName` identifies an authored tier defini
 
 The original four tiers were once numbered 1 to 4, and those numbers survive at the edges: numbered telemetry fields, `[router.tierN]` settings, numbered environment variables and `tierN` aliases in `[tier_policy.*]` keys. The `[legacy_tiers]` table in `tasks.toml` is the only place a name and a number meet. It is read at load and handed to code that writes those compatibility surfaces; no tier, instance, registry or Cascade carries a number. Configuration with no explicit `[[tier]]` entries keeps the original numbering.
 
-`CascadeGraph` computes a deterministic topological execution order from the adjacent TierId pairs in each Task's Cascade. Shared TierIds execute once for all eligible tasks; tiers absent from every task path remain available in the registry but do not execute. The complete `tier_outcomes` array remains name-keyed in graph execution order; existing numbered fields remain compatibility projections. Tiers 5 and 6 are downstream execution backends, not Cascade nodes.
+`CascadeGraph` computes a deterministic topological execution order by resolving each task's adjacent TierName pairs to hash-derived TierIds. Shared TierNames resolve to shared graph nodes and execute once for all eligible tasks; definitions absent from every task path remain available in the registry but do not materialize. The complete `tier_outcomes` array remains name-keyed in graph execution order; existing numbered fields remain compatibility projections. Tiers 5 and 6 are downstream execution backends, not Cascade nodes.
 
 ---
 
