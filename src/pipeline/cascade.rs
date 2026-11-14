@@ -31,7 +31,6 @@ impl Cascade {
     }
 
     pub fn tiers(&self) -> &[TierId] { &self.tiers }
-    pub fn contains(&self, tier: &TierId) -> bool { self.tiers.contains(tier) }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,7 +174,6 @@ impl CascadeGraph {
     }
 
     pub fn order(&self) -> &[TierId] { &self.order }
-    pub fn paths(&self) -> &BTreeMap<String, Cascade> { &self.paths }
     pub fn task_uses(&self, task: &str, tier: &TierId) -> bool {
         self.tasks_by_tier.get(tier).is_some_and(|tasks| tasks.contains(task))
     }
