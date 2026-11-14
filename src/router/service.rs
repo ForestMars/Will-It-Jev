@@ -18,11 +18,13 @@ use tokio::sync::mpsc;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::pipeline::registry::{TierDirectory, FALLBACK_TIER_NAME};
+use crate::legacy_tiers::LegacyTierNumbers;
+use crate::pipeline::cascade::{CascadeGraph, Slot};
+use crate::pipeline::tier::{TierId, FALLBACK_TIER_NAME};
 use crate::pipeline::runner::{CascadeRunner, Resolution, RunOutcome, TierTrace};
 use crate::pipeline::tagger::JointTagStore;
 use crate::pipeline::task::{
-    Decision, Reading, TaskId, TaskProfile, TierPolicyMap, TierReading, LABEL_JEV, LABEL_LLM,
+    Decision, Reading, Task, TierPolicyMap, TierReading, LABEL_JEV, LABEL_LLM,
 };
 use crate::tagging::{is_sampled, TagInput, TagQueue};
 use crate::telemetry::{
@@ -38,37 +40,41 @@ use super::{
 pub struct AppDependencies {
     pub cascade: Arc<CascadeRunner>,
     /// All configured task contracts, used by the generic task execution API.
-    pub task_profiles: Vec<TaskProfile>,
-    pub route_profile: TaskProfile,
+    pub task_profiles: Vec<Task>,
+    pub route_profile: Task,
     pub tier_policies: Arc<TierPolicyMap>,
     pub dispatcher: DownstreamDispatcher,
     pub hashes: Hashes,
     pub capture_tx: mpsc::Sender<RouteRecord>,
     pub tag_queue: TagQueue,
-    pub tag_profile: Option<TaskProfile>,
+    pub tag_profile: Option<Task>,
     pub joint_tags: JointTagStore,
     pub tag_in_request: bool,
     pub tag_sample_prob: f32,
     pub joint_tag_ttl: Duration,
     pub budget: Duration,
+    /// Numbers for the numbered telemetry fields. Consulted only when a record
+    /// is built; nothing upstream of telemetry sees them.
+    pub legacy: Arc<LegacyTierNumbers>,
 }
 
 #[derive(Clone)]
 pub struct AppState {
     cascade: Arc<CascadeRunner>,
-    route_profile: TaskProfile,
+    route_profile: Task,
     tier_policies: Arc<TierPolicyMap>,
     dispatcher: Arc<DownstreamDispatcher>,
     hashes: Arc<Hashes>,
     capture_tx: mpsc::Sender<RouteRecord>,
     tag_queue: TagQueue,
-    tag_profile: Option<TaskProfile>,
+    tag_profile: Option<Task>,
     joint_tags: JointTagStore,
     tag_in_request: bool,
     tag_sample_prob: f32,
     joint_tag_ttl: Duration,
     budget: Duration,
-    tiers: Arc<TierDirectory>,
+    cascade_order: Arc<CascadeGraph>,
+    legacy: Arc<LegacyTierNumbers>,
 }
 
 #[derive(Deserialize)]
@@ -95,7 +101,8 @@ pub fn app(dependencies: AppDependencies) -> Router {
         dependencies.budget,
     );
     let state = AppState {
-        tiers: dependencies.cascade.directory(),
+        cascade_order: dependencies.cascade.graph(),
+        legacy: dependencies.legacy,
         cascade: dependencies.cascade,
         route_profile: dependencies.route_profile,
         tier_policies: dependencies.tier_policies,
@@ -226,7 +233,7 @@ async fn completion(
         let split = Arc::clone(&state.cascade).run_split(
             route_input.clone(),
             request_profiles.clone(),
-            BTreeSet::from([TaskId::route()]),
+            BTreeSet::from([String::from("route")]),
             Arc::clone(&state.tier_policies),
             state.budget,
         );
@@ -252,7 +259,7 @@ async fn completion(
         );
     }
     let (backend, mut record) =
-        route_record(request_id, &route_input, &state.hashes, &state.tiers, &request_profiles, &outcome, route_started);
+        route_record(request_id, &route_input, &state.hashes, &state.cascade_order, &state.legacy, &request_profiles, &outcome, route_started);
 
     tracing::info!(
         request_id = %record.request_id,
@@ -346,24 +353,26 @@ fn route_record(
     request_id: String,
     prompt: &str,
     hashes: &Hashes,
-    tiers: &TierDirectory,
-    profiles: &[TaskProfile],
+    tiers: &CascadeGraph,
+    legacy: &LegacyTierNumbers,
+    profiles: &[Task],
     outcome: &RunOutcome,
     started: Instant,
 ) -> (Backend, RouteRecord) {
-    let route_outcome = outcome.tasks.get(&TaskId::route());
+    let route_outcome = outcome.tasks.get(&String::from("route"));
     // The numeric value is the legacy ordinal (0 for a tier without one); the
     // name is the identity. Fallback keeps its historical value of 6.
-    let (backend, decision_tier, decision_tier_name) = match route_outcome.map(|task| &task.resolution) {
-        Some(Resolution::Tier { tier, reading, .. }) => (
+    let (backend, decision_tier, decision_tier_name, decision_tier_id) = match route_outcome.map(|task| &task.resolution) {
+        Some(Resolution::Tier { tier_id, tier, reading, .. }) => (
             backend_for_label(&reading.label),
-            tiers.legacy_ordinal(tier).unwrap_or(0),
+            legacy.ordinal_of(tier).unwrap_or(0),
             tier.to_string(),
+            tier_id.to_string(),
         ),
         Some(Resolution::Fallback { label }) => {
-            (backend_for_label(label), 6, FALLBACK_TIER_NAME.to_string())
+            (backend_for_label(label), 6, FALLBACK_TIER_NAME.to_string(), String::new())
         }
-        Some(Resolution::Deferred) | None => (Backend::Llm, 6, FALLBACK_TIER_NAME.to_string()),
+        Some(Resolution::Deferred) | None => (Backend::Llm, 6, FALLBACK_TIER_NAME.to_string(), String::new()),
     };
 
     let trace = route_outcome.map(|task| task.trace.as_slice()).unwrap_or(&[]);
@@ -375,20 +384,20 @@ fn route_record(
             "route task tier trace"
         );
     }
-    let tier1_outcome = trace_for_ordinal(trace, tiers, 1)
+    let tier1_outcome = trace_for_ordinal(trace, legacy, 1)
         .map(tier1_record)
         .unwrap_or(Tier1Record {
             confidence: 0.0,
             decided: false,
             reason: "disabled".into(),
         });
-    let tier2_outcome = trace_for_ordinal(trace, tiers, 2).map(tier2_record);
-    let tier3_outcome = trace_for_ordinal(trace, tiers, 3).map(tier3_record);
-    let tier4_outcome = trace_for_ordinal(trace, tiers, 4).map(tier3_record);
+    let tier2_outcome = trace_for_ordinal(trace, legacy, 2).map(tier2_record);
+    let tier3_outcome = trace_for_ordinal(trace, legacy, 3).map(tier3_record);
+    let tier4_outcome = trace_for_ordinal(trace, legacy, 4).map(tier3_record);
     let latency_us = started.elapsed().as_micros();
     let task_decisions = outcome.tasks.iter().map(|(task_id, task_outcome)| {
         let output_kind = profiles.iter()
-            .find(|profile| profile.task.as_str() == task_id.as_str())
+            .find(|profile| profile.name.as_str() == task_id.as_str())
             .map(|profile| profile.output_kind.as_str())
             .unwrap_or("unknown");
         let latency_ms = outcome.tier_calls.iter()
@@ -396,13 +405,14 @@ fn route_record(
             .map(|call| call.took.as_secs_f64() * 1000.0)
             .sum();
         match &task_outcome.resolution {
-            Resolution::Tier { tier, model_id, reading } => TaskDecisionRecord {
+            Resolution::Tier { tier_id, tier, model_id, reading } => TaskDecisionRecord {
                 task_id: task_id.as_str().to_string(),
                 output_kind: output_kind.to_string(),
                 status: "resolved".into(),
                 latency_ms,
-                resolving_tier: tiers.legacy_ordinal(tier),
+                resolving_tier: legacy.ordinal_of(tier),
                 resolving_tier_name: Some(tier.to_string()),
+                resolving_tier_id: Some(tier_id.to_string()),
                 model_id: Some(model_id.clone()),
                 label: Some(reading.label.clone()),
                 confidence: Some(reading.confidence),
@@ -418,6 +428,7 @@ fn route_record(
                 latency_ms,
                 resolving_tier: None,
                 resolving_tier_name: None,
+                resolving_tier_id: None,
                 model_id: None,
                 label: Some(label.clone()),
                 confidence: None,
@@ -430,6 +441,7 @@ fn route_record(
                 latency_ms,
                 resolving_tier: None,
                 resolving_tier_name: None,
+                resolving_tier_id: None,
                 model_id: None,
                 label: None,
                 confidence: None,
@@ -454,6 +466,7 @@ fn route_record(
         }),
         cascade_decision_tier: decision_tier,
         decided_by_tier_name: decision_tier_name.clone(),
+        decided_by_tier_id: decision_tier_id,
         final_routing: FinalRouting {
             backend: backend.to_string(),
             tier: decision_tier,
@@ -483,9 +496,9 @@ fn backend_for_label(label: &str) -> Backend {
 }
 
 /// Every tier that ran for the route task, by name, in execution order. This is
-/// the complete per-tier record; it covers tiers that have no legacy ordinal and
+/// the complete per-tier record; it covers tiers that have no legacy number and
 /// so never appear in the numbered fields below.
-fn tier_outcome_records(trace: &[TierTrace], tiers: &TierDirectory) -> Vec<TierOutcomeRecord> {
+fn tier_outcome_records(trace: &[TierTrace], tiers: &CascadeGraph) -> Vec<TierOutcomeRecord> {
     trace
         .iter()
         .map(|entry| {
@@ -505,8 +518,8 @@ fn tier_outcome_records(trace: &[TierTrace], tiers: &TierDirectory) -> Vec<TierO
             };
             TierOutcomeRecord {
                 tier: entry.tier.to_string(),
-                position: tiers.position(&entry.tier).unwrap_or_default(),
-                legacy_ordinal: tiers.legacy_ordinal(&entry.tier),
+                tier_id: entry.tier_id.to_string(),
+                position: tiers.slot(&entry.tier_id).map(Slot::index).unwrap_or_default(),
                 model_id: entry.model_id.clone(),
                 status: status.into(),
                 decided: matches!(&entry.decision, Decision::Resolve(_)),
@@ -521,13 +534,13 @@ fn tier_outcome_records(trace: &[TierTrace], tiers: &TierDirectory) -> Vec<TierO
 
 /// The numbered telemetry fields (`tier1_outcome` .. `tier4_outcome`) describe
 /// the original four tiers. Find the trace entry of whichever registered tier
-/// carries that legacy ordinal.
+/// carries that legacy number.
 fn trace_for_ordinal<'a>(
     trace: &'a [TierTrace],
-    tiers: &TierDirectory,
+    legacy: &LegacyTierNumbers,
     ordinal: u8,
 ) -> Option<&'a TierTrace> {
-    let id = tiers.id_for_ordinal(ordinal)?;
+    let id = legacy.name_of(ordinal)?;
     trace.iter().find(|entry| &entry.tier == id)
 }
 
@@ -659,47 +672,74 @@ mod tests {
         assert_eq!(openai_chat_response(&payload, None), payload);
     }
 
-    // ---- tier identity in the route record ---------------------------------
+    // ---- task-owned cascade and graph telemetry ---------------------------
 
-    use crate::pipeline::registry::{tid, TierId, TierRegistry};
+    use crate::pipeline::cascade::Cascade;
+    use crate::pipeline::tier::tname;
+    use crate::pipeline::registry::TierRegistry;
     use crate::pipeline::runner::TaskOutcome;
     use crate::pipeline::task::{FallbackPolicy, OutputKind};
-    use crate::pipeline::tier::{Tier, TierContext, TierOutput};
+    use crate::pipeline::tier::{FakeEvaluate, ModelFormat, Params, RequestShape, Role, Tier, TierContext, TierOutput, Transport};
     use async_trait::async_trait;
 
-    struct NamedTier(TierId);
-
+    struct NamedTier;
     #[async_trait]
-    impl Tier for NamedTier {
-        fn id(&self) -> &TierId { &self.0 }
-        fn name(&self) -> &str { "named" }
+    impl FakeEvaluate for NamedTier {
         async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
             TierOutput::abstain_all("named", ctx.tasks, "test")
         }
     }
 
-    /// rules(1), prefilter(no ordinal), modernbert(3) in that execution order.
-    fn directory() -> TierDirectory {
+    fn fixture() -> (Task, CascadeGraph) {
         let mut registry = TierRegistry::new();
-        for (name, ordinal) in [("rules", Some(1)), ("prefilter", None), ("modernbert", Some(3))] {
-            registry.register(Arc::new(NamedTier(tid(name))), ordinal).unwrap();
+        for name in ["rules", "prefilter", "modernbert"] {
+            let (tier, params) = if name == "rules" {
+                (
+                    Tier { exex: Role::Rules, transport: Transport::InProcess, request_shape: None },
+                    Params { model_format: None, model: None, config: Some("test-rules".into()),
+                        endpoint: None, timeout_ms: None, enabled: None },
+                )
+            } else {
+                (
+                    Tier { exex: Role::Encoder, transport: Transport::Grpc, request_shape: Some(RequestShape::Score) },
+                    Params { model_format: Some(ModelFormat::Onnx), model: Some(name.into()), config: None,
+                        endpoint: Some("http://127.0.0.1:9".into()), timeout_ms: Some(250), enabled: None },
+                )
+            };
+            registry.register_fake(tname(name), tier, params, Arc::new(NamedTier)).unwrap();
         }
-        registry.directory()
-    }
-
-    fn route_profile() -> TaskProfile {
-        TaskProfile {
-            task: TaskId::route(),
+        let task = Task {
+            name: "route".into(),
+            cascade: Cascade::from_names(
+                &[tname("rules"), tname("prefilter"), tname("modernbert")],
+            ).unwrap(),
             output_kind: OutputKind::Binary,
             labels: Some(vec![LABEL_JEV.into(), LABEL_LLM.into()]),
             label_metadata: Vec::new(),
             taxonomy_version: None,
             fallback: FallbackPolicy::Label(LABEL_LLM.into()),
-        }
+        };
+        let graph = CascadeGraph::from_tasks(&[task.clone()], &registry).unwrap();
+        (task, graph)
+    }
+
+    /// rules is 1 and modernbert is 3; prefilter has no legacy number.
+    fn legacy() -> LegacyTierNumbers {
+        LegacyTierNumbers::new([(tname("rules"), 1), (tname("modernbert"), 3)]).unwrap()
+    }
+
+    fn test_tier_id(name: &str) -> TierId {
+        fixture().1.id_for_name(&tname(name)).expect("test tier exists")
     }
 
     fn trace(tier: &str, reading: TierReading, decision: Decision) -> TierTrace {
-        TierTrace { tier: tid(tier), model_id: format!("m-{tier}"), reading, decision }
+        TierTrace {
+            tier_id: test_tier_id(tier),
+            tier: tname(tier),
+            model_id: format!("m-{tier}"),
+            reading,
+            decision,
+        }
     }
 
     fn pass() -> Decision {
@@ -707,8 +747,9 @@ mod tests {
     }
 
     fn record_for(resolution: Resolution, trace: Vec<TierTrace>) -> RouteRecord {
+        let (profile, graph) = fixture();
         let outcome = RunOutcome {
-            tasks: [(TaskId::route(), TaskOutcome { resolution, trace })].into(),
+            tasks: [("route".to_string(), TaskOutcome { resolution, trace })].into(),
             tier_calls: Vec::new(),
         };
         let hashes = Hashes { tier1_toml: "t1".into(), tier2_bin: "t2".into() };
@@ -716,18 +757,19 @@ mod tests {
             "11111111-1111-4111-8111-111111111111".into(),
             "prompt",
             &hashes,
-            &directory(),
-            &[route_profile()],
+            &graph,
+            &legacy(),
+            &[profile],
             &outcome,
             Instant::now(),
         ).1
     }
 
     #[test]
-    fn route_record_carries_legacy_ordinal_and_tier_name() {
+    fn route_record_carries_legacy_number_and_tier_name() {
         let reading = Reading::new(LABEL_JEV, 0.97);
         let record = record_for(
-            Resolution::Tier { tier: tid("modernbert"), model_id: "m".into(), reading: reading.clone() },
+            Resolution::Tier { tier_id: test_tier_id("modernbert"), tier: tname("modernbert"), model_id: "m".into(), reading: reading.clone() },
             vec![
                 trace("rules", TierReading::Abstain("conflict"), pass()),
                 trace("modernbert", TierReading::Scored(reading.clone()), Decision::Resolve(reading)),
@@ -746,10 +788,10 @@ mod tests {
     }
 
     #[test]
-    fn a_tier_without_a_legacy_ordinal_is_identified_by_name_only() {
+    fn a_tier_without_a_legacy_number_is_identified_by_name_only() {
         let reading = Reading::new(LABEL_JEV, 0.9);
         let record = record_for(
-            Resolution::Tier { tier: tid("prefilter"), model_id: "m".into(), reading: reading.clone() },
+            Resolution::Tier { tier_id: test_tier_id("prefilter"), tier: tname("prefilter"), model_id: "m".into(), reading: reading.clone() },
             vec![trace("prefilter", TierReading::Scored(reading.clone()), Decision::Resolve(reading))],
         );
         assert_eq!(record.decided_by_tier_name, "prefilter");
@@ -788,7 +830,7 @@ mod tests {
     fn tier_outcomes_list_every_tier_by_name_in_execution_order() {
         let reading = Reading { label: LABEL_JEV.into(), confidence: 0.97, scores: vec![(LABEL_JEV.into(), 0.97), (LABEL_LLM.into(), 0.03)] };
         let record = record_for(
-            Resolution::Tier { tier: tid("modernbert"), model_id: "m".into(), reading: reading.clone() },
+            Resolution::Tier { tier_id: test_tier_id("modernbert"), tier: tname("modernbert"), model_id: "m".into(), reading: reading.clone() },
             vec![
                 trace("rules", TierReading::Abstain("conflict"), pass()),
                 trace("prefilter", TierReading::Unsupported, pass()),
@@ -799,16 +841,16 @@ mod tests {
         assert_eq!(names, ["rules", "prefilter", "modernbert"]);
 
         let rules = &record.tier_outcomes[0];
-        assert_eq!((rules.position, rules.legacy_ordinal, rules.status.as_str(), rules.decided), (0, Some(1), "abstain", false));
+        assert_eq!((rules.position, rules.status.as_str(), rules.decided), (0, "abstain", false));
         assert_eq!(rules.label, None);
 
         // A tier with no legacy ordinal is fully described here even though no
         // numbered field can hold it.
         let prefilter = &record.tier_outcomes[1];
-        assert_eq!((prefilter.position, prefilter.legacy_ordinal, prefilter.status.as_str()), (1, None, "unsupported"));
+        assert_eq!((prefilter.position, prefilter.status.as_str()), (1, "unsupported"));
 
         let winner = &record.tier_outcomes[2];
-        assert_eq!((winner.position, winner.legacy_ordinal, winner.decided), (2, Some(3), true));
+        assert_eq!((winner.position, winner.decided), (2, true));
         assert_eq!(winner.reason, "resolved");
         assert_eq!(winner.label.as_deref(), Some(LABEL_JEV));
         assert_eq!(winner.confidence, Some(0.97));
@@ -817,10 +859,10 @@ mod tests {
     }
 
     #[test]
-    fn a_tier_without_a_legacy_ordinal_decides_visibly_in_tier_outcomes() {
+    fn a_tier_without_a_legacy_number_decides_visibly_in_tier_outcomes() {
         let reading = Reading::new(LABEL_JEV, 0.9);
         let record = record_for(
-            Resolution::Tier { tier: tid("prefilter"), model_id: "m".into(), reading: reading.clone() },
+            Resolution::Tier { tier_id: test_tier_id("prefilter"), tier: tname("prefilter"), model_id: "m".into(), reading: reading.clone() },
             vec![trace("prefilter", TierReading::Scored(reading.clone()), Decision::Resolve(reading))],
         );
         assert!(record.tier3_outcome.is_none());
@@ -833,7 +875,7 @@ mod tests {
     fn final_routing_carries_a_tier_name_matching_its_number() {
         let reading = Reading::new(LABEL_JEV, 0.97);
         let decided = record_for(
-            Resolution::Tier { tier: tid("modernbert"), model_id: "m".into(), reading: reading.clone() },
+            Resolution::Tier { tier_id: test_tier_id("modernbert"), tier: tname("modernbert"), model_id: "m".into(), reading: reading.clone() },
             vec![trace("modernbert", TierReading::Scored(reading.clone()), Decision::Resolve(reading))],
         );
         assert_eq!((decided.final_routing.tier, decided.final_routing.tier_name.as_str()), (3, "modernbert"));

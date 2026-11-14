@@ -45,6 +45,9 @@ pub struct RouteRecord {
     /// Name of the tier that decided the route, or `fallback`.
     #[serde(default)]
     pub decided_by_tier_name: String,
+    /// Generated identity of the tier that decided the route; empty for fallback.
+    #[serde(default)]
+    pub decided_by_tier_id: String,
     pub final_routing: FinalRouting,
     #[serde(default)]
     pub router_classification_latency_us: u128,
@@ -69,13 +72,13 @@ pub struct RouteRecord {
 /// One tier's reading and decision for the route task.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TierOutcomeRecord {
-    /// Tier name.
+    /// Human-readable tier name.
     pub tier: String,
+    /// Generated tier-instance identity.
+    #[serde(default)]
+    pub tier_id: String,
     /// Zero-based execution position in the tier registry.
     pub position: usize,
-    /// The 1..=4 number the original tiers carried, when this tier has one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub legacy_ordinal: Option<u8>,
     pub model_id: String,
     /// `scored`, `abstain` or `unsupported`.
     pub status: String,
@@ -103,6 +106,9 @@ pub struct TaskDecisionRecord {
     /// Name of the tier that resolved the task; absent for fallback or deferred.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolving_tier_name: Option<String>,
+    /// Generated identity of the resolving tier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolving_tier_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
