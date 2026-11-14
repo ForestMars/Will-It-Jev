@@ -59,7 +59,7 @@ Each tier returns one of two outcomes:
 
 Tier 6 is the terminal generative tier. Provider availability determines whether a response can be returned.
 
-The `TierRegistry` catalogs every configured instance by `TierName`; its membership and insertion order do not define execution. Each `Task` owns an ordered `Cascade` of TierIds. `CascadeGraph` is computed from all task cascades: adjacent tiers create dependency edges, shared TierIds become shared nodes, and contradictory paths fail cycle validation. Disabled instances are omitted from each task's runtime Cascade while preserving the remaining relative order. A task receives a turn at a graph node only when its own Cascade contains that TierId and a corresponding `[tier_policy.<tier>.<task>]` entry exists.
+The `TierRegistry` catalogs available `Tier` definitions and their declarative parameters by `TierName`; it stores no `TierInstance` and assigns no `TierId`. Each `Task` owns an ordered `Cascade` of `TierName` values. `CascadeGraph` compiles those named paths, materializes one `TierInstance` for each referenced definition, and assigns each instance a hash-derived `TierId`. Shared names produce shared graph nodes; unused definitions remain in the registry without acquiring an instance ID. Contradictory task paths fail cycle validation. Disabled definitions are omitted from each task's Cascade while preserving the remaining relative order.
 
 ```toml
 [task.route]
@@ -86,9 +86,9 @@ A task skips nodes absent from its own Cascade and nodes without a task-specific
 
 A new task adds its output contract, ordered `cascade`, and policies for the tiers it uses. A new `[[tier]]` adds an available instance to the registry; adding its name to a task's Cascade makes it part of that task's execution path.
 
-Three concepts stay distinct. A `TierName` is authored and looks up an instance in the registry. A `TierId` is generated from the name and behavior-determining instance content, including its tier definition, model format, model, rule artifact and artifact hash. Renaming an instance changes its `TierId`; endpoint, timeout and enabled state do not. A `Slot` is the instance's position in the compiled `CascadeGraph`: an execution/telemetry address, not a stable identity.
+The identity layers stay distinct. `TierName` identifies an authored tier definition and appears in task cascades. `TierId` is generated only when `CascadeGraph` materializes a concrete instance; the hash includes its name and behavior-determining configuration, including inference runtime, model-related configuration and loaded artifact content. Endpoint and timeout are deployment details, not identity. `Slot` is the instance's position in the compiled graph, an execution/telemetry address rather than an identity.
 
-A `Tier` is the reusable definition; a `TierInstance` adds the parameters and loaded implementation that distinguish a concrete instance. `model_format` identifies only the encoder artifact representation (`onnx` or `gguf`); it does not choose an inference runtime. Several instances of one Tier can coexist, for example one encoder over ONNX and another over GGUF. The `model` field identifies the model an instance runs (a file for FastText; for an encoder, the name the sidecar should report). `TIER1_CONFIG` and `FASTTEXT_MODEL` only supply a value for an instance that declares none.
+`model_format` selects the inference runtime at the adapter boundary. The router selects the corresponding adapter endpoint but does not compare or validate the model identity reported by a sidecar. `TierInstance` is the concrete realization of a definition and is owned by `CascadeGraph`, not by `TierRegistry`.
 
 The original four tiers were once numbered 1 to 4, and those numbers survive at the edges: numbered telemetry fields, `[router.tierN]` settings, numbered environment variables and `tierN` aliases in `[tier_policy.*]` keys. The `[legacy_tiers]` table in `tasks.toml` is the only place a name and a number meet. It is read at load and handed to code that writes those compatibility surfaces; no tier, instance, registry or Cascade carries a number. Configuration with no explicit `[[tier]]` entries keeps the original numbering.
 
@@ -171,9 +171,9 @@ src/
     mod.rs            Low-overhead tracing and telemetry initialization
   pipeline/           Task-agnostic cascade engine (see "Multi-task cascade" below)
     task.rs           Task contracts, raw readings and tier/task resolution policies
-    registry.rs       Unordered TierRegistry of available TierInstances, keyed by TierName
-    cascade.rs        Task-owned Cascade paths and the computed CascadeGraph
-    tier.rs           Tier declarations, TierInstances and their concrete evaluators
+    registry.rs       Unordered TierRegistry of available Tier definitions, keyed by TierName
+    cascade.rs        Task-owned TierName paths; CascadeGraph materializes instances and compiles the DAG
+    tier.rs           Tier definitions, hash identities, TierInstances and evaluator contract
     runner.rs         CascadeRunner: one ordered pass, batching eligible tasks at each tier
     config.rs         config/tasks.toml loader
     tagger.rs         CascadeTagger: category tagging on the shared tiers
@@ -518,7 +518,7 @@ Tiers are decoupled from the questions they answer. A `TierInstance` returns raw
 readings and applies no thresholds. Each `Task` owns its ordered `Cascade`, alongside its
 output contract, allowed labels and fallback. `CascadeGraph` is compiled from all task paths.
 The `CascadeRunner` traverses that graph in topological order, batching tasks whose own path
-contains the current TierId and whose tier/task policy is present. Each task leaves when it
+contains the current TierName and whose tier/task policy is present. Each task leaves when it
 resolves or exhausts the policy-bearing tiers on its path.
 
 * `route` (jev_capable / needs_llm): the policies in `config/tasks.toml` set the
