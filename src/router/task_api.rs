@@ -444,7 +444,7 @@ mod tests {
                 ].into(),
                 calls: calls.clone(),
             })),
-        ])
+        ]);
 
         let profiles = vec![
             profile("customer_intent", OutputKind::Multiclass, &["billing", "account"], &["rules"]),
