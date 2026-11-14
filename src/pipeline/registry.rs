@@ -82,21 +82,21 @@ impl TierRegistry {
     }
 
     #[cfg(test)]
-    pub fn of(tiers: Vec<std::sync::Arc<super::tier::TierInstance>>) -> Self {
+    pub fn of(
+        entries: Vec<(
+            TierName,
+            Tier,
+            Params,
+            std::sync::Arc<dyn super::tier::FakeEvaluate>,
+        )>,
+    ) -> Self {
         let mut registry = Self::new();
-        for instance in tiers {
-            let fake = instance.fake_evaluator()
-                .expect("test registry instances must use FakeEvaluate");
-            registry.register_fake(
-                instance.name().clone(),
-                *instance.tier(),
-                instance.params().clone(),
-                fake,
-            ).expect("test tier names must be unique");
+        for (name, tier, params, fake) in entries {
+            registry.register_fake(name, tier, params, fake)
+                .expect("test tier names must be unique");
         }
         registry
-    }
-}
+    }}
 
 #[cfg(test)]
 mod tests {
