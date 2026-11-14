@@ -54,6 +54,15 @@ impl fmt::Display for Slot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{}", self.0) }
 }
 
+/// A precedence constraint contributed by one or more task-owned cascade paths.
+/// The task set preserves the provenance of an edge in the union execution DAG.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CascadeDependency {
+    pub from: TierId,
+    pub to: TierId,
+    pub tasks: BTreeSet<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CascadeGraphError {
     UnknownTier { task: String, tier: TierName },
@@ -61,7 +70,10 @@ pub enum CascadeGraphError {
     DuplicateTask(String),
     TierBuild { tier: TierName, reason: String },
     TierIdCollision { id: TierId, first: TierName, second: TierName },
-    Cycle { tiers: Vec<TierId> },
+    Cycle {
+        tiers: Vec<TierId>,
+        blocked_dependencies: Vec<CascadeDependency>,
+    },
 }
 impl fmt::Display for CascadeGraphError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -75,11 +87,19 @@ impl fmt::Display for CascadeGraphError {
                 write!(f, "failed to materialize tier {tier} on CascadeGraph: {reason}"),
             Self::TierIdCollision { id, first, second } =>
                 write!(f, "tiers {first} and {second} generated the same TierId {id}"),
-            Self::Cycle { tiers } => write!(
-                f,
-                "task cascades create a cycle among tiers: {}",
-                tiers.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
-            ),
+            Self::Cycle { tiers, blocked_dependencies } => {
+                let tiers = tiers.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+                let dependencies = blocked_dependencies.iter().map(|edge| format!(
+                    "{} -> {} required by [{}]",
+                    edge.from,
+                    edge.to,
+                    edge.tasks.iter().cloned().collect::<Vec<_>>().join(", "),
+                )).collect::<Vec<_>>().join("; ");
+                write!(
+                    f,
+                    "task cascades create a cycle among tiers: {tiers}; blocked precedence constraints: {dependencies}"
+                )
+            },
         }
     }
 }
@@ -87,10 +107,13 @@ impl Error for CascadeGraphError {}
 
 /// The graph owns the concrete TierInstances. Each task path remains a sequence
 /// of TierNames; graph nodes receive hash-derived TierIds only during compilation.
+/// The union graph has one global topological order, and each precedence edge
+/// retains the task paths that introduced it.
 #[derive(Clone, Default)]
 pub struct CascadeGraph {
     paths: BTreeMap<String, Cascade>,
     order: Vec<TierId>,
+    dependencies: Vec<CascadeDependency>,
     tasks_by_tier: BTreeMap<TierId, BTreeSet<String>>,
     names_by_id: BTreeMap<TierId, TierName>,
     ids_by_name: BTreeMap<TierName, TierId>,
@@ -103,7 +126,7 @@ impl CascadeGraph {
         registry: &TierRegistry,
     ) -> Result<Self, CascadeGraphError> {
         let mut graph = Self::default();
-        let mut successors: BTreeMap<TierId, BTreeSet<TierId>> = BTreeMap::new();
+        let mut successors: BTreeMap<TierId, BTreeMap<TierId, BTreeSet<String>>> = BTreeMap::new();
         let mut indegree: BTreeMap<TierId, usize> = BTreeMap::new();
         let mut first_seen: BTreeMap<TierId, usize> = BTreeMap::new();
         let mut next_rank = 0usize;
@@ -187,13 +210,25 @@ impl CascadeGraph {
             }
 
             for edge in path_ids.windows(2) {
-                if successors.entry(edge[0]).or_default().insert(edge[1]) {
+                let owners = successors.entry(edge[0]).or_default().entry(edge[1]).or_default();
+                if owners.is_empty() {
                     *indegree.entry(edge[1]).or_insert(0) += 1;
                 }
+                owners.insert(task.name.clone());
             }
 
             graph.paths.insert(task.name.clone(), task.cascade.clone());
         }
+
+        // Materialize the union edges with their task-path provenance. Keep the
+        // ordering relation global; provenance explains which paths require it.
+        graph.dependencies = successors.iter()
+            .flat_map(|(from, next)| next.iter().map(|(to, tasks)| CascadeDependency {
+                from: *from,
+                to: *to,
+                tasks: tasks.clone(),
+            }))
+            .collect();
 
         // Preserve first appearance in task cascades as the deterministic tie-break.
         let mut ready: BTreeSet<(usize, TierId)> = indegree.iter()
@@ -207,7 +242,7 @@ impl CascadeGraph {
         while let Some((_, tier)) = ready.pop_first() {
             order.push(tier);
             if let Some(next) = successors.get(&tier) {
-                for dependent in next {
+                for dependent in next.keys() {
                     let degree = indegree.get_mut(dependent).expect("edge target has indegree");
                     *degree -= 1;
                     if *degree == 0 {
@@ -221,10 +256,17 @@ impl CascadeGraph {
         }
 
         if order.len() != indegree.len() {
-            let tiers = indegree.into_iter()
-                .filter_map(|(tier, degree)| (degree > 0).then_some(tier))
+            let blocked: BTreeSet<TierId> = indegree.iter()
+                .filter_map(|(tier, degree)| (*degree > 0).then_some(*tier))
                 .collect();
-            return Err(CascadeGraphError::Cycle { tiers });
+            let tiers = blocked.iter().copied().collect();
+            // Kahn's residual graph can include nodes downstream of a cycle,
+            // so report every dependency still blocked by that residual graph.
+            let blocked_dependencies = graph.dependencies.iter()
+                .filter(|edge| blocked.contains(&edge.from) && blocked.contains(&edge.to))
+                .cloned()
+                .collect();
+            return Err(CascadeGraphError::Cycle { tiers, blocked_dependencies });
         }
 
         graph.order = order;
@@ -232,6 +274,10 @@ impl CascadeGraph {
     }
 
     pub fn order(&self) -> &[TierId] { &self.order }
+
+    /// All precedence constraints in the union DAG, with the task paths that
+    /// contributed each edge. The returned order is deterministic.
+    pub fn dependencies(&self) -> &[CascadeDependency] { &self.dependencies }
 
     pub fn task_uses(&self, task: &str, tier: &TierId) -> bool {
         self.tasks_by_tier.get(tier).is_some_and(|tasks| tasks.contains(task))
@@ -349,11 +395,37 @@ mod tests {
     }
 
     #[test]
-    fn contradictory_task_paths_are_rejected_as_a_cycle() {
+    fn shared_dependencies_retain_every_contributing_task() {
+        let registry = registry(&["alpha", "beta"]);
+        let tasks = vec![
+            task("first", &["alpha", "beta"]),
+            task("second", &["alpha", "beta"]),
+        ];
+        let graph = CascadeGraph::from_tasks(&tasks, &registry).unwrap();
+
+        assert_eq!(graph.dependencies().len(), 1);
+        assert_eq!(
+            graph.dependencies()[0].tasks,
+            ["first".to_string(), "second".to_string()].into_iter().collect(),
+        );
+    }
+
+    #[test]
+    fn contradictory_task_paths_report_the_owners_of_blocked_dependencies() {
         let registry = registry(&["alpha", "beta"]);
         let tasks = vec![task("first", &["alpha", "beta"]), task("second", &["beta", "alpha"])];
-        assert!(matches!(CascadeGraph::from_tasks(&tasks, &registry),
-            Err(CascadeGraphError::Cycle { .. })));
+        let error = CascadeGraph::from_tasks(&tasks, &registry).unwrap_err();
+
+        let CascadeGraphError::Cycle { tiers, blocked_dependencies } = error else {
+            panic!("contradictory task paths must fail graph compilation");
+        };
+        assert_eq!(tiers.len(), 2);
+        assert_eq!(blocked_dependencies.len(), 2);
+        let owners: BTreeSet<_> = blocked_dependencies.iter()
+            .flat_map(|edge| edge.tasks.iter().cloned())
+            .collect();
+        assert_eq!(owners, ["first".to_string(), "second".to_string()].into_iter().collect());
+        assert!(blocked_dependencies.iter().all(|edge| edge.tasks.len() == 1));
     }
 
     #[test]
