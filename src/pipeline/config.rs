@@ -589,7 +589,7 @@ mod tests {
             "[task.tag]\ntaxonomy = \"../taskonomies/help_desk.json\"\noutput_kind = \"multiclass\"\nfallback = \"defer\"",
             Path::new("config"),
         ).unwrap();
-        let tag = cfg.profile("tag").unwrap();
+        let tag = cfg.profiles.get("tag").unwrap();
         assert_eq!(tag.output_kind, OutputKind::Multiclass);
         assert_eq!(tag.labels.as_ref().unwrap().len(), 20);
         assert_eq!(tag.taxonomy_version.as_deref(), Some("1.1.0"));
