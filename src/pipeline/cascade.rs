@@ -414,7 +414,10 @@ mod tests {
     fn contradictory_task_paths_report_the_owners_of_blocked_dependencies() {
         let registry = registry(&["alpha", "beta"]);
         let tasks = vec![task("first", &["alpha", "beta"]), task("second", &["beta", "alpha"])];
-        let error = CascadeGraph::from_tasks(&tasks, &registry).unwrap_err();
+        let error = match CascadeGraph::from_tasks(&tasks, &registry) {
+            Err(error) => error,
+            Ok(_) => panic!("contradictory task paths must fail graph compilation"),
+        };
 
         let CascadeGraphError::Cycle { tiers, blocked_dependencies } = error else {
             panic!("contradictory task paths must fail graph compilation");
