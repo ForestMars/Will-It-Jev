@@ -598,6 +598,15 @@ impl TierInstance {
 
 #[cfg(test)]
 impl TierInstance {
+    pub fn fake_with_definition(
+        name: TierName,
+        tier: Tier,
+        params: Params,
+        fake: Arc<dyn FakeEvaluate>,
+    ) -> Self {
+        Self::assemble(name, tier, params, Runner::Fake(fake), None)
+    }
+
     /// An encoder instance over an already-constructed gRPC runner.
     pub fn encoder(name: &str, shape: RequestShape, model: Option<&str>, runner: Tier3Runner) -> Self {
         let tier = Tier { exex: Role::Encoder, transport: Transport::Grpc, request_shape: Some(shape) };
