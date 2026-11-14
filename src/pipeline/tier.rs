@@ -598,32 +598,6 @@ impl TierInstance {
 
 #[cfg(test)]
 impl TierInstance {
-    /// An instance whose executor is a test double. The model is the name, so
-    /// instances built from different names have different ids.
-    pub fn fake(name: &str, fake: Arc<dyn FakeEvaluate>) -> Self {
-        Self::fake_with_model(name, name, fake)
-    }
-
-    pub fn fake_with_definition(
-        name: TierName,
-        tier: Tier,
-        params: Params,
-        fake: Arc<dyn FakeEvaluate>,
-    ) -> Self {
-        Self::assemble(name, tier, params, Runner::Fake(fake), None)
-    }
-
-    pub fn fake_with_model(name: &str, model: &str, fake: Arc<dyn FakeEvaluate>) -> Self {
-        let tier = Tier { exex: Role::Rules, transport: Transport::InProcess, request_shape: None };
-        let params = Params {
-            model_format: None, model: Some(model.to_string()), config: None,
-            endpoint: None, timeout_ms: None, enabled: None,
-        };
-        Self::assemble(
-            TierName::new(name).expect("test tier name must be valid"), tier, params, Runner::Fake(fake), None,
-        )
-    }
-
     /// An encoder instance over an already-constructed gRPC runner.
     pub fn encoder(name: &str, shape: RequestShape, model: Option<&str>, runner: Tier3Runner) -> Self {
         let tier = Tier { exex: Role::Encoder, transport: Transport::Grpc, request_shape: Some(shape) };
