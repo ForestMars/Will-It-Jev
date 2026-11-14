@@ -365,7 +365,7 @@ mod tests {
         cascade::{Cascade, CascadeGraph},
         registry::TierRegistry,
         task::{FallbackPolicy, OutputKind, Reading, TierPolicy},
-        tier::{tname, FakeEvaluate, ModelFormat, Params, RequestShape, Role, Tier, TierContext, TierOutput, Transport},
+        tier::{tname, FakeEvaluate, ModelFormat, Params, RequestShape, Role, Tier, TierContext, TierName, TierOutput, Transport},
     };
     use async_trait::async_trait;
     use std::collections::BTreeMap;
@@ -408,7 +408,7 @@ mod tests {
         name: &str,
         role: Role,
         fake: Arc<dyn FakeEvaluate>,
-    ) -> (super::super::super::pipeline::tier::TierName, Tier, Params, Arc<dyn FakeEvaluate>) {
+    ) -> (TierName, Tier, Params, Arc<dyn FakeEvaluate>) {
         let (transport, request_shape, model_format, model, config, endpoint, timeout_ms) =
             match role {
                 Role::Rules => (Transport::InProcess, None, None, None, Some("test-rules".into()), None, None),
