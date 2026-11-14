@@ -11,9 +11,8 @@ use tokio::task::JoinHandle;
 use tracing::debug;
 
 use super::cascade::CascadeGraph;
-use super::registry::TierRegistry;
 use super::task::{Decision, FallbackPolicy, Reading, Task, TierPolicyMap, TierReading};
-use super::tier::{TierContext, TierId, TierInstance, TierName};
+use super::tier::{TierContext, TierId, TierName};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Resolution {
@@ -57,26 +56,8 @@ pub struct RunOutcome {
     pub tier_calls: Vec<TierCall>,
 }
 
-#[derive(Debug)]
-pub enum CascadeRunnerBuildError {
-    MissingTier(TierId),
-}
-
-impl std::fmt::Display for CascadeRunnerBuildError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::MissingTier(id) => write!(f, "cascade references unavailable tier {id}"),
-        }
-    }
-}
-
-impl std::error::Error for CascadeRunnerBuildError {}
-
 pub struct CascadeRunner {
-    /// Complete catalog of available tier instances, including unused entries.
-    registry: TierRegistry,
-    /// Implementations used by the cascade, keyed by Cascade-assigned TierId.
-    tiers: BTreeMap<TierId, Arc<TierInstance>>,
+    /// The graph owns every materialized TierInstance used for this run.
     graph: Arc<CascadeGraph>,
 }
 
@@ -87,34 +68,11 @@ pub struct SplitRun {
 }
 
 impl CascadeRunner {
-    /// Bind the available registry to a graph compiled from the selected Tasks.
-    pub fn new(
-        registry: TierRegistry,
-        graph: CascadeGraph,
-    ) -> Result<Self, CascadeRunnerBuildError> {
-        let mut tiers = BTreeMap::new();
-        for id in graph.order() {
-            let name = graph.tier_name(id)
-                .ok_or_else(|| CascadeRunnerBuildError::MissingTier(*id))?;
-            let tier = registry.get(name)
-                .ok_or_else(|| CascadeRunnerBuildError::MissingTier(*id))?;
-            let actual = TierInstance::derive_id(
-                tier.name(), tier.tier(), tier.params(), tier.artifact_hash(),
-            );
-            if actual != *id {
-                return Err(CascadeRunnerBuildError::MissingTier(*id));
-            }
-            tiers.insert(*id, tier);
-        }
-        Ok(Self { registry, tiers, graph: Arc::new(graph) })
+    pub fn new(graph: CascadeGraph) -> Self {
+        Self { graph: Arc::new(graph) }
     }
 
-    /// Complete inventory of available instances, including unused entries.
-    pub fn registry(&self) -> &TierRegistry {
-        &self.registry
-    }
-
-    /// The computed execution graph for all Task.cascade paths.
+    /// The computed execution graph, including its materialized instances.
     pub fn graph(&self) -> Arc<CascadeGraph> {
         Arc::clone(&self.graph)
     }
@@ -213,7 +171,7 @@ impl CascadeRunner {
                 continue;
             }
 
-            let Some(tier) = self.tiers.get(&tier_id).cloned() else {
+            let Some(tier) = self.graph.instance(&tier_id) else {
                 for task in task_ids {
                     active.remove(&task);
                 }
@@ -361,11 +319,11 @@ mod tests {
         })))
     }
 
-    fn task(name: &str, registry: &TierRegistry, path: &[&str], kind: OutputKind,
+    fn task(name: &str, path: &[&str], kind: OutputKind,
         labels: &[&str], fallback: FallbackPolicy) -> Task {
         Task {
             name: name.into(),
-            cascade: Cascade::from_names(&path.iter().map(|name| tname(name)).collect::<Vec<_>>(), registry).unwrap(),
+            cascade: Cascade::from_names(&path.iter().map(|name| tname(name)).collect::<Vec<_>>()).unwrap(),
             output_kind: kind,
             labels: Some(labels.iter().map(|label| (*label).to_string()).collect()),
             label_metadata: Vec::new(),
@@ -373,12 +331,12 @@ mod tests {
             fallback,
         }
     }
-    fn route(registry: &TierRegistry, path: &[&str]) -> Task {
-        task("route", registry, path, OutputKind::Binary, &[LABEL_JEV, LABEL_LLM],
+    fn route(path: &[&str]) -> Task {
+        task("route", path, OutputKind::Binary, &[LABEL_JEV, LABEL_LLM],
             FallbackPolicy::Label(LABEL_LLM.into()))
     }
-    fn tag(registry: &TierRegistry, path: &[&str]) -> Task {
-        task("tag", registry, path, OutputKind::Multiclass, &["engineering", "help_desk"],
+    fn tag(path: &[&str]) -> Task {
+        task("tag", path, OutputKind::Multiclass, &["engineering", "help_desk"],
             FallbackPolicy::Defer)
     }
     fn scored(label: &str, score: f32) -> TierReading { TierReading::Scored(Reading::new(label, score)) }
@@ -398,11 +356,11 @@ mod tests {
                 ("route", scored(LABEL_JEV, 0.97)), ("tag", scored("engineering", 0.88)),
             ]),
         ]);
-        let profiles = vec![route(&registry, &["rules", "modernbert"]), tag(&registry, &["modernbert"])];
+        let profiles = vec![route(&["rules", "modernbert"]), tag(&["modernbert"])];
         let graph = CascadeGraph::from_tasks(&profiles, &registry).unwrap();
         let rules = tier_id(&graph, "rules");
         let modernbert = tier_id(&graph, "modernbert");
-        let runner = CascadeRunner::new(registry, graph).unwrap();
+        let runner = CascadeRunner::new(graph);
         let policies: TierPolicyMap = [
             (rules, [("route".into(), TierPolicy::new(0.78))].into()),
             (modernbert, [
@@ -431,7 +389,7 @@ mod tests {
         let graph = CascadeGraph::from_tasks(&profiles, &registry).unwrap();
         let rules = tier_id(&graph, "rules");
         let modernbert = tier_id(&graph, "modernbert");
-        let runner = Arc::new(CascadeRunner::new(registry, graph).unwrap());
+        let runner = Arc::new(CascadeRunner::new(graph));
         let policies: TierPolicyMap = [
             (rules, [("route".into(), TierPolicy::new(0.9))].into()),
             (modernbert, [("tag".into(), TierPolicy::new(0.8))].into()),
@@ -456,11 +414,11 @@ mod tests {
         let profiles = vec![route(&registry, &["rules"])];
         let graph = CascadeGraph::from_tasks(&profiles, &registry).unwrap();
         let rules = tier_id(&graph, "rules");
-        let harrier = tier_id(&graph, "harrier");
-        let runner = CascadeRunner::new(registry, graph).unwrap();
+        let unrelated = TierId::from_digest(&[0xab; 32]);
+        let runner = CascadeRunner::new(graph);
         let policies: TierPolicyMap = [
             (rules, [("route".into(), TierPolicy::new(0.9))].into()),
-            (harrier, [("route".into(), TierPolicy::new(0.1))].into()),
+            (unrelated, [("route".into(), TierPolicy::new(0.1))].into()),
         ].into();
         let result = runner.run("prompt", &profiles, &policies, Duration::from_secs(1)).await;
         assert!(resolved_at(&result.tasks["route"].resolution, "rules"));
@@ -476,10 +434,10 @@ mod tests {
         ]);
         let profiles = vec![route(&registry, &["rules"])];
         let graph = CascadeGraph::from_tasks(&profiles, &registry).unwrap();
-        let harrier = tier_id(&graph, "harrier");
-        let runner = CascadeRunner::new(registry, graph).unwrap();
-        assert!(runner.registry().get(&tname("harrier")).is_some());
-        assert_eq!(runner.graph().slot(&harrier), None);
+        let runner = CascadeRunner::new(graph);
+        assert!(registry.get(&tname("harrier")).is_some());
+        assert!(runner.graph().id_for_name(&tname("harrier")).is_none());
+        assert!(runner.graph().instance_for_name(&tname("harrier")).is_none());
     }
 
     #[tokio::test]
@@ -488,7 +446,7 @@ mod tests {
         let registry = TierRegistry::of(vec![fake_tier("rules", &calls, Duration::ZERO, &[])]);
         let profiles = vec![tag(&registry, &["rules"])];
         let graph = CascadeGraph::from_tasks(&profiles, &registry).unwrap();
-        let runner = CascadeRunner::new(registry, graph).unwrap();
+        let runner = CascadeRunner::new(graph);
         let result = runner.run("prompt", &profiles, &TierPolicyMap::new(), Duration::from_secs(1)).await;
         assert_eq!(result.tasks["tag"].resolution, Resolution::Deferred);
         assert!(calls.lock().unwrap().is_empty());
