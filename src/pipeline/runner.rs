@@ -32,6 +32,7 @@ pub enum Resolution {
 
 #[derive(Debug, Clone)]
 pub struct TierTrace {
+    pub tier_id: TierId,
     pub tier: TierName,
     pub model_id: String,
     pub reading: TierReading,
@@ -46,7 +47,6 @@ pub struct TaskOutcome {
 
 #[derive(Debug, Clone)]
 pub struct TierCall {
-    pub tier_id: TierId,
     pub tier: TierName,
     pub tasks: Vec<String>,
     pub took: Duration,
