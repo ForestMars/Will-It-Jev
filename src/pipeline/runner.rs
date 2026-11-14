@@ -284,7 +284,7 @@ mod tests {
     use crate::pipeline::cascade::{Cascade, CascadeGraph, Slot};
     use crate::pipeline::registry::TierRegistry;
     use crate::pipeline::task::{FallbackPolicy, OutputKind, TierPolicy, LABEL_JEV, LABEL_LLM};
-    use crate::pipeline::tier::{tname, FakeEvaluate, TierContext, TierOutput};
+    use crate::pipeline::tier::{tname, FakeEvaluate, ModelFormat, Params, RequestShape, Role, Tier, TierContext, TierOutput, Transport};
     use async_trait::async_trait;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
@@ -311,12 +311,20 @@ mod tests {
     }
 
     fn fake_tier(name: &str, calls: &CallLog, delay: Duration,
-        answers: &[(&str, TierReading)]) -> Arc<TierInstance> {
-        Arc::new(TierInstance::fake(name, Arc::new(FakeTier {
-            name: name.into(), delay,
-            answers: answers.iter().map(|(task, reading)| ((*task).into(), reading.clone())).collect(),
-            calls: Arc::clone(calls),
-        })))
+        answers: &[(&str, TierReading)]) -> (super::super::tier::TierName, Tier, Params, Arc<dyn FakeEvaluate>) {
+        (
+            tname(name),
+            Tier { exex: Role::Encoder, transport: Transport::Grpc, request_shape: Some(RequestShape::Score) },
+            Params {
+                model_format: Some(ModelFormat::Onnx), model: Some(name.into()), config: None,
+                endpoint: Some("http://127.0.0.1:9".into()), timeout_ms: Some(250), enabled: None,
+            },
+            Arc::new(FakeTier {
+                name: name.into(), delay,
+                answers: answers.iter().map(|(task, reading)| ((*task).into(), reading.clone())).collect(),
+                calls: Arc::clone(calls),
+            }),
+        )
     }
 
     fn task(name: &str, path: &[&str], kind: OutputKind,
@@ -385,7 +393,7 @@ mod tests {
             fake_tier("rules", &calls, Duration::from_millis(5), &[("route", scored(LABEL_JEV, 0.99))]),
             fake_tier("modernbert", &calls, Duration::from_millis(250), &[("tag", scored("help_desk", 0.92))]),
         ]);
-        let profiles = vec![route(&registry, &["rules"]), tag(&registry, &["modernbert"])];
+        let profiles = vec![route(&["rules"]), tag(&["modernbert"])];
         let graph = CascadeGraph::from_tasks(&profiles, &registry).unwrap();
         let rules = tier_id(&graph, "rules");
         let modernbert = tier_id(&graph, "modernbert");
