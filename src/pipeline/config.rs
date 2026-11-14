@@ -570,15 +570,16 @@ mod tests {
     #[test]
     fn disabled_instances_are_omitted_from_task_paths_without_reordering() {
         let cfg = parse(named_config()).unwrap();
-        let registry = TierRegistry::of(vec![
-            Arc::new(TierInstance::fake("harrier", Arc::new(Silent))),
-            Arc::new(TierInstance::fake("rules", Arc::new(Silent))),
-        ]);
+        let entries = cfg.tiers.iter()
+            .filter(|(name, _, _)| name.as_str() == "harrier" || name.as_str() == "rules")
+            .map(|(name, tier, params)| (
+                name.clone(), *tier, params.clone(), Arc::new(Silent) as Arc<dyn FakeEvaluate>,
+            ))
+            .collect();
+        let registry = TierRegistry::of(entries);
         let tasks = cfg.tasks(&registry).unwrap();
-        let graph = CascadeGraph::from_tasks(&tasks, &registry).unwrap();
         let route = tasks.iter().find(|task| task.name == "route").unwrap();
-        let names: Vec<_> = route.cascade.tiers().iter()
-            .map(|id| graph.tier_name(id).unwrap().as_str()).collect();
+        let names: Vec<_> = route.cascade.tiers().iter().map(TierName::as_str).collect();
         assert_eq!(names, ["rules", "harrier"]);
     }
 
