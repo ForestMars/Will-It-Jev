@@ -1,6 +1,6 @@
 // Unordered catalog of tier definitions. Concrete instances belong to CascadeGraph.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
@@ -48,10 +48,6 @@ impl TierRegistry {
 
     pub fn get(&self, name: &TierName) -> Option<(&Tier, &Params)> {
         self.entries.get(name).map(|(tier, params)| (tier, params))
-    }
-
-    pub fn names(&self) -> BTreeSet<TierName> {
-        self.entries.keys().cloned().collect()
     }
 
     pub fn is_empty(&self) -> bool { self.entries.is_empty() }
