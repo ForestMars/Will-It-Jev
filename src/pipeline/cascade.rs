@@ -136,7 +136,7 @@ impl CascadeGraph {
 
                     #[cfg(test)]
                     let instance = if let Some(fake) = registry.fake(name) {
-                        TierInstance::fake(name.as_str(), fake)
+                        TierInstance::fake_with_definition(name.clone(), *definition, params.clone(), fake)
                     } else {
                         TierInstance::build(name.clone(), *definition, params.clone())
                             .map_err(|error| CascadeGraphError::TierBuild {
