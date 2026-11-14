@@ -24,10 +24,9 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::pipeline::{
-    cascade::CascadeGraph,
-    registry::TierDirectory,
+    cascade::{CascadeGraph, Slot},
     runner::{CascadeRunner, Resolution, RunOutcome, TaskOutcome},
-    task::{Decision, TaskId, TaskProfile, TierPolicyMap, TierReading},
+    task::{Decision, Task, TierPolicyMap, TierReading},
 };
 
 const RUN_TTL: Duration = Duration::from_secs(900);
@@ -35,7 +34,7 @@ const RUN_TTL: Duration = Duration::from_secs(900);
 #[derive(Clone)]
 struct TaskApiState {
     cascade: Arc<CascadeRunner>,
-    profiles: Vec<TaskProfile>,
+    profiles: Vec<Task>,
     policies: Arc<TierPolicyMap>,
     budget: Duration,
     runs: TaskRunStore,
@@ -128,7 +127,7 @@ impl IntoResponse for ApiError {
 
 pub fn router(
     cascade: Arc<CascadeRunner>,
-    profiles: Vec<TaskProfile>,
+    profiles: Vec<Task>,
     policies: Arc<TierPolicyMap>,
     budget: Duration,
 ) -> Router {
@@ -173,7 +172,7 @@ async fn get_task_run(
             Json(json!({
                 "run_id": run_id,
                 "status": "complete",
-                "tasks": all_task_results(&outcome, &state.cascade.directory()),
+                "tasks": all_task_results(&outcome, &state.cascade.graph()),
             })),
         ).into_response(),
         Ok(TaskRunLookup::Failed(error)) | Err(error) => (
@@ -210,7 +209,7 @@ async fn execute_task_request(
             return Err(ApiError::Invalid(format!("duplicate task ID {name:?}")));
         }
         let profile = state.profiles.iter()
-            .find(|profile| profile.task.as_str() == name)
+            .find(|profile| profile.name.as_str() == name)
             .ok_or_else(|| ApiError::Invalid(format!("task {name:?} is not configured")))?;
         profiles.push(profile.clone());
     }
@@ -225,7 +224,7 @@ async fn execute_task_request(
 
     let mut required_ids = BTreeSet::new();
     for name in &required_names {
-        let id = TaskId::new(name.clone());
+        let id = name.clone();
         if !required_ids.insert(id) {
             return Err(ApiError::Invalid(format!(
                 "duplicate required task ID {name:?}"
@@ -246,12 +245,12 @@ async fn execute_task_request(
         return Ok(json!({
             "run_id": run_id,
             "status": "complete",
-            "tasks": all_task_results(&outcome, &state.cascade.directory()),
+            "tasks": all_task_results(&outcome, &state.cascade.graph()),
         }));
     }
 
     let pending_names: Vec<String> = request.tasks.iter()
-        .filter(|name| !required_ids.contains(&TaskId::new((*name).clone())))
+        .filter(|name| !required_ids.contains(&String::from((*name).clone())))
         .cloned()
         .collect();
     let split = Arc::clone(&state.cascade).run_split(
@@ -271,12 +270,12 @@ async fn execute_task_request(
         "run_id": run_id,
         "status": "partial",
         "required_tasks": required_names,
-        "tasks": selected_task_results(&required_outcome, &required_ids, &state.cascade.directory()),
+        "tasks": selected_task_results(&required_outcome, &required_ids, &state.cascade.graph()),
         "pending_tasks": pending_names,
     }))
 }
 
-fn all_task_results(outcome: &RunOutcome, tiers: &TierDirectory) -> Value {
+fn all_task_results(outcome: &RunOutcome, tiers: &CascadeGraph) -> Value {
     let mut tasks = Map::new();
     for (task_id, task_outcome) in &outcome.tasks {
         tasks.insert(task_id.as_str().to_string(), task_outcome_json(task_outcome, tiers));
@@ -286,8 +285,8 @@ fn all_task_results(outcome: &RunOutcome, tiers: &TierDirectory) -> Value {
 
 fn selected_task_results(
     outcome: &RunOutcome,
-    selected: &BTreeSet<TaskId>,
-    tiers: &TierDirectory,
+    selected: &BTreeSet<String>,
+    tiers: &CascadeGraph,
 ) -> Value {
     let mut tasks = Map::new();
     for task_id in selected {
@@ -300,12 +299,13 @@ fn selected_task_results(
 
 /// `tier` is the tier's name; `position` is its zero-based place in the
 /// execution order, for clients that want to show the order.
-fn task_outcome_json(outcome: &TaskOutcome, tiers: &TierDirectory) -> Value {
+fn task_outcome_json(outcome: &TaskOutcome, tiers: &CascadeGraph) -> Value {
     let resolution = match &outcome.resolution {
-        Resolution::Tier { tier, model_id, reading } => json!({
+        Resolution::Tier { tier_id, tier, model_id, reading } => json!({
             "kind": "tier",
             "tier": tier.as_str(),
-            "position": tiers.position(tier),
+            "tier_id": tier_id.to_string(),
+            "position": tiers.slot(tier_id).map(Slot::index),
             "model_id": model_id,
             "label": reading.label,
             "confidence": reading.confidence,
@@ -348,7 +348,8 @@ fn task_outcome_json(outcome: &TaskOutcome, tiers: &TierDirectory) -> Value {
         };
         json!({
             "tier": entry.tier.as_str(),
-            "position": tiers.position(&entry.tier),
+            "tier_id": entry.tier_id.to_string(),
+            "position": tiers.slot(&entry.tier_id).map(Slot::index),
             "model_id": entry.model_id,
             "reading": reading,
             "decision": decision,
@@ -361,9 +362,10 @@ fn task_outcome_json(outcome: &TaskOutcome, tiers: &TierDirectory) -> Value {
 mod tests {
     use super::*;
     use crate::pipeline::{
-        registry::{tid, TierId, TierRegistry},
+        cascade::{Cascade, CascadeGraph},
+        registry::TierRegistry,
         task::{FallbackPolicy, OutputKind, Reading, TierPolicy},
-        tier::{Tier, TierContext, TierOutput},
+        tier::{tname, FakeEvaluate, ModelFormat, Params, RequestShape, Role, Tier, TierContext, TierName, TierOutput, Transport},
     };
     use async_trait::async_trait;
     use std::collections::BTreeMap;
@@ -372,39 +374,28 @@ mod tests {
     type CallLog = Arc<Mutex<Vec<(String, Vec<String>)>>>;
 
     struct FixtureTier {
-        id: TierId,
+        name: String,
         delay: Duration,
-        readings: BTreeMap<TaskId, TierReading>,
+        readings: BTreeMap<String, TierReading>,
         calls: CallLog,
     }
-
     #[async_trait]
-    impl Tier for FixtureTier {
-        fn id(&self) -> &TierId { &self.id }
-        fn name(&self) -> &str { "fixture" }
-
+    impl FakeEvaluate for FixtureTier {
         async fn evaluate(&self, context: &TierContext<'_>) -> TierOutput {
-            self.calls.lock().unwrap().push((
-                self.id.to_string(),
-                context.tasks.iter().map(|task| task.as_str().to_string()).collect(),
-            ));
+            self.calls.lock().unwrap().push((self.name.clone(), context.tasks.to_vec()));
             sleep(self.delay).await;
-            let readings = context.tasks.iter().map(|task| {
-                (
-                    task.clone(),
-                    self.readings.get(task).cloned().unwrap_or(TierReading::Unsupported),
-                )
-            }).collect();
-            TierOutput {
-                model_id: format!("fixture-tier-{}", self.id),
-                readings,
-            }
+            let readings = context.tasks.iter().map(|task| (
+                task.clone(),
+                self.readings.get(task).cloned().unwrap_or(TierReading::Unsupported),
+            )).collect();
+            TierOutput { model_id: format!("fixture-tier-{}", self.name), readings }
         }
     }
 
-    fn profile(task: &str, kind: OutputKind, labels: &[&str]) -> TaskProfile {
-        TaskProfile {
-            task: TaskId::new(task),
+    fn profile(task: &str, kind: OutputKind, labels: &[&str], path: &[&str]) -> Task {
+        Task {
+            name: task.to_string(),
+            cascade: Cascade::from_names(&path.iter().map(|name| tname(name)).collect::<Vec<_>>()).unwrap(),
             output_kind: kind,
             labels: Some(labels.iter().map(|label| (*label).to_string()).collect()),
             label_metadata: Vec::new(),
@@ -413,70 +404,78 @@ mod tests {
         }
     }
 
+    fn fake_entry(
+        name: &str,
+        role: Role,
+        fake: Arc<dyn FakeEvaluate>,
+    ) -> (TierName, Tier, Params, Arc<dyn FakeEvaluate>) {
+        let (transport, request_shape, model_format, model, config, endpoint, timeout_ms) =
+            match role {
+                Role::Rules => (Transport::InProcess, None, None, None, Some("test-rules".into()), None, None),
+                Role::FastText => (Transport::InProcess, None, None, Some("test-fasttext".into()), None, None, None),
+                Role::Encoder => (Transport::Grpc, Some(RequestShape::Score), Some(ModelFormat::Onnx),
+                    Some(name.into()), None, Some("http://127.0.0.1:9".into()), Some(250)),
+            };
+        (
+            tname(name),
+            Tier { exex: role, transport, request_shape },
+            Params { model_format, model, config, endpoint, timeout_ms, enabled: None },
+            fake,
+        )
+    }
+
     #[tokio::test]
-    async fn generic_api_runs_three_arbitrary_tasks_and_returns_required_subset_first() {
+    async fn arbitrary_tasks_follow_independent_paths_and_return_required_subset_first() {
         let calls = Arc::new(Mutex::new(Vec::new()));
+        let registry = TierRegistry::of(vec![
+            fake_entry("rules", Role::Rules, Arc::new(FixtureTier {
+                name: "rules".into(),
+                delay: Duration::from_millis(5),
+                readings: [("customer_intent".into(),
+                    TierReading::Scored(Reading::new("billing", 0.97)))].into(),
+                calls: calls.clone(),
+            })),
+            fake_entry("modernbert", Role::Encoder, Arc::new(FixtureTier {
+                name: "modernbert".into(),
+                delay: Duration::from_millis(300),
+                readings: [
+                    ("urgency".into(), TierReading::Scored(Reading::new("high", 0.91))),
+                    ("fraud_risk".into(), TierReading::Scored(Reading::new("payment_abuse", 0.88))),
+                ].into(),
+                calls: calls.clone(),
+            })),
+        ]);
+
         let profiles = vec![
-            profile("customer_intent", OutputKind::Multiclass, &["billing", "account"]),
-            profile("urgency", OutputKind::Ordinal, &["low", "medium", "high"]),
-            profile("fraud_risk", OutputKind::Multilabel, &["account_takeover", "payment_abuse"]),
+            profile("customer_intent", OutputKind::Multiclass, &["billing", "account"], &["rules"]),
+            profile("urgency", OutputKind::Ordinal, &["low", "medium", "high"], &["modernbert"]),
+            profile("fraud_risk", OutputKind::Multilabel, &["account_takeover", "payment_abuse"], &["modernbert"]),
         ];
-        let tier1 = FixtureTier {
-            id: tid("rules"),
-            delay: Duration::ZERO,
-            readings: [(
-                TaskId::new("customer_intent"),
-                TierReading::Scored(Reading::new("billing", 0.97)),
-            )].into(),
-            calls: calls.clone(),
-        };
-        let tier2 = FixtureTier {
-            id: tid("modernbert"),
-            delay: Duration::from_millis(300),
-            readings: [
-                (TaskId::new("urgency"), TierReading::Scored(Reading::new("high", 0.91))),
-                (TaskId::new("fraud_risk"), TierReading::Scored(Reading::new("payment_abuse", 0.88))),
-            ].into(),
-            calls: calls.clone(),
-        };
-        let registry = TierRegistry::of(vec![Arc::new(tier1), Arc::new(tier2)]);
-        let paths: BTreeMap<TaskId, Vec<TierId>> = [
-            (TaskId::new("customer_intent"), vec![tid("rules")]),
-            (TaskId::new("urgency"), vec![tid("modernbert")]),
-            (TaskId::new("fraud_risk"), vec![tid("modernbert")]),
-        ].into();
-        let graph = CascadeGraph::from_task_paths(paths, &registry.ids()).unwrap();
-        let cascade = Arc::new(CascadeRunner::new(registry, graph).unwrap());
+        let graph = CascadeGraph::from_tasks(&profiles, &registry).unwrap();
+        let rules_id = graph.id_for_name(&tname("rules")).unwrap();
+        let modernbert_id = graph.id_for_name(&tname("modernbert")).unwrap();
+        let cascade = Arc::new(CascadeRunner::new(graph));
         let policies: TierPolicyMap = [
-            (tid("rules"), [(TaskId::new("customer_intent"), TierPolicy::new(0.90))].into()),
-            (tid("modernbert"), [
-                (TaskId::new("urgency"), TierPolicy::new(0.80)),
-                (TaskId::new("fraud_risk"), TierPolicy::new(0.80)),
+            (rules_id, [("customer_intent".into(), TierPolicy::new(0.90))].into()),
+            (modernbert_id, [
+                ("urgency".into(), TierPolicy::new(0.80)),
+                ("fraud_risk".into(), TierPolicy::new(0.80)),
             ].into()),
         ].into();
         let state = TaskApiState {
-            cascade,
-            profiles,
-            policies: Arc::new(policies),
-            budget: Duration::from_secs(2),
-            runs: TaskRunStore::default(),
+            cascade, profiles, policies: Arc::new(policies),
+            budget: Duration::from_secs(2), runs: TaskRunStore::default(),
         };
         let request = TaskExecutionRequest {
             prompt: "Evaluate the support request.".into(),
-            tasks: vec![
-                "customer_intent".into(),
-                "urgency".into(),
-                "fraud_risk".into(),
-            ],
+            tasks: vec!["customer_intent".into(), "urgency".into(), "fraud_risk".into()],
             required_tasks: Some(vec!["customer_intent".into()]),
         };
 
         let response = execute_task_request(&state, request).await.unwrap();
         assert_eq!(response["status"], "partial");
-        assert_eq!(
-            response["tasks"]["customer_intent"]["resolution"]["label"],
-            "billing"
-        );
+        assert_eq!(response["tasks"]["customer_intent"]["resolution"]["label"], "billing");
+        assert_eq!(response["tasks"]["customer_intent"]["resolution"]["position"], 0);
         assert_eq!(response["pending_tasks"], json!(["urgency", "fraud_risk"]));
         let run_id = response["run_id"].as_str().unwrap().to_string();
         assert!(matches!(state.runs.poll(&run_id).unwrap(), TaskRunLookup::Pending));
@@ -493,20 +492,13 @@ mod tests {
         }).await.expect("best-effort tasks should finish within the test budget");
 
         assert_eq!(complete.tasks.len(), 3);
-        assert_eq!(
-            complete.tasks[&TaskId::new("urgency")].resolution,
-            Resolution::Tier {
-                tier: tid("modernbert"),
-                model_id: "fixture-tier-modernbert".into(),
-                reading: Reading::new("high", 0.91),
-            }
-        );
+        assert!(matches!(complete.tasks[&String::from("urgency")].resolution,
+            Resolution::Tier { ref tier, .. } if tier.as_str() == "modernbert"));
+        assert!(matches!(complete.tasks[&String::from("fraud_risk")].resolution,
+            Resolution::Tier { ref tier, .. } if tier.as_str() == "modernbert"));
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0], ("rules".to_string(), vec!["customer_intent".into()]));
-        assert_eq!(
-            calls[1],
-            ("modernbert".to_string(), vec!["urgency".into(), "fraud_risk".into()])
-        );
+        assert_eq!(calls[1], ("modernbert".to_string(), vec!["urgency".into(), "fraud_risk".into()]));
     }
 }

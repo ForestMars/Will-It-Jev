@@ -1,8 +1,8 @@
 // src/pipeline/tagger.rs
 //
-// Adapt the task-independent cascade to the existing tagging interface. The
-// tag task supplies its own profile and is evaluated with the same shared
-// cascade and separate tier/task policy registry as the route task.
+// Adapt a task's Cascade result to the existing tagging interface. The tag
+// task carries its own ordered path; shared TierIds are evaluated once in the
+// CascadeGraph when route and tag paths overlap.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use super::registry::TierDirectory;
+use crate::legacy_tiers::LegacyTierNumbers;
 use super::runner::{Resolution, RunOutcome};
-use super::task::{Reading, TaskId};
+use super::task::Reading;
 use crate::tagging::{CategoryScore, TaskDecisionMetadata, TagError, TagInput, Tagger, TaggerOutput, TaggerVerdict};
 
 struct JointEntry {
@@ -70,7 +70,7 @@ pub struct CascadeTagger<F: Tagger> {
     taxonomy_version: String,
     output_kind: String,
     fallback: F,
-    tiers: Arc<TierDirectory>,
+    legacy: Arc<LegacyTierNumbers>,
 }
 
 impl<F: Tagger> CascadeTagger<F> {
@@ -87,13 +87,13 @@ impl<F: Tagger> CascadeTagger<F> {
             taxonomy_version: taxonomy_version.into(),
             output_kind: output_kind.into(),
             fallback,
-            tiers: Arc::new(TierDirectory::default()),
+            legacy: Arc::new(LegacyTierNumbers::default()),
         }
     }
 
-    /// Lets the tagger record a resolving tier's legacy ordinal next to its name.
-    pub fn with_tier_directory(mut self, tiers: Arc<TierDirectory>) -> Self {
-        self.tiers = tiers;
+    /// Lets the tagger record a resolving tier's legacy number next to its name.
+    pub fn with_legacy_numbers(mut self, legacy: Arc<LegacyTierNumbers>) -> Self {
+        self.legacy = legacy;
         self
     }
 }
@@ -119,18 +119,19 @@ impl<F: Tagger> Tagger for CascadeTagger<F> {
         let Some(outcome) = self.store.take(&input.request_id, self.budget).await? else {
             return self.fallback.tag(input).await;
         };
-        match outcome.tasks.get(&TaskId::tag()).map(|task| &task.resolution) {
-            Some(Resolution::Tier { tier, model_id, reading }) => {
+        match outcome.tasks.get(&String::from("tag")).map(|task| &task.resolution) {
+            Some(Resolution::Tier { tier_id, tier, model_id, reading }) => {
                 tracing::debug!(request_id = %input.request_id, tier = %tier, model_id,
                     "tag decision reused from request cascade");
                 Ok(TaggerOutput {
                     verdict: verdict(reading),
                     usage: None,
                     decision: Some(TaskDecisionMetadata {
-                        task_id: TaskId::tag().as_str().to_string(),
+                        task_id: String::from("tag").as_str().to_string(),
                         output_kind: self.output_kind.clone(),
-                        resolving_tier: self.tiers.legacy_ordinal(tier),
+                        resolving_tier: self.legacy.ordinal_of(tier),
                         resolving_tier_name: Some(tier.to_string()),
+                        resolving_tier_id: Some(tier_id.to_string()),
                         model_id: Some(model_id.clone()),
                         scores: reading.scores.iter().map(|(category_id, score)| {
                             CategoryScore { category_id: category_id.clone(), score: *score }
@@ -148,10 +149,9 @@ impl<F: Tagger> Tagger for CascadeTagger<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::registry::tid;
+    use crate::pipeline::tier::{tname, TierId};
     use std::future::Future;
     use crate::pipeline::runner::{RunOutcome, TaskOutcome};
-    use crate::pipeline::task::TaskId;
     use crate::pipeline::runner::Resolution;
     use crate::tagging::{Tagger, TaggerVerdict};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -185,10 +185,11 @@ mod tests {
         let store = JointTagStore::default();
         let outcome = RunOutcome {
             tasks: [(
-                TaskId::tag(),
+                String::from("tag"),
                 TaskOutcome {
                     resolution: Resolution::Tier {
-                        tier: tid("modernbert"),
+                        tier_id: TierId::from_digest(&[9; 32]),
+                        tier: tname("modernbert"),
                         model_id: "shared-encoder".into(),
                         reading: Reading {
                             label: "help_desk".into(),

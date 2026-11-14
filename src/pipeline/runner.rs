@@ -1,28 +1,24 @@
 // src/pipeline/runner.rs
 //
-// Generic cascade execution. TierRegistry catalogs available TierIds;
-// CascadeGraph supplies task-specific dependencies and traversal order.
-// Task definitions and tier/task resolution policies remain independent.
+// Task cascades compile into a shared execution graph. At each graph node,
+// only tasks whose own path includes that tier and whose policy exists are batched.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-
 use tracing::debug;
 
 use super::cascade::CascadeGraph;
-use super::registry::{TierDirectory, TierId, TierRegistry};
-use super::task::{
-    Decision, FallbackPolicy, Reading, TaskId, TaskProfile, TierPolicyMap, TierReading,
-};
-use super::tier::{Tier, TierContext};
+use super::task::{Decision, FallbackPolicy, Reading, Task, TierPolicyMap, TierReading};
+use super::tier::{TierContext, TierId, TierName};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Resolution {
     Tier {
-        tier: TierId,
+        tier_id: TierId,
+        tier: TierName,
         model_id: String,
         reading: Reading,
     },
@@ -34,7 +30,8 @@ pub enum Resolution {
 
 #[derive(Debug, Clone)]
 pub struct TierTrace {
-    pub tier: TierId,
+    pub tier_id: TierId,
+    pub tier: TierName,
     pub model_id: String,
     pub reading: TierReading,
     pub decision: Decision,
@@ -48,83 +45,55 @@ pub struct TaskOutcome {
 
 #[derive(Debug, Clone)]
 pub struct TierCall {
-    pub tier: TierId,
-    pub tasks: Vec<TaskId>,
+    pub tier: TierName,
+    pub tasks: Vec<String>,
     pub took: Duration,
 }
 
 #[derive(Debug, Clone)]
 pub struct RunOutcome {
-    pub tasks: BTreeMap<TaskId, TaskOutcome>,
+    pub tasks: BTreeMap<String, TaskOutcome>,
     pub tier_calls: Vec<TierCall>,
 }
 
-#[derive(Debug)]
-pub enum CascadeRunnerBuildError { MissingTier(TierId) }
-
-impl std::fmt::Display for CascadeRunnerBuildError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self { Self::MissingTier(id) => write!(f, "cascade graph references unavailable tier {id}") }
-    }
-}
-impl std::error::Error for CascadeRunnerBuildError {}
-
 pub struct CascadeRunner {
-    /// Complete catalog of available tiers, including tiers absent from this graph.
-    registry: TierRegistry,
-    /// The graph's deterministic topological execution projection.
-    tiers: Vec<(TierId, Arc<dyn Tier>)>,
+    /// The graph owns every materialized TierInstance used for this run.
     graph: Arc<CascadeGraph>,
-    directory: Arc<TierDirectory>,
 }
 
-/// Required-task completion and full cascade completion are separate signals from one run.
+/// Required-task completion and full cascade completion are separate signals.
 pub struct SplitRun {
     pub required: oneshot::Receiver<RunOutcome>,
     pub done: JoinHandle<RunOutcome>,
 }
 
 impl CascadeRunner {
-    /// Bind the available TierRegistry to a validated task-cascade DAG.
-    pub fn new(registry: TierRegistry, graph: CascadeGraph) -> Result<Self, CascadeRunnerBuildError> {
-        let mut tiers = Vec::with_capacity(graph.order().len());
-        for id in graph.order() {
-            let tier = registry.get(id).ok_or_else(|| CascadeRunnerBuildError::MissingTier(id.clone()))?;
-            tiers.push((id.clone(), tier));
-        }
-        let directory = Arc::new(registry.directory(graph.order()));
-        Ok(Self { registry, tiers, graph: Arc::new(graph), directory })
+    pub fn new(graph: CascadeGraph) -> Self {
+        Self { graph: Arc::new(graph) }
     }
 
-    /// Complete registry of available TierIds, including unused entries.
-    pub fn registry(&self) -> &TierRegistry {
-        &self.registry
+    /// The computed execution graph, including its materialized instances.
+    pub fn graph(&self) -> Arc<CascadeGraph> {
+        Arc::clone(&self.graph)
     }
 
-    /// Names, graph positions and legacy ordinals for tiers in the execution DAG.
-    pub fn directory(&self) -> Arc<TierDirectory> {
-        Arc::clone(&self.directory)
-    }
-
-    /// `profiles` describe tasks. `policies` independently determine which
-    /// tier may resolve each task and the task's calibrated bar at that tier.
     pub async fn run(
         &self,
         prompt: &str,
-        profiles: &[TaskProfile],
+        profiles: &[Task],
         policies: &TierPolicyMap,
         budget: Duration,
     ) -> RunOutcome {
         self.run_inner(prompt, profiles, policies, budget, None).await
     }
 
-    /// Starts exactly one cascade. The required receiver is published as soon as
-    /// its task IDs resolve; best-effort tasks continue in the same execution.
+    /// Starts one graph execution. Required tasks can complete while other tasks
+    /// continue through their own remaining Cascade paths.
     pub fn run_split(
         self: Arc<Self>,
         prompt: String,
-        profiles: Vec<TaskProfile>,
-        required_tasks: BTreeSet<TaskId>,
+        profiles: Vec<Task>,
+        required_tasks: BTreeSet<String>,
         policies: Arc<TierPolicyMap>,
         budget: Duration,
     ) -> SplitRun {
@@ -138,96 +107,146 @@ impl CascadeRunner {
     async fn run_inner(
         &self,
         prompt: &str,
-        profiles: &[TaskProfile],
+        profiles: &[Task],
         policies: &TierPolicyMap,
         budget: Duration,
-        mut required_tx: Option<(BTreeSet<TaskId>, oneshot::Sender<RunOutcome>)>,
+        mut required_tx: Option<(BTreeSet<String>, oneshot::Sender<RunOutcome>)>,
     ) -> RunOutcome {
         let start = Instant::now();
-        let mut active: BTreeSet<TaskId> = profiles.iter().map(|p| p.task.clone()).collect();
-        debug_assert_eq!(active.len(), profiles.len(), "duplicate task ids in profiles");
+        let profile_order: Vec<String> = profiles.iter()
+            .map(|profile| profile.name.clone())
+            .collect();
+        let profile_by_name: BTreeMap<&str, &Task> = profiles.iter()
+            .map(|profile| (profile.name.as_str(), profile))
+            .collect();
+        debug_assert_eq!(
+            profile_by_name.len(),
+            profiles.len(),
+            "duplicate task names in profiles",
+        );
 
-        let mut resolved: BTreeMap<TaskId, Resolution> = BTreeMap::new();
-        let mut traces: BTreeMap<TaskId, Vec<TierTrace>> = BTreeMap::new();
+        // A task participates only at tiers where a corresponding policy exists.
+        // Tasks with no policy anywhere immediately take their configured fallback.
+        let last_policy_index: BTreeMap<String, usize> = profiles.iter()
+            .filter_map(|profile| {
+                self.graph.order().iter().enumerate()
+                    .filter(|(_, tier_id)| {
+                        self.graph.task_uses(&profile.name, tier_id)
+                            && policies.get(tier_id)
+                                .is_some_and(|by_task| by_task.contains_key(&profile.name))
+                    })
+                    .map(|(index, _)| (profile.name.clone(), index))
+                    .last()
+            })
+            .collect();
+        let mut active: BTreeSet<String> = last_policy_index.keys().cloned().collect();
+
+        let mut resolved: BTreeMap<String, Resolution> = BTreeMap::new();
+        let mut traces: BTreeMap<String, Vec<TierTrace>> = BTreeMap::new();
         let mut tier_calls = Vec::new();
 
-        for (tier_id, tier) in &self.tiers {
+        if required_tx.as_ref().is_some_and(|(required, _)| {
+            required.iter().all(|task| !active.contains(task))
+        }) {
+            if let Some((_, sender)) = required_tx.take() {
+                let _ = sender.send(build_outcome(profiles, &resolved, &traces, &tier_calls));
+            }
+        }
+
+        for (tier_index, tier_id) in self.graph.order().iter().copied().enumerate() {
             if active.is_empty() || start.elapsed() >= budget {
                 break;
             }
 
-            let by_task = policies.get(tier_id);
-            let wanted: Vec<&TaskProfile> = profiles
-                .iter()
-                .filter(|profile| {
-                    active.contains(&profile.task)
-                        && self.graph.task_uses(&profile.task, tier_id)
-                        && by_task.is_some_and(|map| map.contains_key(&profile.task))
+            let task_ids: Vec<String> = profile_order.iter()
+                .filter(|task| {
+                    active.contains(*task)
+                        && self.graph.task_uses(task, &tier_id)
+                        && policies.get(&tier_id)
+                            .is_some_and(|by_task| by_task.contains_key(*task))
                 })
+                .cloned()
                 .collect();
-            if wanted.is_empty() {
+            if task_ids.is_empty() {
                 continue;
             }
 
-            let ids: Vec<TaskId> = wanted.iter().map(|profile| profile.task.clone()).collect();
+            let Some(tier) = self.graph.instance(&tier_id) else {
+                for task in task_ids {
+                    active.remove(&task);
+                }
+                continue;
+            };
+            let tier_name = tier.name().clone();
+            let remaining = budget.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+
             let call_started = Instant::now();
-            debug!(
-                tier = %tier_id,
-                tier_name = tier.name(),
-                task_count = ids.len(),
-                "executing inference tier"
-            );
-            let output = tier
-                .evaluate(&TierContext {
+            let evaluation = tokio::time::timeout(
+                remaining,
+                tier.evaluate(&TierContext {
                     prompt,
-                    tasks: &ids,
+                    tasks: &task_ids,
                     task_profiles: profiles,
-                    budget: budget.saturating_sub(start.elapsed()),
-                })
-                .await;
+                    budget: remaining,
+                }),
+            ).await;
+            let output = match evaluation {
+                Ok(output) => output,
+                Err(_) => break,
+            };
             tier_calls.push(TierCall {
-                tier: tier_id.clone(),
-                tasks: ids,
+                tier: tier_name.clone(),
+                tasks: task_ids.clone(),
                 took: call_started.elapsed(),
             });
 
-            for profile in wanted {
-                let reading = output
-                    .readings
-                    .get(&profile.task)
+            let by_task = policies.get(&tier_id)
+                .expect("tasks were selected only when this tier has a policy");
+            for task_name in task_ids {
+                if !active.contains(&task_name) {
+                    continue;
+                }
+                let Some(profile) = profile_by_name.get(task_name.as_str()).copied() else {
+                    active.remove(&task_name);
+                    continue;
+                };
+                let policy = by_task.get(&task_name)
+                    .expect("task batch contains only tasks with policies at this tier");
+                let reading = output.readings.get(&task_name)
                     .cloned()
                     .unwrap_or(TierReading::Unsupported);
-                let policy = by_task
-                    .and_then(|map| map.get(&profile.task))
-                    .expect("wanted task must have a tier policy");
                 let decision = profile.decide(policy, &reading);
-                debug!(task = %profile.task, tier = %tier_id, ?decision, "task decision");
+                debug!(task = %task_name, tier = %tier_name, ?decision, "task decision");
 
                 if let Decision::Resolve(resolved_reading) = &decision {
-                    resolved.insert(
-                        profile.task.clone(),
-                        Resolution::Tier {
-                            tier: tier_id.clone(),
-                            model_id: output.model_id.clone(),
-                            reading: resolved_reading.clone(),
-                        },
-                    );
-                    active.remove(&profile.task);
+                    resolved.insert(task_name.clone(), Resolution::Tier {
+                        tier_id,
+                        tier: tier_name.clone(),
+                        model_id: output.model_id.clone(),
+                        reading: resolved_reading.clone(),
+                    });
+                    active.remove(&task_name);
+                } else if last_policy_index.get(&task_name) == Some(&tier_index) {
+                    active.remove(&task_name);
                 }
 
-                traces.entry(profile.task.clone()).or_default().push(TierTrace {
-                    tier: tier_id.clone(),
+                traces.entry(task_name.clone()).or_default().push(TierTrace {
+                    tier_id,
+                    tier: tier_name.clone(),
                     model_id: output.model_id.clone(),
                     reading,
                     decision,
                 });
             }
 
-            if let Some((required, _)) = required_tx.as_ref() {
-                if required.iter().all(|task| resolved.contains_key(task)) {
-                    if let Some((_, sender)) = required_tx.take() {
-                        let _ = sender.send(build_outcome(profiles, &resolved, &traces, &tier_calls));
-                    }
+            if required_tx.as_ref().is_some_and(|(required, _)| {
+                required.iter().all(|task| !active.contains(task))
+            }) {
+                if let Some((_, sender)) = required_tx.take() {
+                    let _ = sender.send(build_outcome(profiles, &resolved, &traces, &tier_calls));
                 }
             }
         }
@@ -241,20 +260,20 @@ impl CascadeRunner {
 }
 
 fn build_outcome(
-    profiles: &[TaskProfile],
-    resolved: &BTreeMap<TaskId, Resolution>,
-    traces: &BTreeMap<TaskId, Vec<TierTrace>>,
+    profiles: &[Task],
+    resolved: &BTreeMap<String, Resolution>,
+    traces: &BTreeMap<String, Vec<TierTrace>>,
     tier_calls: &[TierCall],
 ) -> RunOutcome {
     let tasks = profiles.iter().map(|profile| {
-        let resolution = resolved.get(&profile.task).cloned().unwrap_or_else(|| {
+        let resolution = resolved.get(&profile.name).cloned().unwrap_or_else(|| {
             match &profile.fallback {
                 FallbackPolicy::Label(label) => Resolution::Fallback { label: label.clone() },
                 FallbackPolicy::Defer => Resolution::Deferred,
             }
         });
-        let trace = traces.get(&profile.task).cloned().unwrap_or_default();
-        (profile.task.clone(), TaskOutcome { resolution, trace })
+        let trace = traces.get(&profile.name).cloned().unwrap_or_default();
+        (profile.name.clone(), TaskOutcome { resolution, trace })
     }).collect();
     RunOutcome { tasks, tier_calls: tier_calls.to_vec() }
 }
@@ -262,271 +281,183 @@ fn build_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::cascade::CascadeGraph;
-    use crate::pipeline::registry::{tid, TierRegistry};
-    use crate::pipeline::task::{OutputKind, TierPolicy, LABEL_JEV, LABEL_LLM};
-    use crate::pipeline::tier::TierOutput;
+    use crate::pipeline::cascade::{Cascade, CascadeGraph, Slot};
+    use crate::pipeline::registry::TierRegistry;
+    use crate::pipeline::task::{FallbackPolicy, OutputKind, TierPolicy, LABEL_JEV, LABEL_LLM};
+    use crate::pipeline::tier::{tname, FakeEvaluate, ModelFormat, Params, RequestShape, Role, Tier, TierContext, TierOutput, Transport};
     use async_trait::async_trait;
+    use std::collections::BTreeMap;
     use std::sync::Mutex;
 
-    type TierCallLog = Arc<Mutex<Vec<(String, Vec<TaskId>)>>>;
-
-    fn test_graph(paths: &[(&str, &[&str])]) -> CascadeGraph {
-        let paths: BTreeMap<TaskId, Vec<TierId>> = paths.iter().map(|(task, names)| (
-            TaskId::new(*task), names.iter().map(|name| tid(name)).collect()
-        )).collect();
-        let registered: BTreeSet<TierId> = paths.values().flatten().cloned().collect();
-        CascadeGraph::from_task_paths(paths, &registered).unwrap()
-    }
-
-    fn test_runner(tiers: Vec<Arc<dyn Tier>>, paths: &[(&str, &[&str])]) -> CascadeRunner {
-        let registry = TierRegistry::of(tiers);
-        CascadeRunner::new(registry, test_graph(paths)).unwrap()
-    }
-
+    type CallLog = Arc<Mutex<Vec<(String, Vec<String>)>>>;
 
     struct FakeTier {
-        id: TierId,
-        answers: Vec<(TaskId, TierReading)>,
-        calls: TierCallLog,
+        name: String,
+        delay: Duration,
+        answers: BTreeMap<String, TierReading>,
+        calls: CallLog,
     }
-
-    impl FakeTier {
-        fn new(name: &str, answers: Vec<(TaskId, TierReading)>, calls: &TierCallLog) -> Self {
-            Self { id: tid(name), answers, calls: calls.clone() }
-        }
-    }
-
     #[async_trait]
-    impl Tier for FakeTier {
-        fn id(&self) -> &TierId { &self.id }
-        fn name(&self) -> &str { "fake" }
+    impl FakeEvaluate for FakeTier {
         async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
-            self.calls.lock().unwrap().push((self.id.to_string(), ctx.tasks.to_vec()));
-            let readings = ctx.tasks.iter().map(|task| {
-                let reading = self.answers.iter()
-                    .find(|(id, _)| id == task)
-                    .map(|(_, reading)| reading.clone())
-                    .unwrap_or(TierReading::Abstain("unsupported_task"));
-                (task.clone(), reading)
-            }).collect();
-            TierOutput { model_id: format!("fake-{}", self.id), readings }
+            self.calls.lock().unwrap().push((self.name.clone(), ctx.tasks.to_vec()));
+            if !self.delay.is_zero() { tokio::time::sleep(self.delay).await; }
+            let readings = ctx.tasks.iter().map(|task| (
+                task.clone(),
+                self.answers.get(task).cloned().unwrap_or(TierReading::Abstain("unsupported_task")),
+            )).collect();
+            TierOutput { model_id: format!("fake-{}", self.name), readings }
         }
     }
 
-    fn scored(label: &str, confidence: f32) -> TierReading {
-        TierReading::Scored(Reading::new(label, confidence))
+    fn fake_tier(name: &str, calls: &CallLog, delay: Duration,
+        answers: &[(&str, TierReading)]) -> (super::super::tier::TierName, Tier, Params, Arc<dyn FakeEvaluate>) {
+        (
+            tname(name),
+            Tier { exex: Role::Encoder, transport: Transport::Grpc, request_shape: Some(RequestShape::Score) },
+            Params {
+                model_format: Some(ModelFormat::Onnx), model: Some(name.into()), config: None,
+                endpoint: Some("http://127.0.0.1:9".into()), timeout_ms: Some(250), enabled: None,
+            },
+            Arc::new(FakeTier {
+                name: name.into(), delay,
+                answers: answers.iter().map(|(task, reading)| ((*task).into(), reading.clone())).collect(),
+                calls: Arc::clone(calls),
+            }),
+        )
     }
 
-    fn route_profile() -> TaskProfile {
-        TaskProfile {
-            task: TaskId::route(),
-            output_kind: OutputKind::Binary,
-            labels: Some(vec![LABEL_JEV.into(), LABEL_LLM.into()]),
+    fn task(name: &str, path: &[&str], kind: OutputKind,
+        labels: &[&str], fallback: FallbackPolicy) -> Task {
+        Task {
+            name: name.into(),
+            cascade: Cascade::from_names(&path.iter().map(|name| tname(name)).collect::<Vec<_>>()).unwrap(),
+            output_kind: kind,
+            labels: Some(labels.iter().map(|label| (*label).to_string()).collect()),
             label_metadata: Vec::new(),
             taxonomy_version: None,
-            fallback: FallbackPolicy::Label(LABEL_LLM.into()),
+            fallback,
         }
     }
-
-    fn tag_profile(labels: Option<Vec<String>>) -> TaskProfile {
-        TaskProfile {
-            task: TaskId::tag(),
-            output_kind: OutputKind::Multiclass,
-            labels,
-            label_metadata: Vec::new(),
-            taxonomy_version: None,
-            fallback: FallbackPolicy::Defer,
-        }
+    fn route(path: &[&str]) -> Task {
+        task("route", path, OutputKind::Binary, &[LABEL_JEV, LABEL_LLM],
+            FallbackPolicy::Label(LABEL_LLM.into()))
     }
-
+    fn tag(path: &[&str]) -> Task {
+        task("tag", path, OutputKind::Multiclass, &["engineering", "help_desk"],
+            FallbackPolicy::Defer)
+    }
+    fn scored(label: &str, score: f32) -> TierReading { TierReading::Scored(Reading::new(label, score)) }
+    fn tier_id(graph: &CascadeGraph, name: &str) -> TierId {
+        graph.id_for_name(&tname(name)).expect("tier id exists")
+    }
     fn resolved_at(resolution: &Resolution, name: &str) -> bool {
         matches!(resolution, Resolution::Tier { tier, .. } if tier.as_str() == name)
     }
 
     #[tokio::test]
-    async fn separate_tasks_share_a_tier_call_and_resolve_independently() {
+    async fn task_paths_share_graph_nodes_and_batch_only_eligible_tasks() {
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let tier = FakeTier::new(
-            "modernbert",
-            vec![
-                (TaskId::route(), scored(LABEL_JEV, 0.97)),
-                (TaskId::tag(), scored("engineering", 0.85)),
-            ],
-            &calls,
-        );
-        let runner = test_runner(vec![Arc::new(tier)], &[("route", &["modernbert"]), ("tag", &["modernbert"])]);
-        let profiles = vec![
-            route_profile(),
-            tag_profile(Some(vec!["engineering".into(), "help_desk".into()])),
-        ];
-        let mut policies = TierPolicyMap::new();
-        let mut by_task = BTreeMap::new();
-        by_task.insert(TaskId::route(), TierPolicy::new(0.95).with_label(LABEL_LLM, 0.70));
-        by_task.insert(TaskId::tag(), TierPolicy::new(0.80));
-        policies.insert(tid("modernbert"), by_task);
+        let registry = TierRegistry::of(vec![
+            fake_tier("rules", &calls, Duration::ZERO, &[("route", TierReading::Abstain("pass"))]),
+            fake_tier("modernbert", &calls, Duration::ZERO, &[
+                ("route", scored(LABEL_JEV, 0.97)), ("tag", scored("engineering", 0.88)),
+            ]),
+        ]);
+        let profiles = vec![route(&["rules", "modernbert"]), tag(&["modernbert"])];
+        let graph = CascadeGraph::from_tasks(&profiles, &registry).unwrap();
+        let rules = tier_id(&graph, "rules");
+        let modernbert = tier_id(&graph, "modernbert");
+        let runner = CascadeRunner::new(graph);
+        let policies: TierPolicyMap = [
+            (rules, [("route".into(), TierPolicy::new(0.78))].into()),
+            (modernbert, [
+                ("route".into(), TierPolicy::new(0.95)),
+                ("tag".into(), TierPolicy::new(0.80)),
+            ].into()),
+        ].into();
 
         let result = runner.run("prompt", &profiles, &policies, Duration::from_secs(1)).await;
-        let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].1.len(), 2);
-        assert!(resolved_at(&result.tasks[&TaskId::route()].resolution, "modernbert"));
-        assert!(resolved_at(&result.tasks[&TaskId::tag()].resolution, "modernbert"));
-    }
-
-    struct DelayedTier {
-        id: TierId,
-        delay: Duration,
-    }
-
-    #[async_trait]
-    impl Tier for DelayedTier {
-        fn id(&self) -> &TierId { &self.id }
-        fn name(&self) -> &str { "delayed" }
-        async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
-            tokio::time::sleep(self.delay).await;
-            let readings = ctx.tasks.iter().map(|task| {
-                let reading = if *task == TaskId::route() {
-                    scored(LABEL_JEV, 0.99)
-                } else {
-                    scored("help_desk", 0.92)
-                };
-                (task.clone(), reading)
-            }).collect();
-            TierOutput { model_id: format!("delayed-{}", self.id), readings }
-        }
+        assert!(resolved_at(&result.tasks["route"].resolution, "modernbert"));
+        assert!(resolved_at(&result.tasks["tag"].resolution, "modernbert"));
+        assert_eq!(calls.lock().unwrap().as_slice(), [
+            ("rules".into(), vec!["route".into()]),
+            ("modernbert".into(), vec!["route".into(), "tag".into()]),
+        ]);
     }
 
     #[tokio::test]
-    async fn required_route_is_published_before_best_effort_tier_finishes() {
-        let runner = Arc::new(test_runner(vec![
-            Arc::new(DelayedTier { id: tid("rules"), delay: Duration::from_millis(5) }),
-            Arc::new(DelayedTier { id: tid("modernbert"), delay: Duration::from_millis(250) }),
-        ], &[("route", &["rules"]), ("tag", &["modernbert"])]));
-        let profiles = vec![route_profile(), tag_profile(Some(vec!["help_desk".into()]))];
+    async fn required_task_can_finish_before_another_tasks_path_continues() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let registry = TierRegistry::of(vec![
+            fake_tier("rules", &calls, Duration::from_millis(5), &[("route", scored(LABEL_JEV, 0.99))]),
+            fake_tier("modernbert", &calls, Duration::from_millis(250), &[("tag", scored("help_desk", 0.92))]),
+        ]);
+        let profiles = vec![route(&["rules"]), tag(&["modernbert"])];
+        let graph = CascadeGraph::from_tasks(&profiles, &registry).unwrap();
+        let rules = tier_id(&graph, "rules");
+        let modernbert = tier_id(&graph, "modernbert");
+        let runner = Arc::new(CascadeRunner::new(graph));
         let policies: TierPolicyMap = [
-            (tid("rules"), [(TaskId::route(), TierPolicy::new(0.9))].into()),
-            (tid("modernbert"), [(TaskId::tag(), TierPolicy::new(0.8))].into()),
+            (rules, [("route".into(), TierPolicy::new(0.9))].into()),
+            (modernbert, [("tag".into(), TierPolicy::new(0.8))].into()),
         ].into();
-        let split = runner.run_split(
-            "prompt".into(),
-            profiles,
-            [TaskId::route()].into(),
-            Arc::new(policies),
-            Duration::from_secs(2),
-        );
+        let split = runner.run_split("prompt".into(), profiles, ["route".into()].into(),
+            Arc::new(policies), Duration::from_secs(2));
         let required = tokio::time::timeout(Duration::from_millis(100), split.required)
-            .await.expect("route must resolve before the modernbert tier finishes")
-            .expect("required result sender must remain alive");
-        assert!(resolved_at(&required.tasks[&TaskId::route()].resolution, "rules"));
-        assert_eq!(required.tasks[&TaskId::tag()].resolution, Resolution::Deferred);
+            .await.expect("route should complete before tag's tier").unwrap();
+        assert!(resolved_at(&required.tasks["route"].resolution, "rules"));
+        assert_eq!(required.tasks["tag"].resolution, Resolution::Deferred);
         let complete = split.done.await.unwrap();
-        assert!(resolved_at(&complete.tasks[&TaskId::tag()].resolution, "modernbert"));
-        assert!(resolved_at(&complete.tasks[&TaskId::route()].resolution, "rules"));
+        assert!(resolved_at(&complete.tasks["tag"].resolution, "modernbert"));
     }
 
     #[tokio::test]
-    async fn task_without_a_policy_at_a_tier_is_not_sent_to_that_tier() {
+    async fn a_policy_cannot_make_a_tier_outside_the_task_cascade_eligible() {
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let tier = FakeTier::new(
-            "modernbert",
-            vec![(TaskId::tag(), scored("engineering", 0.99))],
-            &calls,
-        );
-        let runner = test_runner(vec![Arc::new(tier)], &[("tag", &["modernbert"])]);
-        let profiles = vec![tag_profile(None)];
-        let policies = TierPolicyMap::new();
-
+        let registry = TierRegistry::of(vec![
+            fake_tier("rules", &calls, Duration::ZERO, &[("route", scored(LABEL_JEV, 0.99))]),
+            fake_tier("harrier", &calls, Duration::ZERO, &[("route", scored(LABEL_LLM, 0.99))]),
+        ]);
+        let profiles = vec![route(&["rules"])];
+        let graph = CascadeGraph::from_tasks(&profiles, &registry).unwrap();
+        let rules = tier_id(&graph, "rules");
+        let unrelated = TierId::from_digest(&[0xab; 32]);
+        let runner = CascadeRunner::new(graph);
+        let policies: TierPolicyMap = [
+            (rules, [("route".into(), TierPolicy::new(0.9))].into()),
+            (unrelated, [("route".into(), TierPolicy::new(0.1))].into()),
+        ].into();
         let result = runner.run("prompt", &profiles, &policies, Duration::from_secs(1)).await;
+        assert!(resolved_at(&result.tasks["route"].resolution, "rules"));
+        assert_eq!(calls.lock().unwrap().as_slice(), [("rules".into(), vec!["route".into()])]);
+    }
+
+    #[tokio::test]
+    async fn registry_keeps_unused_definitions_without_graph_instances() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let registry = TierRegistry::of(vec![
+            fake_tier("rules", &calls, Duration::ZERO, &[]),
+            fake_tier("harrier", &calls, Duration::ZERO, &[]),
+        ]);
+        let profiles = vec![route(&["rules"])];
+        let graph = CascadeGraph::from_tasks(&profiles, &registry).unwrap();
+        let runner = CascadeRunner::new(graph);
+        assert!(registry.get(&tname("harrier")).is_some());
+        assert!(runner.graph().id_for_name(&tname("harrier")).is_none());
+        assert!(runner.graph().instance_for_name(&tname("harrier")).is_none());
+    }
+
+    #[tokio::test]
+    async fn task_with_no_policy_uses_fallback_without_a_tier_call() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let registry = TierRegistry::of(vec![fake_tier("rules", &calls, Duration::ZERO, &[])]);
+        let profiles = vec![tag(&["rules"])];
+        let graph = CascadeGraph::from_tasks(&profiles, &registry).unwrap();
+        let runner = CascadeRunner::new(graph);
+        let result = runner.run("prompt", &profiles, &TierPolicyMap::new(), Duration::from_secs(1)).await;
+        assert_eq!(result.tasks["tag"].resolution, Resolution::Deferred);
         assert!(calls.lock().unwrap().is_empty());
-        assert_eq!(result.tasks[&TaskId::tag()].resolution, Resolution::Deferred);
-    }
-
-    /// The task path, not registry insertion order or TierId sorting, constrains
-    /// the execution order.
-    #[tokio::test]
-    async fn tiers_run_in_registry_order_regardless_of_their_names() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let runner = test_runner(vec![
-            Arc::new(FakeTier::new("zulu", vec![], &calls)),
-            Arc::new(FakeTier::new("alpha", vec![], &calls)),
-            Arc::new(FakeTier::new("mike", vec![(TaskId::route(), scored(LABEL_JEV, 0.99))], &calls)),
-        ], &[("route", &["zulu", "alpha", "mike"])]);
-        let policies: TierPolicyMap = ["zulu", "alpha", "mike"]
-            .into_iter()
-            .map(|name| (tid(name), [(TaskId::route(), TierPolicy::new(0.9))].into()))
-            .collect();
-
-        let result = runner
-            .run("prompt", &[route_profile()], &policies, Duration::from_secs(1))
-            .await;
-        let order: Vec<String> = calls.lock().unwrap().iter().map(|(name, _)| name.clone()).collect();
-        assert_eq!(order, ["zulu", "alpha", "mike"]);
-        assert!(resolved_at(&result.tasks[&TaskId::route()].resolution, "mike"));
-        let called: Vec<String> = result.tier_calls.iter().map(|call| call.tier.to_string()).collect();
-        assert_eq!(called, ["zulu", "alpha", "mike"]);
-    }
-
-    /// A new TierId can be registered and inserted into a task path without
-    /// changing CascadeRunner or another tier adapter.
-    #[tokio::test]
-    async fn a_new_named_tier_can_be_inserted_between_existing_tiers() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let policies: TierPolicyMap = [
-            (tid("fasttext"), [(TaskId::route(), TierPolicy::new(0.95))].into()),
-            (tid("prefilter"), [(TaskId::route(), TierPolicy::new(0.80))].into()),
-            (tid("modernbert"), [(TaskId::route(), TierPolicy::new(0.95))].into()),
-        ].into();
-
-        let before = test_runner(vec![
-            Arc::new(FakeTier::new("fasttext", vec![(TaskId::route(), scored(LABEL_JEV, 0.60))], &calls)),
-            Arc::new(FakeTier::new("modernbert", vec![(TaskId::route(), scored(LABEL_JEV, 0.99))], &calls)),
-        ], &[("route", &["fasttext", "modernbert"])]);
-        let outcome = before.run("p", &[route_profile()], &policies, Duration::from_secs(1)).await;
-        assert!(resolved_at(&outcome.tasks[&TaskId::route()].resolution, "modernbert"));
-
-        calls.lock().unwrap().clear();
-        let after = test_runner(vec![
-            Arc::new(FakeTier::new("fasttext", vec![(TaskId::route(), scored(LABEL_JEV, 0.60))], &calls)),
-            Arc::new(FakeTier::new("prefilter", vec![(TaskId::route(), scored(LABEL_JEV, 0.85))], &calls)),
-            Arc::new(FakeTier::new("modernbert", vec![(TaskId::route(), scored(LABEL_JEV, 0.99))], &calls)),
-        ], &[("route", &["fasttext", "prefilter", "modernbert"])]);
-        let outcome = after.run("p", &[route_profile()], &policies, Duration::from_secs(1)).await;
-        assert!(resolved_at(&outcome.tasks[&TaskId::route()].resolution, "prefilter"));
-        let order: Vec<String> = calls.lock().unwrap().iter().map(|(name, _)| name.clone()).collect();
-        assert_eq!(order, ["fasttext", "prefilter"], "modernbert must not run once prefilter resolves");
-        assert_eq!(after.directory().position(&tid("prefilter")), Some(1));
-    }
-
-    #[tokio::test]
-    async fn registry_retains_available_tiers_absent_from_the_execution_graph() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let registered = vec![
-            Arc::new(FakeTier::new("rules", vec![], &calls)) as Arc<dyn Tier>,
-            Arc::new(FakeTier::new("modernbert", vec![], &calls)) as Arc<dyn Tier>,
-            Arc::new(FakeTier::new("harrier", vec![], &calls)) as Arc<dyn Tier>,
-        ];
-        let registry = TierRegistry::of(registered);
-        let graph = test_graph(&[("route", &["rules", "modernbert"])]);
-        let runner = CascadeRunner::new(registry, graph).unwrap();
-        assert!(runner.registry().get(&tid("harrier")).is_some());
-        assert_eq!(runner.directory().position(&tid("harrier")), None);
-    }
-
-    #[tokio::test]
-    async fn a_policy_for_an_unregistered_tier_is_never_executed() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let runner = test_runner(vec![Arc::new(FakeTier::new(
-            "rules",
-            vec![(TaskId::route(), scored(LABEL_JEV, 0.99))],
-            &calls,
-        ))], &[("route", &["rules"])]);
-        let policies: TierPolicyMap = [
-            (tid("rules"), [(TaskId::route(), TierPolicy::new(0.95))].into()),
-            (tid("ghost"), [(TaskId::route(), TierPolicy::new(0.10))].into()),
-        ].into();
-        let outcome = runner.run("p", &[route_profile()], &policies, Duration::from_secs(1)).await;
-        assert!(resolved_at(&outcome.tasks[&TaskId::route()].resolution, "rules"));
-        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(Slot::from_index(3).map(Slot::index), Some(3));
     }
 }

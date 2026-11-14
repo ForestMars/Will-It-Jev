@@ -1,6 +1,7 @@
 // src/main.rs
 
 mod config;
+mod legacy_tiers;
 mod pipeline;
 mod router;
 mod tagging;
@@ -10,28 +11,22 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use crate::tagging::{ClickHouseRawTable, OvenV1Tagger, TagConfig};
 use pipeline::tagger::{CascadeTagger, JointTagStore};
-use pipeline::config::{TierExecutor, TierRequestShape, TierSpec, TierTransport};
-use pipeline::tier::{FastTextTier, GrpcScoringTier, RulesTier, Tier};
-use pipeline::{CascadeRunner, TaskId, TierRegistry};
+use legacy_tiers::LegacyTierNumbers;
+use pipeline::cascade::CascadeGraph;
+use pipeline::task::TierPolicyMap;
+use pipeline::tier::{hex, ModelFormat, Params, Role, Tier, TierName};
+use pipeline::TierRegistry;
+use pipeline::CascadeRunner;
 use router::dispatch::DownstreamDispatcher;
 use router::service;
-use router::tier1_runner::{Tier1Automaton, Tier1Engine};
-use router::tier2_runner::Tier2Runner;
-use router::tier3_runner::Tier3Runner;
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use sha2::{Digest, Sha256};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
-
-fn sha256_file(path: &str) -> Result<String, std::io::Error> {
-    let contents = std::fs::read(path)?;
-    Ok(format!("{:x}", Sha256::digest(contents)))
-}
 
 fn default_fasttext_model_path() -> String {
     const CANDIDATES: [&str; 2] = ["models/tier2_small.bin", "models/tier2.bin"];
@@ -49,43 +44,45 @@ fn env_or(name: &str, default: &str) -> String {
 
 /// A tier is enabled by its own `enabled`, else by the `[router.tierN]` block of
 /// the legacy ordinal it carries, else it is on.
-fn tier_enabled(spec: &TierSpec, router: &config::RouterConfig) -> bool {
-    spec.enabled
+fn tier_enabled(name: &TierName, params: &Params, router: &config::RouterConfig, legacy: &LegacyTierNumbers) -> bool {
+    params.enabled
         .or_else(|| {
-            spec.legacy_ordinal
+            legacy.ordinal_of(name)
                 .and_then(|ordinal| router.legacy_tier(ordinal))
                 .map(|tier| tier.enabled)
         })
         .unwrap_or(true)
 }
 
-/// Endpoint and per-call timeout for a gRPC tier. The original two sidecar
-/// tiers keep their historical environment variables; every other tier uses
-/// `TIER_<NAME>_ENDPOINT` and `TIER_<NAME>_MAX_CALL_MS`.
+/// Endpoint and per-call timeout for a gRPC tier. The original sidecars keep
+/// their historical environment variables; other names use TIER_<NAME>_*.
 fn grpc_settings(
-    spec: &TierSpec,
+    name: &TierName,
+    params: &Params,
     router: &config::RouterConfig,
+    numbers: &LegacyTierNumbers,
 ) -> Result<(String, Duration), Box<dyn std::error::Error>> {
-    let legacy = spec.legacy_ordinal.and_then(|ordinal| router.legacy_tier(ordinal));
-    let endpoint = spec
-        .endpoint
-        .as_deref()
+    let ordinal = numbers.ordinal_of(name);
+    let legacy = ordinal.and_then(|ordinal| router.legacy_tier(ordinal));
+    let endpoint = params.endpoint.as_deref()
         .or_else(|| legacy.and_then(|tier| tier.endpoint.as_deref()));
-    let timeout_ms = spec.timeout_ms.or_else(|| legacy.and_then(|tier| tier.timeout_ms));
-    let upper = spec.id.as_str().to_ascii_uppercase().replace('-', "_");
+    let timeout_ms = params.timeout_ms.or_else(|| legacy.and_then(|tier| tier.timeout_ms));
+    let upper = name.as_str().to_ascii_uppercase().replace('-', "_");
+    // model_format selects the inference runtime adapter. Legacy ordinals only
+    // provide compatibility settings; they do not select the runtime.
     let (endpoint_env, endpoint_aliases, timeout_env): (String, &[&str], String) =
-        match spec.legacy_ordinal {
-            Some(3) => (
+        match params.model_format {
+            Some(ModelFormat::Onnx) => (
                 "TIER3_SCORER_ENDPOINT".into(),
-                &["MODERNBERT_ENDPOINT"],
+                &["ONNX_RUNTIME_ENDPOINT", "MODERNBERT_ENDPOINT"],
                 "TIER3_MAX_CALL_MS".into(),
             ),
-            Some(4) => (
+            Some(ModelFormat::Gguf) => (
                 "TIER4_SCORER_ENDPOINT".into(),
-                &["TIER4_HARRIER_ENDPOINT", "TIER3_ENDPOINT"],
+                &["GGUF_RUNTIME_ENDPOINT", "TIER4_HARRIER_ENDPOINT", "TIER3_ENDPOINT"],
                 "TIER4_MAX_CALL_MS".into(),
             ),
-            _ => (
+            None => (
                 format!("TIER_{upper}_ENDPOINT"),
                 &[],
                 format!("TIER_{upper}_MAX_CALL_MS"),
@@ -95,6 +92,43 @@ fn grpc_settings(
         configured_endpoint(&endpoint_env, endpoint_aliases, endpoint)?,
         configured_timeout(&timeout_env, timeout_ms)?,
     ))
+}
+
+/// Resolve deployment-specific parameters before registering the Tier definition.
+/// Concrete TierInstance construction happens only during CascadeGraph compilation.
+fn resolve_instance_params(
+    name: &TierName,
+    tier: &Tier,
+    params: &Params,
+    router: &config::RouterConfig,
+    legacy: &LegacyTierNumbers,
+) -> Result<Params, Box<dyn std::error::Error>> {
+    let mut resolved = params.clone();
+    match tier.exex {
+        Role::Rules => {
+            if resolved.config.is_none() {
+                resolved.config = Some(env_or("TIER1_CONFIG", "config/tier1.toml"));
+            }
+        }
+        Role::FastText => {
+            if resolved.model.is_none() {
+                resolved.model = Some(
+                    std::env::var("FASTTEXT_MODEL").unwrap_or_else(|_| default_fasttext_model_path()),
+                );
+            }
+            if resolved.model.as_deref() == Some("models/tier2.bin")
+                && !std::path::Path::new("models/tier2_small.bin").exists()
+            {
+                tracing::warn!(tier = %name, model_path = "models/tier2.bin", "using legacy fastText tier-2 model; prefer models/tier2_small.bin when available");
+            }
+        }
+        Role::Encoder => {
+            let (endpoint, timeout) = grpc_settings(name, &resolved, router, legacy)?;
+            resolved.endpoint = Some(endpoint);
+            resolved.timeout_ms = Some(u64::try_from(timeout.as_millis())?);
+        }
+    }
+    Ok(resolved)
 }
 
 fn configured_endpoint(
@@ -276,93 +310,121 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pipeline_config =
         pipeline::config::load_or_default(env_or("TASKS_CONFIG", "config/tasks.toml"))?;
-    let route_profile = pipeline_config
-        .profile(&TaskId::route())
-        .ok_or("tasks.toml: missing [task.route] definition")?;
-    if !pipeline_config.has_policy(&TaskId::route()) {
-        return Err("tasks.toml: route task has no [tier_policy.<tier>.route] entries".into());
+    // ---- Build the complete available-tier registry -----------------------
+    // [[tier]] supplies definitions; its array order has no execution meaning.
+    let mut registry = TierRegistry::new();
+    for (name, tier, params) in &pipeline_config.tiers {
+        if !tier_enabled(name, params, &config.router, &pipeline_config.legacy) {
+            tracing::info!(tier = %name, "tier disabled by configuration");
+            continue;
+        }
+        let resolved = resolve_instance_params(name, tier, params, &config.router, &pipeline_config.legacy)?;
+        tracing::info!(
+            tier = %name,
+            executor = tier.exex.as_str(),
+            model_format = ?resolved.model_format.map(ModelFormat::as_str),
+            "tier definition registered"
+        );
+        registry.register(name.clone(), *tier, resolved)?;
     }
-    let tier_policies = Arc::new(pipeline_config.tier_policies.clone());
-    // tag_via_cascade is retained as a compatibility alias. Both settings
-    // now mean that sampled tag tasks join the route request's single cascade.
+    if registry.is_empty() {
+        return Err("no cascade tier is enabled; enable at least one [[tier]]".into());
+    }
+
+    // Compile every Task's ordered Cascade into the combined execution graph.
+    // The registry remains the full unordered inventory; only task paths create
+    // graph nodes and ordering dependencies.
+    let runtime_tasks = pipeline_config.tasks(&registry)?;
+    let execution_graph = CascadeGraph::from_tasks(&runtime_tasks, &registry)?;
+
+    // Policies are authored by TierName, keyed by the concrete TierId at runtime,
+    // and retained only for tasks whose own Cascade contains that tier.
+    let mut tier_policies = TierPolicyMap::new();
+    for (name, by_task) in &pipeline_config.tier_policies {
+        if let Some(id) = execution_graph.id_for_name(name) {
+            let eligible: std::collections::BTreeMap<_, _> = by_task.iter()
+                .filter(|(task, _)| execution_graph.task_uses(task, &id))
+                .map(|(task, policy)| (task.clone(), policy.clone()))
+                .collect();
+            if !eligible.is_empty() {
+                tier_policies.insert(id, eligible);
+            }
+        } else {
+            tracing::info!(tier = %name, "policies for unavailable tier are inactive");
+        }
+    }
+    if execution_graph.order().is_empty() {
+        return Err("no enabled task cascade contains an available tier".into());
+    }
+    tracing::info!(
+        order = ?execution_graph.order().iter()
+            .filter_map(|id| execution_graph.tier_name(id).map(ToString::to_string))
+            .collect::<Vec<_>>(),
+        "compiled task cascade graph"
+    );
+
+    // Legacy artifact hashes describe the loaded legacy executors, independent
+    // of whether a particular task currently traverses them.
+    let artifact_hash = |role: Role| {
+        execution_graph.instances()
+            .find(|(_, instance)| instance.tier().exex == role)
+            .and_then(|(_, instance)| instance.artifact_hash().map(|hash| hex(hash)))
+            .unwrap_or_else(|| "disabled".to_string())
+    };
+    let hashes = telemetry::Hashes {
+        tier1_toml: artifact_hash(Role::Rules),
+        tier2_bin: artifact_hash(Role::FastText),
+    };
+
+    for (tier_id, by_task) in &tier_policies {
+        let Some(name) = execution_graph.tier_name(tier_id) else { continue };
+        for (task, policy) in by_task {
+            if let Some(calibrated_for) = policy.calibrated_for {
+                if calibrated_for != *tier_id {
+                    tracing::warn!(
+                        tier = %name, tier_id = %tier_id, task = %task,
+                        calibrated_for = %calibrated_for, running = %tier_id,
+                        "tier_policy was calibrated for a different instance than the one now running under this name"
+                    );
+                }
+            }
+        }
+    }
+
+    let route_profile = runtime_tasks.iter().find(|task| task.name == "route").cloned()
+        .ok_or("tasks.toml: missing [task.route] definition")?;
+    let route_has_executable_policy = execution_graph.order().iter().any(|id| {
+        execution_graph.task_uses("route", id)
+            && tier_policies.get(id).is_some_and(|by_task| by_task.contains_key("route"))
+    });
+    if !route_has_executable_policy {
+        return Err("tasks.toml: route task has no enabled tier in its cascade with a [tier_policy.<tier>.route] entry".into());
+    }
+
     let tag_in_request = pipeline_config.settings.tag_in_request
         || pipeline_config.settings.tag_via_cascade;
     let tag_profile = if tag_in_request {
-        let profile = pipeline_config.profile(&TaskId::tag()).ok_or(
+        let profile = runtime_tasks.iter().find(|task| task.name == "tag").cloned().ok_or(
             "tasks.toml: tag_in_request = true but there is no [task.tag] profile",
         )?;
-        if !pipeline_config.has_policy(&TaskId::tag()) {
-            return Err("tasks.toml: tag_in_request = true but no [tier_policy.<tier>.tag] policy is configured".into());
-        }
-        let has_executable_tag_head = pipeline_config.tiers.iter().any(|spec| {
-            spec.executor == TierExecutor::Scorer
-                && spec.request_shape == Some(TierRequestShape::ScoreTasks)
-                && tier_enabled(spec, &config.router)
-                && pipeline_config.cascades.task_uses(&TaskId::tag(), &spec.id)
-                && pipeline_config.tier_policies.get(&spec.id)
-                    .is_some_and(|by_task| by_task.contains_key(&TaskId::tag()))
+        let has_executable_tag_head = execution_graph.order().iter().any(|id| {
+            execution_graph.task_uses("tag", id)
+                && execution_graph.instance(id).is_some_and(|instance| {
+                    instance.tier().exex == Role::Encoder
+                        && tier_policies.get(id).is_some_and(|by_task| by_task.contains_key("tag"))
+                })
         });
         if !has_executable_tag_head {
-            return Err(r#"tasks.toml: joint tagging requires a tag policy on an enabled scorer tier configured with request_shape = "score_tasks""#.into());
+            return Err("tasks.toml: joint tagging requires a tag policy on an enabled encoder tier in task.tag.cascade".into());
         }
         Some(profile)
     } else {
         None
     };
 
-    // ---- Build the available-tier registry -------------------------------
-    // TierRegistry is the complete lookup of available TierIds. Task cascades
-    // independently determine which registered tiers run and in what order.
-    let mut registry = TierRegistry::new();
-    let mut tier1_hash = "disabled".to_string();
-    let mut tier2_hash = "disabled".to_string();
-    for spec in &pipeline_config.tiers {
-        if !tier_enabled(spec, &config.router) {
-            tracing::info!(tier = %spec.id, "tier disabled by configuration");
-            continue;
-        }
-        let tier: Arc<dyn Tier> = match (spec.executor, spec.transport) {
-            (TierExecutor::Rules, TierTransport::InProcess) => {
-                let path = env_or("TIER1_CONFIG", "config/tier1.toml");
-                let engine = Arc::new(Tier1Engine::new(Tier1Automaton::from_toml_file(&path)?)?);
-                tier1_hash = sha256_file(&path)?;
-                Arc::new(RulesTier::new(spec.id.clone(), engine))
-            }
-            (TierExecutor::Fasttext, TierTransport::InProcess) => {
-                let path = std::env::var("FASTTEXT_MODEL").unwrap_or_else(|_| default_fasttext_model_path());
-                if path == "models/tier2.bin" && !std::path::Path::new("models/tier2_small.bin").exists() {
-                    tracing::warn!(model_path = %path, "using legacy fastText tier-2 model; prefer models/tier2_small.bin when available");
-                }
-                let runner = Arc::new(Tier2Runner::new(&path)?);
-                tier2_hash = sha256_file(&path)?;
-                Arc::new(FastTextTier::new(spec.id.clone(), runner))
-            }
-            (TierExecutor::Scorer, TierTransport::Grpc) => {
-                let request_shape = spec.request_shape.ok_or("scorer tier is missing request_shape")?;
-                let (endpoint, timeout) = grpc_settings(spec, &config.router)?;
-                Arc::new(GrpcScoringTier::new(
-                    spec.id.clone(),
-                    Tier3Runner::new(endpoint, timeout)?,
-                    request_shape,
-                ))
-            }
-            _ => return Err(format!("unsupported tier configuration for {}", spec.id).into()),
-        };
-        registry.register(tier, spec.legacy_ordinal)?;
-    }
-    if registry.is_empty() {
-        return Err("no cascade tier is enabled; enable at least one [[tier]]".into());
-    }
-    let execution_graph = pipeline_config.cascades.retain_available(&registry.ids())?;
-    if execution_graph.order().is_empty() {
-        return Err("no task cascade contains an enabled tier".into());
-    }
-    tracing::info!(
-        order = ?execution_graph.order().iter().map(|id| id.as_str()).collect::<Vec<_>>(),
-        "cascade DAG topological order"
-    );
-    let hashes = telemetry::Hashes { tier1_toml: tier1_hash, tier2_bin: tier2_hash };
-    let cascade = Arc::new(CascadeRunner::new(registry, execution_graph)?);
+    let tier_policies = Arc::new(tier_policies);
+    let cascade = Arc::new(CascadeRunner::new(execution_graph));
+    let legacy = Arc::new(pipeline_config.legacy.clone());
 
     let downstream_timeout =
         Duration::from_millis(env_or("DOWNSTREAM_TIMEOUT_MS", "120000").parse()?);
@@ -473,7 +535,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 output_kind,
                 ollama_tagger,
             )
-            .with_tier_directory(cascade.directory()),
+            .with_legacy_numbers(Arc::clone(&legacy)),
         );
         tracing::info!("sampled task tagging joins the route request's single cascade");
         tagging::spawn(tagger, tag_config)
@@ -483,7 +545,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = service::app(service::AppDependencies {
         cascade,
-        task_profiles: pipeline_config.profiles(),
+        task_profiles: runtime_tasks,
         route_profile,
         tier_policies,
         dispatcher,
@@ -496,6 +558,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tag_sample_prob,
         joint_tag_ttl: downstream_timeout + tag_budget + Duration::from_secs(90),
         budget: Duration::from_millis(env_or("ROUTER_BUDGET_MS", "600").parse()?),
+        legacy,
     });
     let bind_address = env_or("ROUTER_BIND", "127.0.0.1:8080");
     let listener = tokio::net::TcpListener::bind(&bind_address).await?;

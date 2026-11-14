@@ -59,35 +59,40 @@ Each tier returns one of two outcomes:
 
 Tier 6 is the terminal generative tier. Provider availability determines whether a response can be returned.
 
-Disabled tiers are omitted from the runtime registry without cost. Each task declares its own ordered `cascade` of existing `TierId` values. The router unions adjacent path entries into a directed acyclic graph (DAG), rejects cycles, then executes each shared TierId node once. At a node it batches every still-open task whose path reaches that TierId, allowing one `ScoreTasks` request to evaluate multiple heads against one shared representation.
-
-### Available tiers and task cascades
-
-`TierRegistry` is the lookup of all available configured tiers. It does not impose execution order. Each tier has one stable `TierId`; task policies, traces, resolutions, API responses and telemetry refer to that ID.
-
-Each `[task.<id>]` declares an ordered `cascade = [ ... ]` of TierIds. The order defines dependencies for that task. The union of task paths is the execution DAG: shared TierIds are shared nodes, while tasks can follow different paths. If two task paths imply contradictory ordering, configuration fails rather than silently choosing an order.
+The `TierRegistry` catalogs available `Tier` definitions and their declarative parameters by `TierName`; it stores no `TierInstance` and assigns no `TierId`. Each `Task` owns an ordered `Cascade` of `TierName` values. `CascadeGraph` compiles those named paths, materializes one `TierInstance` for each referenced definition, and assigns each instance a hash-derived `TierId`. Shared names produce shared graph nodes; unused definitions remain in the registry without acquiring an instance ID. Contradictory task paths fail cycle validation. Disabled definitions are omitted from each task's Cascade while preserving the remaining relative order.
 
 ```toml
 [task.route]
 cascade = ["rules", "fasttext", "modernbert", "harrier"]
+labels = ["jev_capable", "needs_llm"]
+fallback_label = "needs_llm"
 
 [task.tag]
 cascade = ["modernbert", "harrier"]
+output_kind = "multiclass"
+fallback = "defer"
 
-[[tier]]
-name = "modernbert"
-executor = "scorer"
-transport = "grpc"
-request_shape = "score_tasks"
-endpoint = "http://127.0.0.1:50052"
-timeout_ms = 500
+[tier_policy.rules.route]
+min_confidence = 0.78
+
+[tier_policy.modernbert.route]
+min_confidence = 0.95
+
+[tier_policy.modernbert.tag]
+min_confidence = 0.85
 ```
 
-A new task normally adds a head and a path through already-registered TierIds; it does not add another encoder execution. When a required capability is absent, register a new TierId with its executor, transport and request shape, then reference that ID in the task's cascade. `executor` selects the computation, `transport` describes how the router reaches it, and `request_shape` selects the scorer RPC contract. These are separate configuration fields.
+A task skips nodes absent from its own Cascade and nodes without a task-specific policy. After a pass, it continues to the next policy-bearing node along its ordered path. Resolution removes that task from the run; exhaustion applies its fallback. Tasks that reach the same graph node are batched into one invocation, allowing a single `ScoreTasks` request to evaluate multiple heads against one shared representation.
 
-When no explicit `[[tier]]` registry exists, legacy configuration retains the original four-tier path. Once a named registry is declared, every task must declare its own `cascade`; the router never infers execution order from registry entries.
+A new task adds its output contract, ordered `cascade` of TierNames, and policies for the tiers it uses. A new `[[tier]]` adds an available Tier definition to the registry; referencing its name in a task's Cascade causes `CascadeGraph` to materialize its TierInstance.
 
-The graph derives a deterministic topological order. Position in the directory is an execution/telemetry projection of that order, not a TierId and not the registry's insertion order. Legacy ordinals remain only for old `tierN` aliases and numbered telemetry projections. The complete `tier_outcomes` array remains name-keyed in execution order; existing numbered fields remain compatibility projections. Tiers 5 and 6 are downstream execution backends, not cascade nodes.
+The identity layers stay distinct. `TierName` identifies an authored tier definition and appears in task cascades. `TierId` is generated only when `CascadeGraph` materializes a concrete instance; the hash includes its name and behavior-determining configuration, including inference runtime, model-related configuration and loaded artifact content. Endpoint and timeout are deployment details, not identity. `Slot` is the instance's position in the compiled graph, an execution/telemetry address rather than an identity.
+
+`model_format` selects the inference runtime at the adapter boundary. The router selects the corresponding adapter endpoint but does not compare or validate the model identity reported by a sidecar. `TierInstance` is the concrete realization of a definition and is owned by `CascadeGraph`, not by `TierRegistry`.
+
+The original four tiers were once numbered 1 to 4, and those numbers survive at the edges: numbered telemetry fields, `[router.tierN]` settings, numbered environment variables and `tierN` aliases in `[tier_policy.*]` keys. The `[legacy_tiers]` table in `tasks.toml` is the only place a name and a number meet. It is read at load and handed to code that writes those compatibility surfaces; no tier, instance, registry or Cascade carries a number. Configuration with no explicit `[[tier]]` entries keeps the original numbering.
+
+`CascadeGraph` computes a deterministic topological execution order by resolving each task's adjacent TierName pairs to hash-derived TierIds. Shared TierNames resolve to shared graph nodes and execute once for all eligible tasks; definitions absent from every task path remain available in the registry but do not materialize. The complete `tier_outcomes` array remains name-keyed in graph execution order; existing numbered fields remain compatibility projections. Tiers 5 and 6 are downstream execution backends, not Cascade nodes.
 
 ---
 
@@ -165,11 +170,11 @@ src/
   logging/
     mod.rs            Low-overhead tracing and telemetry initialization
   pipeline/           Task-agnostic cascade engine (see "Multi-task cascade" below)
-    task.rs           TaskId, raw readings, TaskProfile (per-task bars, labels, fallback)
-    registry.rs       TierId, available TierRegistry, and execution-facing TierDirectory
-    cascade.rs        Task-specific ordered paths combined into a validated execution DAG
-    tier.rs           Tier trait + RulesTier, FastTextTier, GrpcScoringTier (joint ScoreTasks for sidecars)
-    runner.rs         CascadeRunner: one topological pass, batching open tasks at shared TierIds
+    task.rs           Task contracts, raw readings and tier/task resolution policies
+    registry.rs       Unordered TierRegistry of available Tier definitions, keyed by TierName
+    cascade.rs        Task-owned TierName paths; CascadeGraph materializes instances and compiles the DAG
+    tier.rs           Tier definitions, hash identities, TierInstances and evaluator contract
+    runner.rs         CascadeRunner: one ordered pass, batching eligible tasks at each tier
     config.rs         config/tasks.toml loader
     tagger.rs         CascadeTagger: category tagging on the shared tiers
   router/
@@ -509,19 +514,20 @@ See the `LICENSE` file in the repository root.
 
 ## Multi-task cascade
 
-The tiers are decoupled from the question they answer. A `Tier` returns raw per-task
-readings and applies no thresholds; a `TaskProfile` says which tiers a task may exit at,
-the confidence bar per tier and label, the allowed labels, and the fallback. The
-`CascadeRunner` walks the tiers once over the union of open tasks, so a tier executes at
-most once per run however many tasks it serves, and each task leaves as soon as its own
-profile resolves it.
+Tiers are decoupled from the questions they answer. A `TierInstance` returns raw per-task
+readings and applies no thresholds. Each `Task` owns its ordered `Cascade`, alongside its
+output contract, allowed labels and fallback. `CascadeGraph` is compiled from all task paths.
+The `CascadeRunner` traverses that graph in topological order, batching tasks whose own path
+contains the current TierName and whose tier/task policy is present. Each task leaves when it
+resolves or exhausts the policy-bearing tiers on its path.
 
-* `route` (jev_capable / needs_llm): `TaskProfile::route_default()` reproduces today's
-  thresholds; tests assert it decides identically to `tier3_runner::decide` and the
-  tier 1 and 2 rules. `router::cascade::route` itself has not been moved onto the runner.
+* `route` (jev_capable / needs_llm): the policies in `config/tasks.toml` set the
+  confidence bars for each eligible tier. The legacy `router::cascade::route`
+  path remains separate from the generic task runner.
 * `tag` (domain categories): `CascadeTagger` implements `tagging::Tagger`, falling back
   to the Ollama tagger when no tier resolves. Off by default (`tag_via_cascade` in
-  `config/tasks.toml`) and needs a tuned `[task.tag]` profile.
+  `config/tasks.toml`) and needs a `[tier_policy.<tier>.tag]` entry for a tier in
+  `[task.tag].cascade`.
 * Joint execution: the additive `ScoreTasks` RPC scores several tasks from one shared
   encoding. A sidecar that answers UNIMPLEMENTED is served route-only via `Score`.
   No shipped sidecar implements it yet.

@@ -1,24 +1,80 @@
+// Task-owned named cascades and their compiled, instance-bearing execution graph.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
-use super::registry::TierId;
-use super::task::TaskId;
+use super::registry::TierRegistry;
+use super::task::Task;
+use super::tier::{TierId, TierInstance, TierName};
+
+/// One task's ordered path through the tier ontology. It contains names, never
+/// materialized instance IDs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Cascade {
+    tiers: Vec<TierName>,
+}
+
+impl Cascade {
+    pub fn from_names(names: &[TierName]) -> Result<Self, CascadeError> {
+        let mut seen = BTreeSet::new();
+        for name in names {
+            if !seen.insert(name.clone()) {
+                return Err(CascadeError::DuplicateTier(name.clone()));
+            }
+        }
+        Ok(Self { tiers: names.to_vec() })
+    }
+
+    pub fn tiers(&self) -> &[TierName] { &self.tiers }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CascadeError {
+    DuplicateTier(TierName),
+}
+impl fmt::Display for CascadeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateTier(tier) => write!(f, "cascade lists tier {tier} more than once"),
+        }
+    }
+}
+impl Error for CascadeError {}
+
+/// Positional address in the compiled graph, not tier identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Slot(u16);
+impl Slot {
+    pub fn from_index(index: usize) -> Option<Self> { u16::try_from(index).ok().map(Self) }
+    pub fn index(self) -> usize { self.0 as usize }
+}
+impl fmt::Display for Slot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{}", self.0) }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CascadeGraphError {
-    UnknownTier { task: TaskId, tier: TierId },
-    DuplicateTier { task: TaskId, tier: TierId },
+    UnknownTier { task: String, tier: TierName },
+    DuplicateTier { task: String, tier: TierName },
+    DuplicateTask(String),
+    TierBuild { tier: TierName, reason: String },
+    TierIdCollision { id: TierId, first: TierName, second: TierName },
     Cycle { tiers: Vec<TierId> },
 }
-
 impl fmt::Display for CascadeGraphError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownTier { task, tier } =>
-                write!(f, "task {task} cascade references unregistered tier {tier}"),
+                write!(f, "task {task} cascade references unavailable tier {tier}"),
             Self::DuplicateTier { task, tier } =>
                 write!(f, "task {task} cascade lists tier {tier} more than once"),
+            Self::DuplicateTask(task) => write!(f, "task {task} is defined more than once"),
+            Self::TierBuild { tier, reason } =>
+                write!(f, "failed to materialize tier {tier} on CascadeGraph: {reason}"),
+            Self::TierIdCollision { id, first, second } =>
+                write!(f, "tiers {first} and {second} generated the same TierId {id}"),
             Self::Cycle { tiers } => write!(
                 f,
                 "task cascades create a cycle among tiers: {}",
@@ -29,71 +85,135 @@ impl fmt::Display for CascadeGraphError {
 }
 impl Error for CascadeGraphError {}
 
-/// Union of task-specific ordered paths. Adjacent TierIds create dependency
-/// edges; shared TierIds are single nodes and are evaluated once for all tasks
-/// that still need a reading at that node.
-#[derive(Debug, Clone, Default)]
+/// The graph owns the concrete TierInstances. Each task path remains a sequence
+/// of TierNames; graph nodes receive hash-derived TierIds only during compilation.
+#[derive(Clone, Default)]
 pub struct CascadeGraph {
-    paths: BTreeMap<TaskId, Vec<TierId>>,
+    paths: BTreeMap<String, Cascade>,
     order: Vec<TierId>,
-    tasks_by_tier: BTreeMap<TierId, BTreeSet<TaskId>>,
+    tasks_by_tier: BTreeMap<TierId, BTreeSet<String>>,
+    names_by_id: BTreeMap<TierId, TierName>,
+    ids_by_name: BTreeMap<TierName, TierId>,
+    instances: BTreeMap<TierId, Arc<TierInstance>>,
 }
 
 impl CascadeGraph {
-    pub fn from_task_paths(
-        paths: BTreeMap<TaskId, Vec<TierId>>,
-        registered: &BTreeSet<TierId>,
+    pub fn from_tasks(
+        tasks: &[Task],
+        registry: &TierRegistry,
     ) -> Result<Self, CascadeGraphError> {
+        let mut graph = Self::default();
         let mut successors: BTreeMap<TierId, BTreeSet<TierId>> = BTreeMap::new();
         let mut indegree: BTreeMap<TierId, usize> = BTreeMap::new();
-        let mut tasks_by_tier: BTreeMap<TierId, BTreeSet<TaskId>> = BTreeMap::new();
         let mut first_seen: BTreeMap<TierId, usize> = BTreeMap::new();
         let mut next_rank = 0usize;
 
-        for (task, path) in &paths {
-            let mut seen = BTreeSet::new();
-            for tier in path {
-                if !registered.contains(tier) {
-                    return Err(CascadeGraphError::UnknownTier { task: task.clone(), tier: tier.clone() });
+        for task in tasks {
+            if graph.paths.contains_key(&task.name) {
+                return Err(CascadeGraphError::DuplicateTask(task.name.clone()));
+            }
+
+            let mut path_ids = Vec::with_capacity(task.cascade.tiers().len());
+            let mut seen_names = BTreeSet::new();
+
+            for name in task.cascade.tiers() {
+                if !seen_names.insert(name.clone()) {
+                    return Err(CascadeGraphError::DuplicateTier {
+                        task: task.name.clone(),
+                        tier: name.clone(),
+                    });
                 }
-                if !seen.insert(tier.clone()) {
-                    return Err(CascadeGraphError::DuplicateTier { task: task.clone(), tier: tier.clone() });
-                }
-                successors.entry(tier.clone()).or_default();
-                indegree.entry(tier.clone()).or_insert(0);
-                if !first_seen.contains_key(tier) {
-                    first_seen.insert(tier.clone(), next_rank);
+
+                let id = if let Some(id) = graph.ids_by_name.get(name) {
+                    *id
+                } else {
+                    let (definition, params) = registry.get(name).ok_or_else(|| {
+                        CascadeGraphError::UnknownTier {
+                            task: task.name.clone(),
+                            tier: name.clone(),
+                        }
+                    })?;
+
+                    #[cfg(test)]
+                    let instance = if let Some(fake) = registry.fake(name) {
+                        TierInstance::fake_with_definition(name.clone(), *definition, params.clone(), fake)
+                    } else {
+                        TierInstance::build(name.clone(), *definition, params.clone())
+                            .map_err(|error| CascadeGraphError::TierBuild {
+                                tier: name.clone(),
+                                reason: error.to_string(),
+                            })?
+                    };
+
+                    #[cfg(not(test))]
+                    let instance = TierInstance::build(name.clone(), *definition, params.clone())
+                        .map_err(|error| CascadeGraphError::TierBuild {
+                            tier: name.clone(),
+                            reason: error.to_string(),
+                        })?;
+
+                    let instance = Arc::new(instance);
+                    let id = TierInstance::derive_id(
+                        instance.name(),
+                        instance.tier(),
+                        instance.params(),
+                        instance.artifact_hash(),
+                    );
+
+                    if let Some(first) = graph.names_by_id.get(&id) {
+                        if first != name {
+                            return Err(CascadeGraphError::TierIdCollision {
+                                id,
+                                first: first.clone(),
+                                second: name.clone(),
+                            });
+                        }
+                    }
+
+                    graph.names_by_id.insert(id, name.clone());
+                    graph.ids_by_name.insert(name.clone(), id);
+                    graph.instances.insert(id, instance);
+                    id
+                };
+
+                successors.entry(id).or_default();
+                indegree.entry(id).or_insert(0);
+                if !first_seen.contains_key(&id) {
+                    first_seen.insert(id, next_rank);
                     next_rank += 1;
                 }
-                tasks_by_tier.entry(tier.clone()).or_default().insert(task.clone());
+                graph.tasks_by_tier.entry(id).or_default().insert(task.name.clone());
+                path_ids.push(id);
             }
-            for edge in path.windows(2) {
-                if successors.entry(edge[0].clone()).or_default().insert(edge[1].clone()) {
-                    *indegree.entry(edge[1].clone()).or_insert(0) += 1;
+
+            for edge in path_ids.windows(2) {
+                if successors.entry(edge[0]).or_default().insert(edge[1]) {
+                    *indegree.entry(edge[1]).or_insert(0) += 1;
                 }
             }
+
+            graph.paths.insert(task.name.clone(), task.cascade.clone());
         }
 
-        // Preserve first appearance in the configured task paths whenever
-        // dependency edges leave nodes unordered. This is deterministic and
-        // avoids making lexical TierId order an accidental scheduling policy.
+        // Preserve first appearance in task cascades as the deterministic tie-break.
         let mut ready: BTreeSet<(usize, TierId)> = indegree.iter()
             .filter_map(|(tier, degree)| (*degree == 0).then_some((
-                *first_seen.get(tier).expect("registered graph node has a rank"),
-                tier.clone(),
+                *first_seen.get(tier).expect("every graph node has a rank"),
+                *tier,
             )))
             .collect();
+
         let mut order = Vec::with_capacity(indegree.len());
         while let Some((_, tier)) = ready.pop_first() {
-            order.push(tier.clone());
+            order.push(tier);
             if let Some(next) = successors.get(&tier) {
                 for dependent in next {
                     let degree = indegree.get_mut(dependent).expect("edge target has indegree");
                     *degree -= 1;
                     if *degree == 0 {
                         ready.insert((
-                            *first_seen.get(dependent).expect("registered graph node has a rank"),
-                            dependent.clone(),
+                            *first_seen.get(dependent).expect("every graph node has a rank"),
+                            *dependent,
                         ));
                     }
                 }
@@ -107,66 +227,141 @@ impl CascadeGraph {
             return Err(CascadeGraphError::Cycle { tiers });
         }
 
-        Ok(Self { paths, order, tasks_by_tier })
-    }
-
-    /// Remove disabled/unavailable TierIds from each path and rebuild the DAG.
-    /// Relative order among remaining TierIds is preserved.
-    pub fn retain_available(&self, available: &BTreeSet<TierId>) -> Result<Self, CascadeGraphError> {
-        let paths = self.paths.iter().map(|(task, path)| (
-            task.clone(),
-            path.iter().filter(|tier| available.contains(*tier)).cloned().collect(),
-        )).collect();
-        Self::from_task_paths(paths, available)
+        graph.order = order;
+        Ok(graph)
     }
 
     pub fn order(&self) -> &[TierId] { &self.order }
-    pub fn paths(&self) -> &BTreeMap<TaskId, Vec<TierId>> { &self.paths }
 
-    pub fn task_uses(&self, task: &TaskId, tier: &TierId) -> bool {
+    pub fn task_uses(&self, task: &str, tier: &TierId) -> bool {
         self.tasks_by_tier.get(tier).is_some_and(|tasks| tasks.contains(task))
     }
 
-    pub fn tasks_using(&self, tier: &TierId) -> Option<&BTreeSet<TaskId>> {
+    pub fn tasks_using(&self, tier: &TierId) -> Option<&BTreeSet<String>> {
         self.tasks_by_tier.get(tier)
+    }
+
+    pub fn tier_name(&self, id: &TierId) -> Option<&TierName> {
+        self.names_by_id.get(id)
+    }
+
+    pub fn id_for_name(&self, name: &TierName) -> Option<TierId> {
+        self.ids_by_name.get(name).copied()
+    }
+
+    pub fn instance(&self, id: &TierId) -> Option<Arc<TierInstance>> {
+        self.instances.get(id).cloned()
+    }
+
+    pub fn instance_for_name(&self, name: &TierName) -> Option<Arc<TierInstance>> {
+        self.id_for_name(name).and_then(|id| self.instance(&id))
+    }
+
+    pub fn instances(&self) -> impl Iterator<Item = (&TierId, &Arc<TierInstance>)> {
+        self.instances.iter()
+    }
+
+    pub fn slot(&self, id: &TierId) -> Option<Slot> {
+        self.order.iter().position(|candidate| candidate == id).and_then(Slot::from_index)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn id(s: &str) -> TierId { TierId::new(s).unwrap() }
-    fn task(s: &str) -> TaskId { TaskId::new(s) }
+    use crate::pipeline::task::{FallbackPolicy, OutputKind};
+    use crate::pipeline::tier::{
+        tname, FakeEvaluate, ModelFormat, Params, RequestShape, Role, TierContext, TierOutput,
+        Transport,
+    };
+    use async_trait::async_trait;
+    use std::sync::Arc;
 
-    #[test]
-    fn shared_tier_ids_form_shared_dag_nodes() {
-        let paths = [
-            (task("route"), vec![id("rules"), id("modernbert"), id("harrier")]),
-            (task("tag"), vec![id("modernbert"), id("harrier")]),
-        ].into();
-        let registered = ["rules", "modernbert", "harrier"].into_iter().map(id).collect();
-        let graph = CascadeGraph::from_task_paths(paths, &registered).unwrap();
-        assert_eq!(graph.order(), &[id("rules"), id("modernbert"), id("harrier")]);
-        assert_eq!(graph.tasks_using(&id("modernbert")).unwrap().len(), 2);
+    struct Silent;
+    #[async_trait]
+    impl FakeEvaluate for Silent {
+        async fn evaluate(&self, ctx: &TierContext<'_>) -> TierOutput {
+            TierOutput::abstain_all("silent", ctx.tasks, "test")
+        }
+    }
+
+    fn registry(names: &[&str]) -> TierRegistry {
+        let mut registry = TierRegistry::new();
+        for name in names {
+            registry.register_fake(
+                tname(name),
+                super::super::tier::Tier {
+                    exex: Role::Encoder,
+                    transport: Transport::Grpc,
+                    request_shape: Some(RequestShape::Score),
+                },
+                Params {
+                    model_format: Some(ModelFormat::Onnx),
+                    model: None,
+                    config: None,
+                    endpoint: Some("http://127.0.0.1:9".into()),
+                    timeout_ms: Some(250),
+                    enabled: None,
+                },
+                Arc::new(Silent),
+            ).unwrap();
+        }
+        registry
+    }
+
+    fn task(name: &str, path: &[&str]) -> Task {
+        Task {
+            name: name.into(),
+            cascade: Cascade::from_names(&path.iter().map(|name| tname(name)).collect::<Vec<_>>()).unwrap(),
+            output_kind: OutputKind::Binary,
+            labels: None,
+            label_metadata: Vec::new(),
+            taxonomy_version: None,
+            fallback: FallbackPolicy::Defer,
+        }
     }
 
     #[test]
-    fn conflicting_task_paths_are_rejected_as_a_cycle() {
-        let paths = [
-            (task("route"), vec![id("a"), id("b")]),
-            (task("tag"), vec![id("b"), id("a")]),
-        ].into();
-        let registered = [id("a"), id("b")].into();
-        assert!(matches!(CascadeGraph::from_task_paths(paths, &registered), Err(CascadeGraphError::Cycle { .. })));
+    fn task_cascades_remain_names_and_graph_materializes_only_referenced_instances() {
+        let registry = registry(&["rules", "encoder", "unused"]);
+        let tasks = vec![task("route", &["rules", "encoder"]), task("tag", &["encoder"])];
+        assert_eq!(tasks[0].cascade.tiers(), &[tname("rules"), tname("encoder")]);
+
+        let graph = CascadeGraph::from_tasks(&tasks, &registry).unwrap();
+        let names: Vec<_> = graph.order().iter()
+            .map(|id| graph.tier_name(id).unwrap().as_str()).collect();
+        assert_eq!(names, ["rules", "encoder"]);
+        let encoder = graph.id_for_name(&tname("encoder")).unwrap();
+        assert_eq!(graph.tasks_using(&encoder).unwrap().len(), 2);
+        assert!(registry.get(&tname("unused")).is_some());
+        assert!(graph.id_for_name(&tname("unused")).is_none());
+        assert!(graph.instance_for_name(&tname("unused")).is_none());
     }
 
     #[test]
-    fn task_paths_require_registered_unique_tier_ids() {
-        let paths = [(task("route"), vec![id("a"), id("missing")])].into();
-        let registered = [id("a")].into();
-        assert!(matches!(CascadeGraph::from_task_paths(paths, &registered), Err(CascadeGraphError::UnknownTier { .. })));
-        let paths = [(task("route"), vec![id("a"), id("a")])].into();
-        let registered = [id("a")].into();
-        assert!(matches!(CascadeGraph::from_task_paths(paths, &registered), Err(CascadeGraphError::DuplicateTier { .. })));
+    fn unrelated_paths_preserve_each_order_without_adding_edges_between_them() {
+        let registry = registry(&["alpha", "beta", "gamma"]);
+        let tasks = vec![task("first", &["alpha", "gamma"]), task("second", &["beta", "gamma"])];
+        let graph = CascadeGraph::from_tasks(&tasks, &registry).unwrap();
+        let names: Vec<_> = graph.order().iter()
+            .map(|id| graph.tier_name(id).unwrap().as_str()).collect();
+        assert_eq!(names, ["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn contradictory_task_paths_are_rejected_as_a_cycle() {
+        let registry = registry(&["alpha", "beta"]);
+        let tasks = vec![task("first", &["alpha", "beta"]), task("second", &["beta", "alpha"])];
+        assert!(matches!(CascadeGraph::from_tasks(&tasks, &registry),
+            Err(CascadeGraphError::Cycle { .. })));
+    }
+
+    #[test]
+    fn unknown_and_duplicate_tier_names_are_rejected() {
+        let registry = registry(&["alpha"]);
+        let unknown = task("first", &["missing"]);
+        assert!(matches!(CascadeGraph::from_tasks(&[unknown], &registry),
+            Err(CascadeGraphError::UnknownTier { .. })));
+        assert!(Cascade::from_names(&[tname("alpha"), tname("alpha")]).is_err());
     }
 }

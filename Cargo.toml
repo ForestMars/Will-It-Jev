@@ -23,8 +23,6 @@ anyhow = "1.0.104"
 async-trait = "0.1"
 toml = "1.1.6"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-unicode-normalization = "0.1"
-unicode-segmentation = "1"
 tower = { version = "0.5", features = ["util"] }
 
 [build-dependencies]
