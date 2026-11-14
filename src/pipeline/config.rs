@@ -3,9 +3,9 @@
 // Loads task definitions, the tier registry, and tier/task resolution policies
 // as separate concerns.
 //
-//   [pipeline].cascade       the one shared ordered execution cascade
-//   [task.<id>]               what a task is
-//   [[tier]]                  the available named tiers; no execution order
+//   [pipeline]                pipeline-wide settings
+//   [task.<id>]               task contract plus its ordered Cascade of TierNames
+//   [[tier]]                  available Tier definitions and declarative parameters; no execution order
 //   [tier_policy.<tier>.<id>] whether a task runs/resolves at a tier
 //   [legacy_tiers]            compatibility: tier name -> its old number (optional)
 //
@@ -299,8 +299,8 @@ pub fn parse(contents: &str) -> Result<PipelineConfig, Box<dyn Error>> {
     parse_with_base(contents, Path::new("."))
 }
 
-// Each task's ordered Cascade is authored by TierName and compiled to
-// TierIds once concrete TierInstances have been built.
+// Each Task's ordered Cascade contains TierNames. CascadeGraph resolves those
+// names, materializes TierInstances and assigns hash-derived TierIds.
 fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dyn Error>> {
     let raw: RawFile = toml::from_str(contents)?;
     let has_explicit_tier_registry = !raw.tier.is_empty();
