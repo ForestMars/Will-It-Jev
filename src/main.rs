@@ -94,8 +94,8 @@ fn grpc_settings(
     ))
 }
 
-/// Resolve deployment-specific values after parsing, without introducing a
-/// declaration/domain type between Tier configuration and TierInstance.
+/// Resolve deployment-specific parameters before registering the Tier definition.
+/// Concrete TierInstance construction happens only during CascadeGraph compilation.
 fn resolve_instance_params(
     name: &TierName,
     tier: &Tier,
@@ -311,7 +311,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pipeline_config =
         pipeline::config::load_or_default(env_or("TASKS_CONFIG", "config/tasks.toml"))?;
     // ---- Build the complete available-tier registry -----------------------
-    // [[tier]] supplies instances; its array order has no execution meaning.
+    // [[tier]] supplies definitions; its array order has no execution meaning.
     let mut registry = TierRegistry::new();
     for (name, tier, params) in &pipeline_config.tiers {
         if !tier_enabled(name, params, &config.router, &pipeline_config.legacy) {
