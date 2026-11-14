@@ -404,6 +404,14 @@ mod tests {
         let graph = CascadeGraph::from_tasks(&tasks, &registry).unwrap();
 
         assert_eq!(graph.dependencies().len(), 1);
+        assert_eq!(
+            graph.dependencies()[0].from,
+            graph.id_for_name(&tname("alpha")).unwrap(),
+        );
+        assert_eq!(
+            graph.dependencies()[0].to,
+            graph.id_for_name(&tname("beta")).unwrap(),
+        );
         let expected: BTreeSet<String> = ["first", "second"].into_iter().map(str::to_string).collect();
         assert_eq!(graph.dependencies()[0].tasks, expected);
     }
