@@ -595,12 +595,13 @@ impl TierInstance {
         Self::fake_with_model(name, name, fake)
     }
 
-    #[cfg(test)]
-    pub fn fake_evaluator(&self) -> Option<Arc<dyn FakeEvaluate>> {
-        match &self.runner {
-            Runner::Fake(fake) => Some(Arc::clone(fake)),
-            _ => None,
-        }
+    pub fn fake_with_definition(
+        name: TierName,
+        tier: Tier,
+        params: Params,
+        fake: Arc<dyn FakeEvaluate>,
+    ) -> Self {
+        Self::assemble(name, tier, params, Runner::Fake(fake), None)
     }
 
     pub fn fake_with_model(name: &str, model: &str, fake: Arc<dyn FakeEvaluate>) -> Self {
