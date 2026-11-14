@@ -241,8 +241,6 @@ pub struct PipelineConfig {
     pub settings: PipelineSettings,
     /// Available configured tiers; vector order carries no scheduling semantics.
     pub(crate) tiers: Vec<TierConfig>,
-    /// Authored task paths, resolved into each Task's Cascade at startup.
-    pub(crate) task_cascades: BTreeMap<String, Vec<TierName>>,
     profiles: BTreeMap<String, Task>,
     /// Configuration policies are authored by tier name and resolve to TierId
     /// after tier instances have been constructed.
@@ -252,18 +250,16 @@ pub struct PipelineConfig {
 }
 
 impl PipelineConfig {
-    /// Resolve each task's authored TierNames against enabled concrete instances.
-    /// Disabled instances are omitted without changing the relative path order.
+    /// Resolve task paths against enabled tier definitions. The ordered Cascade
+    /// remains TierNames; CascadeGraph assigns instance IDs during compilation.
     pub fn tasks(&self, registry: &TierRegistry) -> Result<Vec<Task>, Box<dyn Error>> {
         self.profiles.iter().map(|(name, definition)| {
-            let names = self.task_cascades.get(name)
-                .expect("every configured task has a cascade");
-            let enabled: Vec<TierName> = names.iter()
+            let enabled: Vec<TierName> = definition.cascade.tiers().iter()
                 .filter(|tier| registry.get(tier).is_some())
                 .cloned()
                 .collect();
             let mut task = definition.clone();
-            task.cascade = Cascade::from_names(&enabled, registry)
+            task.cascade = Cascade::from_names(&enabled)
                 .map_err(|error| format!("task.{name}.cascade: {error}"))?;
             Ok(task)
         }).collect()
@@ -317,7 +313,6 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
     };
 
     let mut profiles = BTreeMap::new();
-    let mut task_cascades = BTreeMap::new();
     for (name, profile) in raw.task {
         let authored_names = match profile.cascade {
             Some(names) => names,
@@ -345,7 +340,7 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
             }
             cascade.push(tier_name);
         }
-        task_cascades.insert(name.clone(), cascade);
+        let cascade = Cascade::from_names(&cascade)?;
 
         let (labels, label_metadata, taxonomy_version) = if let Some(taxonomy_path) = &profile.taxonomy {
             let taxonomy_file = base.join(taxonomy_path);
@@ -387,7 +382,7 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
         }
         profiles.insert(name.clone(), Task {
             name,
-            cascade: Cascade::default(), // resolved against enabled instances by tasks()
+            cascade,
             output_kind: profile.output_kind,
             labels,
             label_metadata,
@@ -407,8 +402,7 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
             let profile = profiles.get(&task_name).ok_or_else(|| format!(
                 "tier_policy.{tier}.{task_name}: no matching [task.{task_name}] definition"
             ))?;
-            let task_path = task_cascades.get(&task_name).expect("every task has a cascade");
-            if !task_path.contains(&tier) {
+            if !profile.cascade.tiers().contains(&tier) {
                 return Err(format!(
                     "tier_policy.{tier}.{task_name}: tier is not in task.{task_name}.cascade"
                 ).into());
@@ -429,7 +423,7 @@ fn parse_with_base(contents: &str, base: &Path) -> Result<PipelineConfig, Box<dy
         }
     }
 
-    Ok(PipelineConfig { settings, tiers, task_cascades, profiles, tier_policies, legacy })
+    Ok(PipelineConfig { settings, tiers, profiles, tier_policies, legacy })
 }
 
 #[cfg(test)]
@@ -528,7 +522,7 @@ mod tests {
     #[test]
     fn legacy_config_defaults_each_task_to_the_original_four_tiers() {
         let cfg = parse("[task.route]\nfallback_label = \"needs_llm\"").unwrap();
-        let names: Vec<_> = cfg.task_cascades["route"].iter().map(TierName::as_str).collect();
+        let names: Vec<_> = cfg.profiles["route"].cascade.tiers().iter().map(TierName::as_str).collect();
         assert_eq!(names, ["rules", "fasttext", "modernbert", "harrier"]);
     }
 
@@ -600,8 +594,8 @@ mod tests {
     fn shipped_config_has_valid_task_paths_and_policies() {
         let cfg = load_or_default("config/tasks.toml").unwrap();
         let available: std::collections::BTreeSet<_> = cfg.tiers.iter().map(|tier| tier.0.clone()).collect();
-        assert!(cfg.task_cascades.values().flatten().all(|tier| available.contains(tier)));
+        assert!(cfg.profiles.values().flat_map(|task| task.cascade.tiers()).all(|tier| available.contains(tier)));
         assert!(cfg.has_policy("route"));
-        assert!(!cfg.task_cascades.is_empty());
+        assert!(!cfg.profiles.is_empty());
     }
 }
