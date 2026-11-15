@@ -515,6 +515,13 @@ mod tests {
     }
 
     #[test]
+    fn encoder_declarations_require_a_model_identity() {
+        let config = named_config().replace("model = \"modernbert-onnx\"\n", "");
+        let error = parse(&config).expect_err("encoder model identity is mandatory");
+        assert!(error.to_string().contains("encoder must declare a non-empty model identity"));
+    }
+
+    #[test]
     fn explicit_tier_registry_requires_each_task_cascade() {
         let result = parse(r#"
             [task.route]
