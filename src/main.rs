@@ -14,7 +14,7 @@ use pipeline::tagger::{CascadeTagger, JointTagStore};
 use legacy_tiers::LegacyTierNumbers;
 use pipeline::cascade::CascadeGraph;
 use pipeline::task::TierPolicyMap;
-use pipeline::tier::{hex, ModelFormat, Params, Role, Tier, TierName};
+use pipeline::tier::{hex, ModelFormat, Params, Strategy, Tier, TierName};
 use pipeline::TierRegistry;
 use pipeline::CascadeRunner;
 use router::dispatch::DownstreamDispatcher;
@@ -104,13 +104,13 @@ fn resolve_instance_params(
     legacy: &LegacyTierNumbers,
 ) -> Result<Params, Box<dyn std::error::Error>> {
     let mut resolved = params.clone();
-    match tier.exex {
-        Role::Rules => {
+    match tier.strategy {
+        Strategy::Rules => {
             if resolved.config.is_none() {
                 resolved.config = Some(env_or("TIER1_CONFIG", "config/tier1.toml"));
             }
         }
-        Role::FastText => {
+        Strategy::FastText => {
             if resolved.model.is_none() {
                 resolved.model = Some(
                     std::env::var("FASTTEXT_MODEL").unwrap_or_else(|_| default_fasttext_model_path()),
@@ -122,7 +122,7 @@ fn resolve_instance_params(
                 tracing::warn!(tier = %name, model_path = "models/tier2.bin", "using legacy fastText tier-2 model; prefer models/tier2_small.bin when available");
             }
         }
-        Role::Encoder => {
+        Strategy::Encoder => {
             let (endpoint, timeout) = grpc_settings(name, &resolved, router, legacy)?;
             resolved.endpoint = Some(endpoint);
             resolved.timeout_ms = Some(u64::try_from(timeout.as_millis())?);
@@ -321,7 +321,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let resolved = resolve_instance_params(name, tier, params, &config.router, &pipeline_config.legacy)?;
         tracing::info!(
             tier = %name,
-            executor = tier.exex.as_str(),
+            strategy = tier.strategy.as_str(),
             model_format = ?resolved.model_format.map(ModelFormat::as_str),
             "tier definition registered"
         );
@@ -365,15 +365,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Legacy artifact hashes describe the loaded legacy executors, independent
     // of whether a particular task currently traverses them.
-    let artifact_hash = |role: Role| {
+    let artifact_hash = |role: Strategy| {
         execution_graph.instances()
-            .find(|(_, instance)| instance.tier().exex == role)
+            .find(|(_, instance)| instance.tier().strategy == role)
             .and_then(|(_, instance)| instance.artifact_hash().map(|hash| hex(hash)))
             .unwrap_or_else(|| "disabled".to_string())
     };
     let hashes = telemetry::Hashes {
-        tier1_toml: artifact_hash(Role::Rules),
-        tier2_bin: artifact_hash(Role::FastText),
+        tier1_toml: artifact_hash(Strategy::Rules),
+        tier2_bin: artifact_hash(Strategy::FastText),
     };
 
     for (tier_id, by_task) in &tier_policies {
@@ -410,7 +410,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let has_executable_tag_head = execution_graph.order().iter().any(|id| {
             execution_graph.task_uses("tag", id)
                 && execution_graph.instance(id).is_some_and(|instance| {
-                    instance.tier().exex == Role::Encoder
+                    instance.tier().strategy == Strategy::Encoder
                         && tier_policies.get(id).is_some_and(|by_task| by_task.contains_key("tag"))
                 })
         });
