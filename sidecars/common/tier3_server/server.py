@@ -14,6 +14,15 @@ class Tier3Servicer(tier3_pb2_grpc.Tier3ScorerServicer):
         self.calibration = calibration
         self.model_id = model_id
 
+    def _validate_model(self, context):
+        metadata = dict(context.invocation_metadata())
+        requested_model = metadata.get("model-id")
+        if requested_model != self.model_id:
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                f"requested model {requested_model!r} does not match loaded model {self.model_id!r}",
+            )
+
     def _route(self, prompt):
         output = self.model.score(prompt)
         # ModernBERT's compatibility adapter already returns calibrated
@@ -35,6 +44,7 @@ class Tier3Servicer(tier3_pb2_grpc.Tier3ScorerServicer):
         return raw, confidence, label, scores
 
     def Score(self, request, context):
+        self._validate_model(context)
         try:
             raw, confidence, label, _ = self._route(request.prompt)
         except Exception as error:
@@ -48,6 +58,7 @@ class Tier3Servicer(tier3_pb2_grpc.Tier3ScorerServicer):
 
     def ScoreTasks(self, request, context):
         """Run every requested head over one model-owned shared representation."""
+        self._validate_model(context)
         specs = {spec.task: spec for spec in request.task_specs}
         requested = list(request.tasks) or [spec.task for spec in request.task_specs]
         tasks = list(dict.fromkeys(requested))
