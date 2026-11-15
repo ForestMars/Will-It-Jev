@@ -114,7 +114,7 @@ pub fn tname(name: &str) -> TierName {
 /// by a sidecar; the same definition supports many instances, each running its
 /// own model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-pub enum Role {
+pub enum Strategy {
     #[serde(rename = "rules")]
     Rules,
     #[serde(rename = "fasttext")]
@@ -123,7 +123,7 @@ pub enum Role {
     Encoder,
 }
 
-impl Role {
+impl Strategy {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Rules => "rules",
@@ -166,7 +166,7 @@ impl ModelFormat {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tier {
-    pub exex: Role,
+    pub strategy: Strategy,
     pub transport: Transport,
     /// Encoder over gRPC only.
     pub request_shape: Option<RequestShape>,
@@ -175,22 +175,22 @@ pub struct Tier {
 impl Tier {
     /// A definition is coherent when its role, transport and request shape agree.
     pub fn validate(&self) -> Result<(), &'static str> {
-        match (self.exex, self.transport, self.request_shape) {
-            (Role::Rules | Role::FastText, Transport::InProcess, None) => Ok(()),
-            (Role::Rules | Role::FastText, _, _) => {
+        match (self.strategy, self.transport, self.request_shape) {
+            (Strategy::Rules | Strategy::FastText, Transport::InProcess, None) => Ok(()),
+            (Strategy::Rules | Strategy::FastText, _, _) => {
                 Err("rules and fasttext require transport = \"in_process\" and no request_shape")
             }
-            (Role::Encoder, Transport::Grpc, Some(_)) => Ok(()),
-            (Role::Encoder, _, _) => {
+            (Strategy::Encoder, Transport::Grpc, Some(_)) => Ok(()),
+            (Strategy::Encoder, _, _) => {
                 Err("encoder requires transport = \"grpc\" and request_shape = \"score\" or \"score_tasks\"")
             }
         }
     }
 
     pub fn accepts(&self, model_format: Option<ModelFormat>) -> bool {
-        matches!((self.exex, model_format),
-            (Role::Rules | Role::FastText, None)
-                | (Role::Encoder, Some(ModelFormat::Onnx | ModelFormat::Gguf)))
+        matches!((self.strategy, model_format),
+            (Strategy::Rules | Strategy::FastText, None)
+                | (Strategy::Encoder, Some(ModelFormat::Onnx | ModelFormat::Gguf)))
     }
 }
 
@@ -201,8 +201,8 @@ impl Tier {
 pub struct Params {
     /// Encoder only: selects the inference runtime at the adapter boundary.
     pub model_format: Option<ModelFormat>,
-    /// fasttext: path to the model file. encoder: the model name the sidecar is
-    /// expected to report; a different `model_id` in a response is logged once.
+    /// FastText: path to the model file. Encoder: required identity of the
+    /// model loaded by the configured sidecar.
     pub model: Option<String>,
     /// Rules only: path to the rule file.
     pub config: Option<String>,
@@ -373,28 +373,31 @@ impl TierInstance {
     pub fn build(name: TierName, tier: Tier, params: Params) -> Result<Self, Box<dyn Error>> {
         tier.validate().map_err(|reason| format!("tier {name}: {reason}"))?;
         if !tier.accepts(params.model_format) {
-            return Err(format!("tier {name}: model_format {:?} is incompatible with {} executor", params.model_format.map(ModelFormat::as_str), tier.exex.as_str()).into());
+            return Err(format!("tier {name}: model_format {:?} is incompatible with {} strategy", params.model_format.map(ModelFormat::as_str), tier.strategy.as_str()).into());
         }
-        let (runner, artifact_hash) = match tier.exex {
-            Role::Rules => {
+        let (runner, artifact_hash) = match tier.strategy {
+            Strategy::Rules => {
                 let path = params.config.as_deref()
                     .ok_or_else(|| format!("tier {name}: rules tier has no `config` path"))?;
                 let hash = sha256_file(path)?;
                 let engine = Arc::new(Tier1Engine::new(Tier1Automaton::from_toml_file(path)?)?);
                 (Runner::Rules(engine), Some(hash))
             }
-            Role::FastText => {
+            Strategy::FastText => {
                 let path = params.model.as_deref()
                     .ok_or_else(|| format!("tier {name}: fasttext tier has no `model` path"))?;
                 let hash = sha256_file(path)?;
                 (Runner::FastText(Arc::new(Tier2Runner::new(path)?)), Some(hash))
             }
-            Role::Encoder => {
+            Strategy::Encoder => {
+                let model_id = params.model.clone()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| format!("tier {name}: encoder tier has no model identity"))?;
                 let endpoint = params.endpoint.clone()
                     .ok_or_else(|| format!("tier {name}: encoder tier has no endpoint"))?;
                 let timeout_ms = params.timeout_ms
                     .ok_or_else(|| format!("tier {name}: encoder tier has no timeout_ms"))?;
-                (Runner::Grpc(Tier3Runner::new(endpoint, Duration::from_millis(timeout_ms))?), None)
+                (Runner::Grpc(Tier3Runner::new(endpoint, model_id, Duration::from_millis(timeout_ms))?), None)
             }
         };
         Ok(Self::assemble(name, tier, params, runner, artifact_hash))
@@ -432,7 +435,7 @@ impl TierInstance {
             digest.update(b"\0");
         };
         field("tier_name", name.as_str());
-        field("role", tier.exex.as_str());
+        field("role", tier.strategy.as_str());
         field("transport", match tier.transport {
             Transport::InProcess => "in_process",
             Transport::Grpc => "grpc",
@@ -456,6 +459,9 @@ impl TierInstance {
     /// Fallback label used when an adapter call fails before returning runtime metadata.
     /// Model identity remains inside the adapter boundary.
     pub fn model_label(&self) -> String {
+        if self.tier.strategy == Strategy::Encoder {
+            return self.params.model.clone().expect("encoder instances require a model identity");
+        }
         self.name.as_str().to_string()
     }
 
@@ -609,9 +615,9 @@ impl TierInstance {
 
     /// An encoder instance over an already-constructed gRPC runner.
     pub fn encoder(name: &str, shape: RequestShape, model: Option<&str>, runner: Tier3Runner) -> Self {
-        let tier = Tier { exex: Role::Encoder, transport: Transport::Grpc, request_shape: Some(shape) };
+        let tier = Tier { strategy: Strategy::Encoder, transport: Transport::Grpc, request_shape: Some(shape) };
         let params = Params {
-            model_format: Some(ModelFormat::Onnx), model: model.map(str::to_string), config: None,
+            model_format: Some(ModelFormat::Onnx), model: Some(model.unwrap_or("joint-test-sidecar").to_string()), config: None,
             endpoint: Some("http://127.0.0.1:9".into()), timeout_ms: Some(250), enabled: None,
         };
         Self::assemble(
@@ -760,7 +766,7 @@ mod tests {
     fn encoder_config(name: &str, model_format: ModelFormat, model: Option<&str>, endpoint: &str) -> (TierName, Tier, Params) {
         (
             TierName::new(name).unwrap(),
-            Tier { exex: Role::Encoder, transport: Transport::Grpc, request_shape: Some(RequestShape::Score) },
+            Tier { strategy: Strategy::Encoder, transport: Transport::Grpc, request_shape: Some(RequestShape::Score) },
             Params {
                 model_format: Some(model_format), model: model.map(str::to_string), config: None,
                 endpoint: Some(endpoint.to_string()), timeout_ms: Some(250), enabled: None,
@@ -771,7 +777,7 @@ mod tests {
     fn rules_config(name: &str, config: Option<&str>) -> (TierName, Tier, Params) {
         (
             TierName::new(name).unwrap(),
-            Tier { exex: Role::Rules, transport: Transport::InProcess, request_shape: None },
+            Tier { strategy: Strategy::Rules, transport: Transport::InProcess, request_shape: None },
             Params {
                 model_format: None, model: None, config: config.map(str::to_string),
                 endpoint: None, timeout_ms: None, enabled: None,
@@ -874,7 +880,7 @@ mod tests {
     async fn joint_sidecar_scores_multiple_tasks_in_one_rpc() {
         let sidecar = TestSidecar { joint: true, ..Default::default() };
         let calls = sidecar.tasks_calls.clone();
-        let scorer = Tier3Runner::new(endpoint(sidecar).await, Duration::from_secs(2)).unwrap();
+        let scorer = Tier3Runner::new(endpoint(sidecar).await, "joint-test-sidecar".into(), Duration::from_secs(2)).unwrap();
         let tier = TierInstance::encoder("alternate", RequestShape::ScoreTasks, None, scorer);
         let tasks = [String::from("route"), String::from("tag")];
         let profiles = [
@@ -909,7 +915,7 @@ mod tests {
         let sidecar = TestSidecar { joint: true, ..Default::default() };
         let task_calls = sidecar.tasks_calls.clone();
         let score_calls = sidecar.score_calls.clone();
-        let scorer = Tier3Runner::new(endpoint(sidecar).await, Duration::from_secs(2)).unwrap();
+        let scorer = Tier3Runner::new(endpoint(sidecar).await, "joint-test-sidecar".into(), Duration::from_secs(2)).unwrap();
         let tier = TierInstance::encoder("route-scorer", RequestShape::ScoreTasks, None, scorer);
         let tasks = [String::from("route")];
         let profiles = [Task {
@@ -937,7 +943,7 @@ mod tests {
         let sidecar = TestSidecar { joint: false, ..Default::default() };
         let task_calls = sidecar.tasks_calls.clone();
         let score_calls = sidecar.score_calls.clone();
-        let scorer = Tier3Runner::new(endpoint(sidecar).await, Duration::from_secs(2)).unwrap();
+        let scorer = Tier3Runner::new(endpoint(sidecar).await, "joint-test-sidecar".into(), Duration::from_secs(2)).unwrap();
         let tier = TierInstance::encoder("no-joint", RequestShape::ScoreTasks, None, scorer);
         let tasks = [String::from("route")];
         let profiles = [Task {
