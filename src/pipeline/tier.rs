@@ -673,7 +673,7 @@ mod tests {
 
     #[test]
     fn tier_names_are_validated() {
-        for ok in ["rules", "fasttext", "modernbert", "harrier", "oryn-2", "a", "prefilter_v2"] {
+        for ok in ["rules", "fasttext", "encoder_onnx", "encoder_gguf", "oryn-2", "a", "prefilter_v2"] {
             assert!(TierName::new(ok).is_ok(), "{ok} should be valid");
         }
         for bad in ["", "Rules", "2fast", "has space", "x.y", "fallback", "tier3", &"a".repeat(33)] {
