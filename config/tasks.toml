@@ -7,12 +7,12 @@ tag_in_request = false
 tag_budget_ms = 4000
 
 [task.route]
-cascade = ["rules", "fasttext", "modernbert", "harrier"]
+cascade = ["rules", "fasttext", "encoder_onnx", "encoder_gguf"]
 labels = ["jev_capable", "needs_llm"]
 fallback_label = "needs_llm"
 
 [task.tag]
-cascade = ["modernbert", "harrier"]
+cascade = ["encoder_onnx", "encoder_gguf"]
 output_kind = "multiclass"
 taxonomy = "../taskonomies/help_desk.json"
 fallback = "defer"
@@ -21,37 +21,39 @@ fallback = "defer"
 # registry catalogs definitions; task cascades select which definitions the
 # CascadeGraph materializes as TierInstances with hash-derived TierIds.
 #
-#   executor     which executor handles the tier: rules | fasttext | encoder
+#   strategy     execution strategy: rules | fasttext | encoder
 #   transport    how the router reaches it: in_process | grpc
 #   request_shape  encoder only: the RPC contract, score | score_tasks
 #   model_format  encoder inference runtime: onnx | gguf; selects the adapter
-#   model        fasttext: model file; encoder: opaque instance configuration
-#                included in the hash-derived TierId
+#   model        fasttext: model file; encoder: required model identity sent
+#                to the sidecar and included in the hash-derived TierId
 #   config       rules: rule file
 #
 # `model` / `config` fall back to FASTTEXT_MODEL / TIER1_CONFIG for a definition
-# that declares none. `scorer` is accepted as an alias of `encoder`.
+# that declares none. Encoder model identity is mandatory.
 
 [[tier]]
 name = "rules"
-executor = "rules"
+strategy = "rules"
 transport = "in_process"
 
 [[tier]]
 name = "fasttext"
-executor = "fasttext"
+strategy = "fasttext"
 transport = "in_process"
 
 [[tier]]
-name = "modernbert"
-executor = "encoder"
+name = "encoder_onnx"
+strategy = "encoder"
+model = "modernbert-onnx"
 model_format = "onnx"
 transport = "grpc"
 request_shape = "score"
 
 [[tier]]
-name = "harrier"
-executor = "encoder"
+name = "encoder_gguf"
+strategy = "encoder"
+model = "harrier-270m"
 model_format = "gguf"
 transport = "grpc"
 request_shape = "score"
@@ -65,8 +67,8 @@ request_shape = "score"
 [legacy_tiers]
 rules = 1
 fasttext = 2
-modernbert = 3
-harrier = 4
+encoder_onnx = 3
+encoder_gguf = 4
 
 # Calibration belongs to a tier name + task pair. A policy may record the
 # instance it was fitted on with `calibrated_for = "<TierId, 32 hex>"`; the
@@ -82,15 +84,15 @@ never_resolve = ["needs_llm"]
 min_confidence = 0.95
 never_resolve = ["needs_llm"]
 
-[tier_policy.modernbert.route]
+[tier_policy.encoder_onnx.route]
 min_confidence = 0.95
 label_min_confidence = { jev_capable = 0.95, needs_llm = 0.70 }
 
-[tier_policy.harrier.route]
+[tier_policy.encoder_gguf.route]
 min_confidence = 0.95
 label_min_confidence = { jev_capable = 0.95, needs_llm = 0.70 }
 
 # To evaluate route and tag heads in one ScoreTasks call, change the relevant
 # tier's request_shape to "score_tasks" and add its tag policy:
-# [tier_policy.modernbert.tag]
+# [tier_policy.encoder_onnx.tag]
 # min_confidence = 0.85
