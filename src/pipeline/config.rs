@@ -543,7 +543,7 @@ mod tests {
 
     #[test]
     fn task_cascade_rejects_empty_unknown_and_duplicate_tier_names() {
-        let tier = "[[tier]]\nname = \"rules\"\nexecutor = \"rules\"\ntransport = \"in_process\"\n";
+        let tier = "[[tier]]\nname = \"rules\"\nstrategy = \"rules\"\ntransport = \"in_process\"\n";
         for (path, expected) in [
             ("cascade = []", "at least one tier"),
             ("cascade = [\"missing\"]", "unavailable tier missing"),
