@@ -20,6 +20,7 @@ use super::tier3_proto::{
 pub struct Tier3Runner {
     client: Tier3ScorerClient<Channel>,
     max_call: Duration,
+    expected_model_id: Option<String>,
 }
 
 impl Tier3Runner {
@@ -33,7 +34,15 @@ impl Tier3Runner {
         Ok(Self {
             client: Tier3ScorerClient::new(channel),
             max_call,
+            expected_model_id: None,
         })
+    }
+
+    /// Bind this client to the model identity configured on its TierInstance.
+    /// The endpoint hosts that model; responses are checked against this identity.
+    pub fn with_expected_model_id(mut self, model_id: Option<String>) -> Self {
+        self.expected_model_id = model_id;
+        self
     }
 
     /// Legacy single-head scoring request. The task policy is applied by the
@@ -56,6 +65,9 @@ impl Tier3Runner {
             Ok(Err(_)) => Err("rpc_error"),
             Ok(Ok(response)) => {
                 let response = response.into_inner();
+                if self.expected_model_id.as_deref().is_some_and(|expected| expected != response.model_id) {
+                    return Err("model_mismatch");
+                }
                 Ok(RawScore {
                     label: response.label,
                     confidence: response.confidence,
@@ -122,7 +134,13 @@ impl Tier3Runner {
                 Err(TasksError::Unimplemented)
             }
             Ok(Err(_)) => Err(TasksError::Fault("rpc_error")),
-            Ok(Ok(response)) => Ok(response.into_inner()),
+            Ok(Ok(response)) => {
+                let response = response.into_inner();
+                if self.expected_model_id.as_deref().is_some_and(|expected| expected != response.model_id) {
+                    return Err(TasksError::Fault("model_mismatch"));
+                }
+                Ok(response)
+            },
         }
     }
 }
