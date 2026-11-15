@@ -201,8 +201,8 @@ impl Tier {
 pub struct Params {
     /// Encoder only: selects the inference runtime at the adapter boundary.
     pub model_format: Option<ModelFormat>,
-    /// fasttext: path to the model file. encoder: the model name the sidecar is
-    /// expected to report; a different `model_id` in a response is logged once.
+    /// fasttext: path to the model file. encoder: the expected model_id reported
+    /// by the sidecar; a mismatch causes the tier call to abstain.
     pub model: Option<String>,
     /// Rules only: path to the rule file.
     pub config: Option<String>,
@@ -394,7 +394,10 @@ impl TierInstance {
                     .ok_or_else(|| format!("tier {name}: encoder tier has no endpoint"))?;
                 let timeout_ms = params.timeout_ms
                     .ok_or_else(|| format!("tier {name}: encoder tier has no timeout_ms"))?;
-                (Runner::Grpc(Tier3Runner::new(endpoint, Duration::from_millis(timeout_ms))?), None)
+                (Runner::Grpc(
+                    Tier3Runner::new(endpoint, Duration::from_millis(timeout_ms))?
+                        .with_expected_model_id(params.model.clone()),
+                ), None)
             }
         };
         Ok(Self::assemble(name, tier, params, runner, artifact_hash))
@@ -456,7 +459,7 @@ impl TierInstance {
     /// Fallback label used when an adapter call fails before returning runtime metadata.
     /// Model identity remains inside the adapter boundary.
     pub fn model_label(&self) -> String {
-        self.name.as_str().to_string()
+        self.params.model.as_deref().unwrap_or_else(|| self.name.as_str()).to_string()
     }
 
     #[allow(dead_code)]
