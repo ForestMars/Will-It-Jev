@@ -40,7 +40,7 @@ impl LegacyTierNumbers {
     /// declares no `[[tier]]` entries.
     pub fn original_four() -> Self {
         Self::new(
-            [("rules", 1), ("fasttext", 2), ("modernbert", 3), ("harrier", 4)]
+            [("rules", 1), ("fasttext", 2), ("encoder_onnx", 3), ("encoder_gguf", 4)]
                 .map(|(name, ordinal)| (TierName::new(name).expect("built-in tier names are valid"), ordinal)),
         )
         .expect("built-in numbering is valid")
@@ -62,8 +62,8 @@ mod tests {
 
     #[test]
     fn a_name_and_a_number_look_each_other_up() {
-        let map = LegacyTierNumbers::new([(tname("rules"), 1), (tname("modernbert"), 3)]).unwrap();
-        assert_eq!(map.ordinal_of(&tname("modernbert")), Some(3));
+        let map = LegacyTierNumbers::new([(tname("rules"), 1), (tname("encoder_onnx"), 3)]).unwrap();
+        assert_eq!(map.ordinal_of(&tname("encoder_onnx")), Some(3));
         assert_eq!(map.ordinal_of(&tname("prefilter")), None);
         assert_eq!(map.name_of(1), Some(&tname("rules")));
         assert_eq!(map.name_of(2), None);
@@ -78,7 +78,7 @@ mod tests {
     #[test]
     fn the_original_numbering_is_the_four_shipped_tiers() {
         let map = LegacyTierNumbers::original_four();
-        assert_eq!(map.name_of(4), Some(&tname("harrier")));
+        assert_eq!(map.name_of(4), Some(&tname("encoder_gguf")));
         assert_eq!(map.ordinal_of(&tname("fasttext")), Some(2));
     }
 }
