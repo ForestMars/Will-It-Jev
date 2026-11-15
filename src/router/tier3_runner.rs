@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use tokio::time::timeout;
 use tonic::transport::Channel;
+use tonic::Request;
 
 use crate::pipeline::task::{OutputKind, Task};
 
@@ -19,6 +20,7 @@ use super::tier3_proto::{
 #[derive(Clone)]
 pub struct Tier3Runner {
     client: Tier3ScorerClient<Channel>,
+    model_id: String,
     max_call: Duration,
 }
 
@@ -27,11 +29,13 @@ impl Tier3Runner {
     /// connectivity faults are surfaced as per-request pass-through results.
     pub fn new(
         endpoint: String,
+        model_id: String,
         max_call: Duration,
     ) -> Result<Self, tonic::codegen::http::uri::InvalidUri> {
         let channel = Channel::from_shared(endpoint)?.connect_lazy();
         Ok(Self {
             client: Tier3ScorerClient::new(channel),
+            model_id,
             max_call,
         })
     }
@@ -48,9 +52,11 @@ impl Tier3Runner {
         }
         let deadline = budget.min(self.max_call);
         let mut client = self.client.clone();
-        let request = ScoreRequest {
+        let mut request = Request::new(ScoreRequest {
             prompt: prompt.to_string(),
-        };
+        });
+        let model_id = self.model_id.parse().map_err(|_| "invalid_model_id")?;
+        request.metadata_mut().insert("model-id", model_id);
         match timeout(deadline, client.score(request)).await {
             Err(_) => Err("timeout"),
             Ok(Err(_)) => Err("rpc_error"),
@@ -111,11 +117,13 @@ impl Tier3Runner {
                 taxonomy_version: profile.taxonomy_version.clone().unwrap_or_default(),
             }
         }).collect();
-        let request = ScoreTasksRequest {
+        let mut request = Request::new(ScoreTasksRequest {
             prompt: prompt.to_string(),
             tasks,
             task_specs,
-        };
+        });
+        let model_id = self.model_id.parse().map_err(|_| TasksError::Fault("invalid_model_id"))?;
+        request.metadata_mut().insert("model-id", model_id);
         match timeout(deadline, client.score_tasks(request)).await {
             Err(_) => Err(TasksError::Fault("timeout")),
             Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
