@@ -457,7 +457,7 @@ impl TierInstance {
     pub fn artifact_hash(&self) -> Option<&[u8; 32]> { self.artifact_hash.as_ref() }
 
     /// Fallback label used when an adapter call fails before returning runtime metadata.
-    /// Model identity remains inside the adapter boundary.
+    /// Encoder labels use the model identity supplied by this TierInstance.
     pub fn model_label(&self) -> String {
         if self.tier.strategy == Strategy::Encoder {
             return self.params.model.clone().expect("encoder instances require a model identity");
@@ -692,8 +692,13 @@ mod tests {
     impl Tier3Scorer for TestSidecar {
         async fn score(
             &self,
-            _request: Request<ScoreRequest>,
+            request: Request<ScoreRequest>,
         ) -> Result<Response<ScoreResponse>, Status> {
+            if request.metadata().get("model-id").and_then(|value| value.to_str().ok())
+                != Some("joint-test-sidecar")
+            {
+                return Err(Status::failed_precondition("missing or incorrect model-id metadata"));
+            }
             self.score_calls.fetch_add(1, Ordering::SeqCst);
             Ok(Response::new(ScoreResponse {
                 raw_score: 0.97,
@@ -707,6 +712,11 @@ mod tests {
             &self,
             request: Request<ScoreTasksRequest>,
         ) -> Result<Response<ScoreTasksResponse>, Status> {
+            if request.metadata().get("model-id").and_then(|value| value.to_str().ok())
+                != Some("joint-test-sidecar")
+            {
+                return Err(Status::failed_precondition("missing or incorrect model-id metadata"));
+            }
             self.tasks_calls.fetch_add(1, Ordering::SeqCst);
             if !self.joint {
                 return Err(Status::unimplemented("no multi-task heads"));
@@ -866,13 +876,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_sidecar_call_uses_tier_name_as_fallback_label() {
+    async fn failed_sidecar_call_uses_configured_model_as_fallback_label() {
         let instance = build_entry(encoder_config("enc-a", ModelFormat::Onnx, Some("model-a"), "http://127.0.0.1:9")).unwrap();
         let tasks = [String::from("route")];
         let output = instance
             .evaluate(&TierContext { prompt: "test", tasks: &tasks, task_profiles: &[], budget: Duration::from_millis(500) })
             .await;
-        assert_eq!(output.model_id, "enc-a");
+        assert_eq!(output.model_id, "model-a");
         assert!(matches!(output.readings[&String::from("route")], TierReading::Abstain(_)));
     }
 
