@@ -98,7 +98,7 @@ impl TierRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::tier::{tname, ModelFormat, RequestShape, Role, Transport};
+    use crate::pipeline::tier::{tname, ModelFormat, RequestShape, Strategy, Transport};
 
     fn params() -> Params {
         Params {
@@ -115,7 +115,7 @@ mod tests {
     fn registry_is_an_unordered_catalog_of_definitions() {
         let mut registry = TierRegistry::new();
         let encoder = Tier {
-            exex: Role::Encoder,
+            strategy: Strategy::Encoder,
             transport: Transport::Grpc,
             request_shape: Some(RequestShape::Score),
         };
@@ -131,7 +131,7 @@ mod tests {
     fn duplicate_tier_names_are_rejected() {
         let mut registry = TierRegistry::new();
         let tier = Tier {
-            exex: Role::Rules,
+            strategy: Strategy::Rules,
             transport: Transport::InProcess,
             request_shape: None,
         };
